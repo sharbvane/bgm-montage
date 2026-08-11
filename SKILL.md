@@ -1,9 +1,17 @@
 ---
 name: bgm-montage
-description: Learn a dynamic visual profile and audio-linked editing grammar from read-only references and BGM, intelligently search/reuse Pixabay footage, select aesthetically strong and sequence-coherent shots, render a low-repetition montage, optionally export an editable JianYing Pro draft, and enforce automatic media QA. Use when Codex must create a stock-footage montage from a BGM path, theme, duration, aspect ratio, and output directory.
+description: Learn a dynamic visual profile and audio-linked editing grammar from read-only references and BGM, intelligently search/reuse Pixabay or YouTube footage, select aesthetically strong and sequence-coherent shots, render a low-repetition montage, optionally export an editable JianYing Pro draft, and enforce automatic media QA. Use when Codex must create a stock-footage montage from a BGM path, theme, duration, aspect ratio, and output directory.
 ---
 
 # BGM Montage v1.3
+
+YouTube-first acquisition is available through the unified entry point with `--source-provider youtube`. It uses `yt-dlp`, keeps the v1.3 reference/BGM/timeline/selection/render/QA core unchanged, records search queries and source URLs in the asset manifest, and accepts repeated `--exclude-youtube-id` filters. `--asset-manifest` can feed a human-reviewed provider-compatible manifest into the unchanged v1.3 edit core.
+
+## Material usage mode
+
+Use `local_evaluation` by default. In this mode, all material is for local learning, testing, algorithm validation, and montage quality evaluation only. Never use copyright, license, Creative Commons, Public Domain, No Copyright, Royalty Free, Free Stock, or ordinary-YouTube status as a search restriction, ranking feature, rejection reason, or report warning. Do not generate licensing-oriented queries unless the terms independently improve target-image recall. Rank by reference/style match, visual impact, aesthetics, environment dynamics, depth, composition, realism, image quality, motion, BGM fit, and whole-film consistency. Quality takes priority over source.
+
+Switch to `publish` only when the user explicitly says the specific video will be publicly distributed, commercially used, or externally shared. Then define a task-specific rights policy. Never infer future publication. Use `--usage-mode publish` only after that explicit instruction.
 
 把只读参考视频、BGM 与 Pixabay 素材转成可追踪、可复现的自动混剪。推荐使用 CPython 3.11 和 Skill 自有 `.venv`；系统必须能在 `PATH` 中找到 `ffmpeg` 与 `ffprobe`。
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.3.2 — 2026-08-11
+
+- Added an auditable `local_evaluation` default and explicit `publish` mode. Local evaluation applies zero copyright/license ranking weight, no ordinary-YouTube penalty, no authorization filter, no licensing-query generation, and no recurring rights warning; source choice remains quality-first.
+- Unified YouTube, Pixabay, supplied-manifest, run-state, and run-report policy fields through `material_usage_policy.py`; legacy attribution reminders are removed from local-evaluation manifests.
+- Added project-wide `AGENTS.md` guidance and regression coverage proving the default mode, zero rights weight, report normalization, explicit publish switch, and license-word-neutral YouTube metadata scoring.
+
+## v1.3.1 — 2026-08-10
+
+- Added a minimal YouTube-first `yt-dlp` acquisition adapter, provider-compatible manifests, repeated query/exclusion controls, and `--asset-manifest` handoff for human-reviewed pools. The v1.3 reference, BGM, timeline, editing, rendering, and QA core remains unchanged.
+- Corrected climax QA routing for short tracks whose later detected drop/climax events fall inside a broadly labeled `outro`; actual event windows are used when section-role shots cover less than half of those windows. Existing pass thresholds were not lowered.
+
 ## v1.3 — 2026-08-10
 
 - 保留 v1.2 已验证的参考学习、BGM BPM/重拍/乐句/段落/能量/停顿分析、下载前音乐槽位、恒速安全区间、FFmpeg 全局帧网格渲染、自动返工与完整媒体 QA；没有重写节奏核心。

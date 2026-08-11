@@ -1,7 +1,7 @@
 interface:
   display_name: "BGM Montage"
-  short_description: "Plan, source, render, and QA BGM-led Pixabay montages"
-  default_prompt: "Use $bgm-montage v1.3 to derive a task-specific visual profile from my request, read-only references, and BGM; intelligently reuse or search Pixabay footage; prioritize aesthetic quality, whole-film cohesion, visual match cuts, and low repetition; render without overwriting prior runs; optionally create an editable JianYing draft; and deliver only after automatic QA passes. If CLIP is unavailable, use structural fallback only when I explicitly allow it."
+  short_description: "Plan, source, render, and QA quality-first BGM montages"
+  default_prompt: "Use $bgm-montage v1.3 to derive a task-specific visual profile from my request, read-only references, and BGM; intelligently reuse or search YouTube or Pixabay footage; in the default local_evaluation mode apply no copyright or license restriction, weighting, or recurring report warning and prioritize final visual quality over source; switch to publish mode only when I explicitly say this video will be distributed; render without overwriting prior runs; and deliver only after automatic QA passes."
 
 policy:
   allow_implicit_invocation: true

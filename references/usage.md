@@ -1,5 +1,27 @@
 # bgm-montage v1.3 使用说明
 
+## YouTube-first acquisition
+
+Use `--source-provider youtube` when YouTube should be searched before Pixabay. This mode requires `yt-dlp` and a configured JavaScript runtime, does not require `PIXABAY_API_KEY`, and preserves the existing v1.3 reference analysis, BGM analysis, timeline planning, source-window selection, rendering, and QA stages.
+
+```powershell
+& $Python (Join-Path $SkillRoot "scripts\bgm_montage.py") `
+  --source-provider youtube `
+  --search-query "shelf cloud over highway raw footage" `
+  --search-query "supercell storm field raw video 4k" `
+  --youtube-results-per-query 8 `
+  --youtube-max-download-candidates 30 `
+  --exclude-youtube-id "REJECTED_ID" `
+  --bgm ".\music\track.mp3" `
+  --theme "cinematic approaching storm landscape" `
+  --ratio 16:9 `
+  --output-dir ".\renders"
+```
+
+Provider-compatible manifests record the YouTube ID, title, channel, page URL, actual query, download section, local path, quality analysis, and usable source windows. After contact-sheet review, pass a curated manifest with `--asset-manifest PATH`; this skips acquisition only and leaves the v1.3 editing core active.
+
+`--usage-mode local_evaluation` is the default. It applies zero authorization/copyright weight, does not restrict ordinary YouTube material, does not generate license-oriented search terms, and suppresses repeated rights reminders in reports. Use `--usage-mode publish` only after the user explicitly states that the current video will be publicly distributed, commercially used, or externally shared; publication policy is then task-specific rather than inferred.
+
 ## 1. 运行环境
 
 推荐并验证的 Python 主版本是 **CPython 3.11**。依赖锁定文件面向 CPython 3.11.9 / Windows 11 x64；系统还必须提供可执行的 `ffmpeg` 和 `ffprobe`。

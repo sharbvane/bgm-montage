@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified entry point for reference-style, BGM-driven Pixabay montage creation."""
+"""Unified entry point for reference-style, BGM-driven montage creation."""
 
 from __future__ import annotations
 
@@ -32,6 +32,9 @@ from runtime_paths import RuntimePaths, discover_project_root
 from timeline_planner import plan_timeline_slots
 from validate_output import validate_output
 from visual_intelligence import build_visual_style_profile
+from youtube_pipeline import InsufficientMaterialError as YouTubeInsufficientMaterialError
+from youtube_pipeline import run_youtube_pipeline
+from material_usage_policy import USAGE_MODES, apply_usage_policy, material_usage_policy, normalize_usage_mode
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -190,6 +193,12 @@ def _invocation_payload(
         "max_search_pages": int(_arg(args, "max_search_pages", 3)),
         "priority_queries": list(_arg(args, "priority_queries", []) or []),
         "wide_aerial_only": bool(_arg(args, "wide_aerial_only", False)),
+        "source_provider": str(_arg(args, "source_provider", "pixabay")),
+        "usage_mode": str(_arg(args, "usage_mode", "local_evaluation")),
+        "asset_manifest": str(_arg(args, "asset_manifest", "") or ""),
+        "youtube_results_per_query": int(_arg(args, "youtube_results_per_query", 8)),
+        "youtube_max_download_candidates": int(_arg(args, "youtube_max_download_candidates", 36)),
+        "excluded_youtube_ids": list(_arg(args, "excluded_youtube_ids", []) or []),
         "visual_style": str(_arg(args, "visual_style", "auto")),
         "excluded_pixabay_ids": list(_arg(args, "excluded_pixabay_ids", []) or []),
         "max_reuse_per_asset": int(_arg(args, "max_reuse_per_asset", 1)),
@@ -313,7 +322,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     """Run the v1.3 pipeline, checkpointing every reusable stage."""
 
     load_dotenv(PROJECT_ROOT / ".env", override=False)
-    if not os.getenv("PIXABAY_API_KEY"):
+    source_provider = str(_arg(args, "source_provider", "pixabay")).lower()
+    usage_mode = normalize_usage_mode(_arg(args, "usage_mode", "local_evaluation"))
+    if source_provider == "pixabay" and not os.getenv("PIXABAY_API_KEY"):
         raise RuntimeError(f"PIXABAY_API_KEY is missing. Put it in {PROJECT_ROOT / '.env'}.")
 
     bgm_path = Path(args.bgm).expanduser().resolve()
@@ -351,7 +362,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "material theme directory", material_theme_directory(material_dir, args.theme), reference_dir
     )
     cache_root = Path(args.cache_dir).expanduser().resolve()
-    for cache_name in ("references", "bgm", "pixabay"):
+    for cache_name in ("references", "bgm", source_provider):
         _assert_writable_tree_separate(f"{cache_name} cache directory", cache_root / cache_name, reference_dir)
 
     invocation = _invocation_payload(
@@ -407,7 +418,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "reference_dir": str(reference_dir),
             "material_dir": str(material_dir),
         },
-        "api_key_configured": True,
+        "source_provider": source_provider,
+        "usage_mode": usage_mode,
+        "material_usage_policy": material_usage_policy(usage_mode),
+        "api_key_configured": bool(os.getenv("PIXABAY_API_KEY")) if source_provider == "pixabay" else None,
         "stages": {},
         "artifacts": {"run_state": str(state_path), "run_report": str(run_report_path)},
         "passed": False,
@@ -557,7 +571,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         asset_manifest_path = run_dir / "asset_manifest.json"
         sources_path = run_dir / "sources.json"
         print(
-            f"[5/7] Searching a >= {_arg(args, 'candidate_pool_multiplier', 6)}x pool and selecting {desired_assets} Pixabay assets",
+            f"[5/7] Searching a >= {_arg(args, 'candidate_pool_multiplier', 6)}x pool and selecting {desired_assets} {source_provider} assets",
             flush=True,
         )
         material_sources_path: Path | None = None
@@ -566,37 +580,68 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             material_candidate = material_theme_directory(material_dir, args.theme) / "sources.json"
             material_sources_path = material_candidate if material_candidate.is_file() else None
             pixabay_resumed = True
+        elif _arg(args, "asset_manifest", None):
+            provided_manifest = Path(str(_arg(args, "asset_manifest", None))).expanduser().resolve()
+            if not provided_manifest.is_file():
+                raise FileNotFoundError(f"Provided asset manifest not found: {provided_manifest}")
+            media_result = _media_result_from_manifest(provided_manifest)
+            material_sources_path = provided_manifest
+            _copy_or_create_sources(media_result, asset_manifest_path)
+            pixabay_resumed = True
         else:
-            media_result = run_pixabay_pipeline(
-                args.theme,
-                style_profile,
-                audio_profile,
-                material_dir,
-                cache_root / "pixabay",
-                desired_assets,
-                args.ratio,
-                min_resolution=(args.min_width, args.min_height),
-                dry_run=False,
-                target_duration=target_duration,
-                timeline_plan=timeline_plan,
-                candidate_pool_multiplier=int(_arg(args, "candidate_pool_multiplier", 6)),
-                max_search_pages=int(_arg(args, "max_search_pages", 3)),
-                priority_queries=list(_arg(args, "priority_queries", []) or []),
-                wide_aerial_only=bool(_arg(args, "wide_aerial_only", False)),
-                visual_cohesion_profile=visual_request,
-                excluded_pixabay_ids=list(_arg(args, "excluded_pixabay_ids", []) or []),
-            )
+            if source_provider == "youtube":
+                media_result = run_youtube_pipeline(
+                    args.theme,
+                    style_profile,
+                    audio_profile,
+                    material_dir,
+                    cache_root / "youtube",
+                    desired_assets,
+                    args.ratio,
+                    min_resolution=(args.min_width, args.min_height),
+                    target_duration=target_duration,
+                    timeline_plan=timeline_plan,
+                    candidate_pool_multiplier=int(_arg(args, "candidate_pool_multiplier", 6)),
+                    priority_queries=list(_arg(args, "priority_queries", []) or []),
+                    visual_cohesion_profile=visual_request,
+                    excluded_youtube_ids=list(_arg(args, "excluded_youtube_ids", []) or []),
+                    results_per_query=int(_arg(args, "youtube_results_per_query", 8)),
+                    max_download_candidates=int(_arg(args, "youtube_max_download_candidates", 36)),
+                    usage_mode=usage_mode,
+                )
+            else:
+                media_result = run_pixabay_pipeline(
+                    args.theme,
+                    style_profile,
+                    audio_profile,
+                    material_dir,
+                    cache_root / "pixabay",
+                    desired_assets,
+                    args.ratio,
+                    min_resolution=(args.min_width, args.min_height),
+                    dry_run=False,
+                    target_duration=target_duration,
+                    timeline_plan=timeline_plan,
+                    candidate_pool_multiplier=int(_arg(args, "candidate_pool_multiplier", 6)),
+                    max_search_pages=int(_arg(args, "max_search_pages", 3)),
+                    priority_queries=list(_arg(args, "priority_queries", []) or []),
+                    wide_aerial_only=bool(_arg(args, "wide_aerial_only", False)),
+                    visual_cohesion_profile=visual_request,
+                    excluded_pixabay_ids=list(_arg(args, "excluded_pixabay_ids", []) or []),
+                    usage_mode=usage_mode,
+                )
             material_sources_path = _material_sources_path(media_result)
             _copy_or_create_sources(media_result, asset_manifest_path)
             pixabay_resumed = False
         if not asset_manifest_path.is_file():
             _copy_or_create_sources(media_result, asset_manifest_path)
+        _write_json(asset_manifest_path, apply_usage_policy(_read_json(asset_manifest_path), usage_mode))
         _json_copy(asset_manifest_path, sources_path)
         selected = media_result.get("selected") or media_result.get("selected_assets") or []
         if not selected:
-            raise RuntimeError("Pixabay search completed without any selected local videos")
-        report["stages"]["pixabay"] = {
-            "status": "resumed" if pixabay_resumed else "ok",
+            raise RuntimeError(f"{source_provider} search completed without any selected local videos")
+        report["stages"][source_provider] = {
+            "status": "provided_manifest" if _arg(args, "asset_manifest", None) else ("resumed" if pixabay_resumed else "ok"),
             "selected": len(selected),
             "candidate_count": media_result.get("candidate_count"),
             "candidate_pool_gate": media_result.get("candidate_pool_gate"),
@@ -798,7 +843,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
         report["passed"] = False
         report["failure"] = {"type": type(exc).__name__, "message": _strip_secret(str(exc))}
-        if isinstance(exc, (PixabayInsufficientMaterialError, TimelineInsufficientMaterialError)):
+        if isinstance(exc, (PixabayInsufficientMaterialError, YouTubeInsufficientMaterialError, TimelineInsufficientMaterialError)):
             report["failure"]["category"] = "insufficient_material"
         checkpoint()
         raise
@@ -824,6 +869,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference-dir", default=str(PROJECT_ROOT / "参考视频"))
     parser.add_argument("--material-dir", default=str(PROJECT_ROOT / "视频素材"))
     parser.add_argument("--cache-dir", default=str(PROJECT_ROOT / ".bgm-montage-cache"))
+    parser.add_argument(
+        "--source-provider",
+        choices=("pixabay", "youtube"),
+        default="pixabay",
+        help="Material acquisition provider. YouTube mode uses yt-dlp and does not require PIXABAY_API_KEY.",
+    )
+    parser.add_argument(
+        "--usage-mode",
+        choices=USAGE_MODES,
+        default="local_evaluation",
+        help="Default local evaluation applies no copyright/license restriction or ranking weight; use publish only after explicit distribution intent.",
+    )
+    parser.add_argument(
+        "--asset-manifest",
+        help="Use an already downloaded and visually reviewed asset manifest; skips provider search/download only.",
+    )
     parser.add_argument("--assets", type=int, help="Override final asset count (default derives from duration)")
     parser.add_argument("--min-width", type=int, default=1280)
     parser.add_argument("--min-height", type=int, default=720)
@@ -844,7 +905,16 @@ def build_parser() -> argparse.ArgumentParser:
         dest="priority_queries",
         action="append",
         default=[],
-        help="Exact priority Pixabay query; repeat for multiple location-led searches.",
+        help="Exact priority provider query; repeat for multiple visual search directions.",
+    )
+    parser.add_argument("--youtube-results-per-query", type=int, default=8)
+    parser.add_argument("--youtube-max-download-candidates", type=int, default=36)
+    parser.add_argument(
+        "--exclude-youtube-id",
+        dest="excluded_youtube_ids",
+        action="append",
+        default=[],
+        help="Exclude a YouTube video ID after contact-sheet review; repeat as needed.",
     )
     parser.add_argument(
         "--wide-aerial-only",

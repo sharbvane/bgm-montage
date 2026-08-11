@@ -22,11 +22,35 @@ from montage import (  # noqa: E402
     render_timeline,
     timeline_diversity_issues,
 )
-from validate_output import validate_output  # noqa: E402
+from validate_output import _climax_metrics, validate_output  # noqa: E402
 
 
 FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
+
+
+def test_climax_qa_uses_event_windows_when_early_drop_role_misses_late_peak() -> None:
+    shots = [
+        {
+            "output_start": 0.0, "output_end": 2.0, "output_duration": 2.0,
+            "audio_section_role": "drop", "source_motion": 0.30, "source_shot_scale": "wide",
+        },
+        {
+            "output_start": 2.0, "output_end": 5.0, "output_duration": 3.0,
+            "audio_section_role": "outro", "source_motion": 0.18, "source_shot_scale": "medium",
+        },
+        {
+            "output_start": 5.0, "output_end": 7.5, "output_duration": 2.5,
+            "audio_section_role": "outro", "source_motion": 0.92, "source_shot_scale": "wide",
+            "is_emphasis": True,
+        },
+    ]
+    audiomap = {"events": {"climaxes": [6.5], "drops": [6.5]}}
+    metrics = _climax_metrics(shots, audiomap, 7.5)
+    assert metrics is not None
+    assert metrics["comparison_method"] == "drop_and_climax_event_windows"
+    assert metrics["section_role_event_window_coverage"] < 0.50
+    assert metrics["passed"] is True
 
 
 def _asset(path: Path, index: int, *, fingerprint: str | None = None) -> dict:

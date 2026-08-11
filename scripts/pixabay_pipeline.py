@@ -51,6 +51,7 @@ from visual_intelligence import (
     metadata_profile_fit,
     plan_visual_search_queries,
 )
+from material_usage_policy import USAGE_MODES, apply_usage_policy, normalize_usage_mode
 from visual_semantics import (
     aggregate_subject_regions,
     face_content_risk,
@@ -3053,6 +3054,7 @@ def run_pixabay_pipeline(
     wide_aerial_only: bool = False,
     visual_cohesion_profile: str = "none",
     excluded_pixabay_ids: Sequence[str | int] = (),
+    usage_mode: str = "local_evaluation",
 ) -> dict[str, Any]:
     """Search, select, download, QA, deduplicate, and attribute Pixabay clips.
 
@@ -3061,6 +3063,7 @@ def run_pixabay_pipeline(
     tried automatically.  Runtime artifacts never contain the API credential.
     """
 
+    usage_mode = normalize_usage_mode(usage_mode)
     if not str(theme).strip():
         raise ValueError("theme must not be empty")
     desired_count = int(desired_count)
@@ -3724,7 +3727,7 @@ def run_pixabay_pipeline(
         sufficiency["passed"] = False
         status = "insufficient_material"
 
-    manifest = {
+    manifest = apply_usage_policy({
         "schema_version": SCHEMA_VERSION,
         "asset_manifest_schema_version": ASSET_MANIFEST_SCHEMA_VERSION,
         "manifest_type": "asset_manifest",
@@ -3775,9 +3778,8 @@ def run_pixabay_pipeline(
         "reuse_summary": dict(
             Counter(str(source.get("reuse_mode") or "unknown") for source in selected)
         ),
-        "attribution_notice": "Pixabay source metadata retained for traceability; verify current Pixabay license terms when publishing.",
         "heuristic_notice": "Content, shot scale, motion, aesthetic quality, and visual consistency labels are sampled signal-derived estimates.",
-    }
+    }, usage_mode)
     snapshot_token = secrets.token_hex(12)
     snapshot_path = (
         cache_root
@@ -4168,6 +4170,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dry-run", action="store_true", help="search and rank without downloading full videos")
     parser.add_argument("--result-json", help="optional path for the returned stage result")
+    parser.add_argument("--usage-mode", choices=USAGE_MODES, default="local_evaluation")
     return parser
 
 
@@ -4198,6 +4201,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             wide_aerial_only=args.wide_aerial_only,
             visual_cohesion_profile=args.visual_cohesion_profile,
             excluded_pixabay_ids=args.excluded_pixabay_ids,
+            usage_mode=args.usage_mode,
         )
         if args.result_json:
             _atomic_write_json(Path(args.result_json).expanduser().resolve(), result)

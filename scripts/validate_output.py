@@ -310,7 +310,19 @@ def _climax_metrics(
         if str(shot.get("audio_section_role") or shot.get("section_role") or "").lower()
         in {"intro", "break", "outro"}
     ]
-    if role_climax and role_calm:
+    # A section label is only a trustworthy proxy for the actual musical peak
+    # when it covers most detected climax/drop windows.  Short tracks can have
+    # one early ``drop`` section while later accents inside an ``outro`` carry
+    # the strongest energy; blindly preferring section roles makes the QA
+    # impossible to satisfy no matter how the later event-driven edit changes.
+    role_window_coverage = (
+        sum(any(overlaps(shot, [window]) for shot in role_climax) for window in windows)
+        / max(1, len(windows))
+        if role_climax
+        else 0.0
+    )
+    role_window_coverage = min(1.0, role_window_coverage)
+    if role_climax and role_calm and role_window_coverage >= 0.50:
         climax_shots = role_climax
         calm_shots = role_calm
         comparison_method = "audiomap_section_roles"
@@ -337,6 +349,7 @@ def _climax_metrics(
     return {
         "windows": [[round(left, 4), round(right, 4)] for left, right in windows],
         "comparison_method": comparison_method,
+        "section_role_event_window_coverage": round(role_window_coverage, 4),
         "climax_shot_count": len(climax_shots),
         "climax_cut_density": round(climax_density, 4),
         "calm_cut_density": round(calm_density, 4),
