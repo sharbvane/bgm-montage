@@ -41,6 +41,7 @@ REQUIRED_SCRIPTS = (
     "package_skill.py",
     "pixabay_pipeline.py",
     "runtime_paths.py",
+    "timeline_planner.py",
     "validate_output.py",
     "visual_semantics.py",
 )
@@ -131,13 +132,16 @@ def collect_allowlisted_files(skill_root: str | os.PathLike[str]) -> list[Path]:
     if not root.is_dir() or root.name != SKILL_NAME:
         raise PackagingError(f"Skill root must be a directory named {SKILL_NAME}: {root}")
 
+    required_relatives = [
+        *map(Path, REQUIRED_ROOT_FILES),
+        *REQUIRED_EXACT_FILES,
+        *(Path("scripts") / name for name in REQUIRED_SCRIPTS),
+    ]
     missing: list[str] = []
-    for relative in (*map(Path, REQUIRED_ROOT_FILES), *REQUIRED_EXACT_FILES):
-        if not (root / relative).is_file():
+    for relative in required_relatives:
+        required_path = root / relative
+        if not required_path.is_file() or required_path.is_symlink():
             missing.append(relative.as_posix())
-    for name in REQUIRED_SCRIPTS:
-        if not (root / "scripts" / name).is_file():
-            missing.append(f"scripts/{name}")
     if missing:
         raise PackagingError("Required package files are missing: " + ", ".join(sorted(missing)))
 
@@ -166,6 +170,17 @@ def collect_allowlisted_files(skill_root: str | os.PathLike[str]) -> list[Path]:
 
     if not any(relative.parts and relative.parts[0] == "tests" for relative in selected.values()):
         raise PackagingError("At least one allowlisted automated test is required under tests/")
+    selected_names = set(selected)
+    omitted_required = sorted(
+        relative.as_posix()
+        for relative in required_relatives
+        if relative.as_posix() not in selected_names
+    )
+    if omitted_required:
+        raise PackagingError(
+            "Required package files were not admitted to the ZIP allowlist: "
+            + ", ".join(omitted_required)
+        )
     return [selected[key] for key in sorted(selected)]
 
 
@@ -335,7 +350,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Canonical bgm-montage Skill directory",
     )
     parser.add_argument("--output", help="Destination .zip path")
-    parser.add_argument("--version", default="1.1", help="Version used by the default ZIP filename")
+    parser.add_argument("--version", default="1.2", help="Version used by the default ZIP filename")
     parser.add_argument("--force", action="store_true", help="Explicitly replace an existing ZIP")
     return parser
 

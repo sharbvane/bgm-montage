@@ -15,6 +15,7 @@ if str(SCRIPTS) not in sys.path:
 import pixabay_pipeline as pipeline  # noqa: E402
 from montage import (  # noqa: E402
     InsufficientMaterialError,
+    _candidate_score,
     build_timeline,
     parse_ratio,
     plan_subject_crop,
@@ -359,3 +360,55 @@ def test_manufacturing_is_not_man_and_face_risk_monotonically_lowers_scores(
     by_id = {int(item["id"]): item for item in scored}
     assert by_id[11]["face_content_risk"] < by_id[12]["face_content_risk"] < by_id[13]["face_content_risk"]
     assert by_id[11]["pre_score"] > by_id[12]["pre_score"] > by_id[13]["pre_score"]
+
+
+def test_structural_motion_scoring_reserves_fast_clips_for_climax() -> None:
+    """Intro accents must not consume the strongest motion before the climax."""
+
+    def asset(key: str, motion: float) -> dict[str, object]:
+        return {
+            "canonical_source_key": key,
+            "tags": "nature journey landscape",
+            "scene_category": "nature",
+            "subject_label": "landscape",
+            "search_query": "nature journey landscape",
+            "motion": motion,
+            "motion_label": "dynamic" if motion > 0.6 else "gentle",
+            "shot_scale": "wide",
+            "width": 1920,
+            "height": 1080,
+            "quality_score": 0.8,
+            "stability_score": 0.8,
+            "score": 0.8,
+            "face_risk": 0.0,
+        }
+
+    intro_slot = {
+        "index": 0,
+        "recommended_content": "nature journey landscape",
+        "mood": "balanced",
+        "section_role": "intro",
+        "is_emphasis": False,
+    }
+    climax_slot = {**intro_slot, "index": 1, "section_role": "climax", "is_emphasis": True}
+    slow = asset("pixabay:slow", 0.30)
+    fast = asset("pixabay:fast", 0.90)
+    spec = parse_ratio("16:9")
+
+    intro_slow, intro_slow_parts = _candidate_score(
+        slow, intro_slot, None, "wide", 0.9, "dynamic", spec, "nature journey", "motion-policy"
+    )
+    intro_fast, intro_fast_parts = _candidate_score(
+        fast, intro_slot, None, "wide", 0.9, "dynamic", spec, "nature journey", "motion-policy"
+    )
+    climax_slow, climax_slow_parts = _candidate_score(
+        slow, climax_slot, None, "wide", 0.5, "dynamic", spec, "nature journey", "motion-policy"
+    )
+    climax_fast, climax_fast_parts = _candidate_score(
+        fast, climax_slot, None, "wide", 0.5, "dynamic", spec, "nature journey", "motion-policy"
+    )
+
+    assert intro_slow > intro_fast
+    assert climax_fast > climax_slow
+    assert intro_slow_parts["structural_motion_target"] == pytest.approx(0.34)
+    assert climax_fast_parts["structural_motion_target"] == pytest.approx(0.82)

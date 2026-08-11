@@ -1,19 +1,40 @@
 # Changelog
 
+## v1.2 — 2026-08-08
+
+- 将 BGM 分析统一为结构化 `audiomap.json`：增加确定性的 beat/downbeat、onset、能量、密度、静音/低能量区间、hard stop、drop、surge、climax、乐句、段落角色、重复结构和分析摘要。
+- 增加保守的节奏模式判定：节拍置信度、间隔稳定性、覆盖和脉冲证据达标时使用 `beat_cut`；舒缓、氛围或不稳定节拍使用 `phrase_flow`。
+- 增加下载前 `timeline.json`，让镜头边界优先吸附真实音乐事件，并逐槽位记录段落、情绪、能量、画面内容、景别、运动、重点事件和转场建议。
+- 将参考 `style_profile.json` 与 `editing_grammar.json` 接入实际时间线和选片：参与镜头时长、切点权重、段落密度、景别/运动变化、相邻镜头差异、简单转场和结尾结构。
+- 统一 v1.2 主产物为 `audiomap.json`、`timeline.json`、`asset_manifest.json`、`edit_decisions.json` 和 `render_report.json`；同时保留 v1.1 的 `bgm_profile.json`、`sources.json`、`edit_plan.json` 和 `validation.json` 兼容别名。
+- 强化 Pixabay 候选池门槛：默认要求每个计划镜头至少 6 个元数据候选，并检查重点槽位覆盖；扩展查询和缓存检索后仍不足时明确失败。
+- 素材清单增加统一 canonical source 身份、文件哈希、可用连续区间、质量/语义标签、下载/复用状态、历史使用和实际输出/源区间；已下载素材可跨主题、跨项目复用而不重复下载。
+- 增加 Pixabay ID 级跨进程事务锁、PID/token/心跳与死进程回收；锁内二次读取统一索引，保证并行项目对同一素材只下载一次。共享主题清单使用事务锁和每次运行的不可变快照，坏 JSON 或权限错误会 fail-closed。
+- 时间线默认同一 canonical source 只使用一次；有限复用仍受最大次数、累计画面占比、镜头/时间间隔和源区间重叠限制。
+- 增加素材内部最佳区间选择，避开片头片尾、黑帧、低变化、强抖动和动作结束后的停顿；不再用最后一帧冻结补齐镜头。
+- 增加逐槽位综合评分与相邻多样性检查，综合主题/槽位语义、段落情绪、运动、景别、画质、比例、可用时长、历史复用、人脸风险以及前后镜头差异。
+- 参考视频画像增加镜头时长分布、分阶段节奏、运动方向、转场提示、关键镜头、高潮剪辑密度和重复/相邻关系；v1.1 指纹缓存可非破坏性迁移并派生 v1.2 字段。
+- 渲染仅使用硬切、淡入淡出（含淡黑）和短叠化，并对软转场设置预算；保留主体感知裁剪、模糊背景填充、恒速片段变速和统一调色。
+- 将逐镜头时长统一量化到全局输出帧网格，合并不足 0.5 秒的尾部碎片槽位，并为源解码保留非冻结帧余量，避免 concat 逐段取整与全局截断把最后镜头压成单帧；QA 增加严格流时长、计划尾镜和编码后尾部突变检查。
+- 扩展 `render_report.json`：完整解码、音视频流时长、分辨率、帧率、音量、黑帧、冻结、静音、来源路径、源区间、重复率、人脸预算、裁剪安全、相邻多样性、音乐切点对齐和高潮视觉响应。
+- QA 失败时按新尝试种子重新分配素材、选择源区间并重渲染；只有最终报告通过后才写入素材使用历史。默认最多自动返工 2 次，全部失败时不交付成片。
+- 增加 `run_state.json` 断点续跑校验；继续保持 UTC/随机 `run_id` 和默认不覆盖历史输出。
+- CLI 新增候选池、搜索页数、来源复用/占比、重复间隔、返工次数和显式语义降级配置；v1.1 主要参数继续兼容。
+
+### 明确边界
+
+v1.2 不识别或复刻复杂遮罩/wipe、match cut、速度坡度、字幕内容或样式、OCR、动态字幕/图形、人物身份、可靠时序动作或逐帧主体跟踪。CLIP 仅是采样帧零样本语义增强；不可用时必须显式允许 structural fallback，报告会保留降级状态。参考视频的淡化/叠化标签是保守提示，不代表可复刻任意复杂特效。Linux/Docker 仅验证 ZIP 路径布局兼容，不宣称完成现场运行验证。
+
 ## v1.1 — 2026-08-02
 
-- Moved the canonical Skill layout to `.agents/skills/bgm-montage` and corrected project-root installation and invocation examples.
-- Unified Pixabay cache paths at `.bgm-montage-cache/pixabay/{search,thumbnails}` and added non-destructive migration from the legacy nested path.
-- Added a machine-level material catalog and hard-link/shared-reference reuse for already downloaded Pixabay assets across themes and projects.
-- Added bounded three-round query expansion plus hard material gates for independent assets, scene diversity, theoretical coverage, reuse count, per-asset screen share, low-face inventory and prominent-face screen share.
-- Added pretrained CLIP zero-shot semantics to sampled reference shots, alongside the existing OpenCV color, exposure, cut, motion, framing and text-region measurements.
-- Added saliency and frontal-face subject geometry for source QA and subject-aware crop planning, with blur-fill fallback when crop retention is unsafe.
-- Added cached reference-audio analysis and `editing_grammar.json`, including cut alignment to accents, strong/weak beats, phrases, sections, pauses and energy, plus shot-duration and adjacency statistics.
-- Connected the learned grammar to actual boundary weighting, energy-dependent shot duration, scale/motion progression, repeated-section variation and ending duration in the timeline.
-- Added UTC/random `run_id` directories and refusal to overwrite existing run outputs by default.
-- Expanded source manifests with search/rejection records, reuse mode and actual usage intervals; expanded validation with repetition, face-budget and crop-plan checks.
-- Added a pinned CPython 3.11 dependency lock, automated tests, and an allowlisted secret-safe ZIP builder using portable `/` member paths.
-
-### Deliberate limitations
-
-The v1.1 analyzer does not identify or reproduce complex transitions, match cuts, masks, speed ramps, subtitle styling, OCR, motion graphics or people identities. CLIP action/emotion output is appearance-based, and subject-aware crop geometry is sampled rather than tracked frame by frame. Linux and Docker extraction are supported by the ZIP layout, but runtime/render verification for those environments is not claimed.
+- 将标准 Skill 布局迁移到 `.agents/skills/bgm-montage`，修正项目根目录安装和调用示例。
+- 统一 Pixabay 缓存为 `.bgm-montage-cache/pixabay/{search,thumbnails}`，并非破坏性迁移旧的重复嵌套缓存。
+- 增加机器级素材目录，以及跨主题/跨项目的硬链接或共享引用复用。
+- 增加有界三轮查询扩展，以及独立素材、场景、理论时长、复用次数、单素材画面占比、低人脸库存和正脸画面占比门槛。
+- 在 OpenCV 颜色、曝光、切点、运动、构图和文字区域统计之外，增加预训练 CLIP 零样本语义分析。
+- 增加显著区域与正脸几何，用于主体感知裁剪；不安全时使用模糊背景填充。
+- 增加参考视频音频分析和 `editing_grammar.json`，学习切点与重音、强弱拍、乐句、段落、停顿和能量的关系。
+- 将参考语法接入边界权重、能量相关镜头时长、景别/运动变化、循环段变化和结尾时长。
+- 增加 `run_id` 输出目录，默认拒绝覆盖既有运行。
+- 扩充来源清单和验证报告，增加复用方式、实际使用区间、重复、人脸预算和裁剪检查。
+- 增加 CPython 3.11 依赖锁定、自动化测试和使用标准 `/` 路径的安全 ZIP 打包器。

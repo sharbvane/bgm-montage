@@ -232,7 +232,7 @@ def _fixture_assets(project: Path) -> list[dict[str, object]]:
 
 @pytest.mark.skipif(not FFMPEG or not FFPROBE, reason="offline render test requires ffmpeg and ffprobe")
 def test_offline_reference_bgm_grammar_timeline_render_and_full_decode(tmp_path: Path) -> None:
-    """Exercise the real v1.1 pipeline without network or external media."""
+    """Exercise the real v1.2 pipeline without network or external media."""
 
     project = tmp_path / "中文 空格 项目"
     reference_dir = project / "参考 视频"
@@ -270,7 +270,7 @@ def test_offline_reference_bgm_grammar_timeline_render_and_full_decode(tmp_path:
         enable_semantics=False,
     )
     assert style_path.is_file()
-    assert style_profile["schema_version"] == "1.1"
+    assert style_profile["schema_version"] == "1.2"
     assert style_profile["corpus"]["video_count"] == 1
     assert style_profile["run_report"]["analyzed"] == 1
     assert style_profile["source_policy"] == "read_only"
@@ -337,7 +337,7 @@ def test_offline_reference_bgm_grammar_timeline_render_and_full_decode(tmp_path:
         style_profile=style_profile,
         editing_grammar=editing_grammar,
         content_policy=content_policy,
-        seed="offline-e2e-v1.1",
+        seed="offline-e2e-v1.2",
         ratio="360:640",
     )
     assert plan["editing_grammar_applied"] is True

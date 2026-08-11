@@ -1,21 +1,17 @@
 ---
 name: bgm-montage
-description: Learn shot-level visual semantics and audio-linked editing grammar from read-only reference videos, analyze a BGM, search and rank Pixabay footage, enforce diversity and low-face-use policies, and render a traceable music-driven montage. Use when Codex must create or refresh a stock-footage montage from a BGM path, theme, duration, aspect ratio, and output directory.
+description: Learn a structured style profile and audio-linked editing grammar from read-only reference videos, analyze BGM structure, search and reuse Pixabay footage, plan a music-event timeline, render a low-repetition montage, and enforce automatic media QA. Use when Codex must create a stock-footage montage from a BGM path, theme, duration, aspect ratio, and output directory.
 ---
 
-# BGM Montage v1.1
+# BGM Montage v1.2
 
-运行可复现、可追溯的“参考风格学习 + BGM 驱动 Pixabay 自动混剪”，并始终把参考视频目录视为只读。
+把只读参考视频、BGM 与 Pixabay 素材转成可追踪、可复现的自动混剪。推荐使用 CPython 3.11 和 Skill 自有 `.venv`；系统必须能在 `PATH` 中找到 `ffmpeg` 与 `ffprobe`。
 
-## 运行流程
+## 统一入口
 
-1. 使用 Python 3.11、Skill 本地 `.venv`，并确认 `ffmpeg`、`ffprobe` 在 `PATH`。
-2. 真实 Pixabay Key 只放项目根目录 `.env` 的 `PIXABAY_API_KEY`；不得输出 Key 或带 Key 的 URL。
-3. 默认通过统一入口运行。首次语义分析会获取预训练 CLIP 模型；若模型不可用，统一入口默认失败。只有用户明确接受结构统计降级时才传 `--allow-semantic-fallback`。
-4. 检查运行目录中的 `style_profile.json`、`editing_grammar.json`、`bgm_profile.json`、`edit_plan.json`、`sources.json`、`validation.json` 与 `run_report.json`。
-5. 仅在素材充足度和完整成片验证都通过时交付视频；素材不足必须保留搜索/淘汰记录并明确失败。
+真实 API Key 只从当前项目根目录 `.env` 或进程环境变量 `PIXABAY_API_KEY` 读取。不要把 Key 写入源码、命令输出、日志、报告或 ZIP。
 
-从项目根目录执行：
+从项目根目录运行：
 
 ```powershell
 & ".\.agents\skills\bgm-montage\.venv\Scripts\python.exe" `
@@ -27,26 +23,31 @@ description: Learn shot-level visual semantics and audio-linked editing grammar 
   --output-dir ".\renders"
 ```
 
-每次运行写入 `<output-dir>/<project-slug>/<run-id>/`。`run_id` 默认是 UTC 时间戳加随机后缀；指定的 `--run-id` 已存在时直接失败，不静默覆盖。
+每次运行写入 `<output-dir>/<project-slug>/<run-id>/`。未传 `--run-id` 时自动生成 UTC 时间戳加随机后缀；已有目录不会被静默覆盖。失败运行可用完全相同的输入、原 `--run-id` 和 `--resume-run` 继续。
 
-## 已实现的决策链
+## 执行约束
 
-- 参考视频：OpenCV 统计加预训练 CLIP 零样本语义，按检测镜头输出主体、场景、表观动作、景别、构图、运动、情绪、搜索关键词和显著主体区域。
-- 参考音频：把检测切点与强重音、强弱拍、乐句、段落、停顿、能量及结尾时序对齐，生成缓存的 `editing_grammar.json`。
-- 搜索与筛选：风格画像、语义关键词、BGM 阶段意图和低人脸策略共同影响英文查询及评分；只下载最终候选的高清版本。
-- 时间线：语法中的事件权重、分能量镜头时长、景别/运动相邻矩阵和结尾时长会影响实际选片与切点；`edit_plan.json` 逐镜头记录影响字段。
-- 安全裁剪：显著区域与正脸几何决定主体感知裁剪；主体保留不足或比例转换过激时改用模糊背景填充。
-- 硬门槛：独立素材数、场景数、低人脸素材数、单素材最多复用次数、单素材画面占比和正脸画面占比均受约束。
+1. 参考视频目录始终只读：不得移动、重命名、修改或覆盖其中任何文件，也不得把缓存或输出写到该目录内。
+2. 优先运行统一入口；仅在排错或复用中间产物时使用单阶段入口。所有入口共用 `<project>/.bgm-montage-cache/{references,bgm,pixabay}`。
+3. 参考语义分析默认尝试本地/预训练 CLIP。CLIP 不可用时，统一入口默认失败；只有明确接受结构化降级时才传 `--allow-semantic-fallback`。降级结果必须保留 unavailable/degraded 状态，不得宣称已完成真实语义识别。
+4. Pixabay 在下载前先建立音乐事件驱动的镜头槽位，并要求元数据候选池、重点槽位覆盖、独立来源、场景多样性、可用时长和低人脸库存达标。搜索扩展后仍不足时明确失败，不得用高度重复素材强行成片。
+5. 已下载 Pixabay 素材可通过统一素材索引跨主题、跨项目复用；同一成片仍受来源复用次数、累计画面占比、重复间隔和源区间重叠限制。
+6. 只在最终成片通过完整解码、音视频流、时长、分辨率、帧率、音量、黑帧、冻结、静音、尾部碎片镜头、重复率、裁剪、卡点和高潮响应检查后提交使用历史。确定性 QA 失败时会重新分配素材并重渲染，默认最多返工 2 次；全部失败则不交付成片。
 
-## 真实性边界
+## 核心产物
 
-当前学习范围是采样镜头、硬切时序和可解释的统计/零样本估计。没有实现或宣称复刻复杂转场、match cut、遮罩、speed ramp、字幕样式、OCR、动态图形或人物身份识别。CLIP 的动作和情绪是单帧外观估计，不是时序动作识别；文字区域检测不是 OCR；显著区域裁剪不是人物跟踪。模型不可用时只允许显式降级，输出会标注 degraded。
+- `audiomap.json`：唯一可信的 BGM 分析；包含节拍、onset、能量、密度、静音、hard stop、drop、surge、climax、乐句、段落及 `beat_cut` / `phrase_flow` 判断。
+- `timeline.json`：下载前的音乐事件镜头槽位计划。
+- `asset_manifest.json`：候选、筛选、下载、复用、来源和实际使用区间。
+- `edit_decisions.json`：逐镜头源区间、速度、裁剪、转场和选片理由。
+- `render_report.json`：最终媒体探测、完整解码和结构化 QA 结果。
 
-## 不可破坏约束
+为兼容 v1.1，运行目录仍同时生成 `bgm_profile.json`、`edit_plan.json`、`sources.json` 和 `validation.json` 别名文件，并保留原有主要命令行参数。
 
-- 不移动、不重命名、不修改、不覆盖参考目录中的任何文件。
-- 不把 `.env`、`.venv`、模型、缓存、下载素材或测试成片放入发布 ZIP。
-- 保留 Pixabay 素材 ID、作者、页面链接、搜索词、本地路径、复用方式和实际使用区间。
-- 先复用跨项目素材库中的同一 Pixabay 素材；可硬链接时建立主题内硬链接，否则引用已有文件，不重复下载。
+## 已实现边界
 
-安装、单阶段命令、缓存目录、门槛、降级方式、测试和打包说明见 [references/usage.md](references/usage.md)。
+参考学习会实际影响音乐边界吸附、镜头时长、段落密度、景别与运动目标、相邻镜头差异、少量转场和结尾结构。渲染仅支持硬切、淡入淡出（含淡黑）和短叠化，并可对单个源片段做安全范围内的恒速变速。
+
+未实现或不宣称支持：复杂遮罩与 wipe、match cut、速度坡度、字幕内容或样式复刻、OCR、动态字幕/图形、人物身份识别、可靠的时序动作识别、逐帧主体跟踪，以及对参考视频复杂特效的自动复刻。主体裁剪来自采样显著区域/正脸几何；不安全时改用模糊背景填充或淘汰素材，不代表人工级构图保证。
+
+安装、单阶段命令、缓存、配置、兼容参数和打包说明见 [references/usage.md](references/usage.md)。

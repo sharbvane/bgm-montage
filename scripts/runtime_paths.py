@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared path contracts for bgm-montage v1.1.
+"""Shared path contracts for bgm-montage.
 
 Every entry point uses the same project cache layout.  The Pixabay stage is
 always rooted at ``<cache>/pixabay``; helpers accept the project cache root for
@@ -58,11 +58,27 @@ def default_library_root() -> Path:
     return (cache_home / "bgm-montage" / "material-library").expanduser().resolve()
 
 
+def normalize_cache_roots(cache_dir: str | os.PathLike[str]) -> tuple[Path, Path]:
+    """Return ``(project_cache_root, pixabay_stage_root)`` for either input.
+
+    Older callers did not agree on whether ``--cache-dir`` named the project
+    cache or the Pixabay stage.  Some callers consequently handed this module
+    ``.../pixabay/pixabay``.  Collapse repeated trailing stage components and
+    keep both public forms backward compatible.
+    """
+
+    path = Path(cache_dir).expanduser().resolve()
+    while path.name.casefold() == "pixabay" and path.parent.name.casefold() == "pixabay":
+        path = path.parent
+    if path.name.casefold() == "pixabay":
+        return path.parent, path
+    return path, path / "pixabay"
+
+
 def pixabay_cache_root(cache_dir: str | os.PathLike[str]) -> Path:
     """Normalize either the project cache root or its Pixabay stage root."""
 
-    path = Path(cache_dir).expanduser().resolve()
-    return path if path.name.casefold() == "pixabay" else path / "pixabay"
+    return normalize_cache_roots(cache_dir)[1]
 
 
 @dataclass(frozen=True)
@@ -90,12 +106,12 @@ class RuntimePaths:
             if project_root is not None
             else discover_project_root()
         )
-        cache = (
+        cache_input = (
             Path(cache_root).expanduser().resolve()
             if cache_root is not None
             else project / ".bgm-montage-cache"
         )
-        pixabay = pixabay_cache_root(cache)
+        cache, pixabay = normalize_cache_roots(cache_input)
         library = (
             Path(library_root).expanduser().resolve()
             if library_root is not None

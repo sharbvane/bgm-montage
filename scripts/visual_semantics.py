@@ -92,7 +92,7 @@ class ClipSemanticAnalyzer:
             from transformers import CLIPModel, CLIPProcessor
         except ImportError as exc:
             raise RuntimeError(
-                "Real semantic analysis requires torch and transformers; install the v1.1 lock file."
+                "Real semantic analysis requires torch and transformers; install the v1.2 lock file."
             ) from exc
 
         self.torch = torch
@@ -381,8 +381,6 @@ def infer_scene_category(tags: str = "", semantic: Mapping[str, Any] | None = No
             if isinstance(value, Mapping):
                 text += " " + str(value.get("label", "")).lower()
     rules = (
-        ("nature", ("nature", "forest", "mountain", "landscape", "trees", "wildlife")),
-        ("water_coast", ("ocean", "sea", "coast", "beach", "water", "waves")),
         ("architecture", ("architecture", "building", "interior", "city", "urban")),
         ("transport", ("road", "car", "vehicle", "traffic", "train", "airplane")),
         ("industrial", ("factory", "machinery", "workshop", "industrial", "production")),
@@ -390,6 +388,12 @@ def infer_scene_category(tags: str = "", semantic: Mapping[str, Any] | None = No
         ("food", ("food", "cooking", "kitchen", "ingredients")),
         ("technology", ("technology", "digital", "electronics", "computer")),
         ("abstract", ("abstract", "graphic", "background")),
+        ("polar_ice", ("polar", "arctic", "antarctic", "glacier", "iceberg", "ice cave")),
+        ("sky_space", ("starry", "stars", "galaxy", "milky way", "aurora", "night sky", "cloudscape")),
+        ("water_coast", ("ocean", "sea", "coast", "beach", "water", "waves")),
+        ("mountain_canyon", ("mountain", "canyon", "cliff", "valley", "alpine", "peak", "summit", "gorge")),
+        ("forest_wilderness", ("forest", "woods", "woodland", "jungle", "trees")),
+        ("nature", ("nature", "landscape", "wildlife", "wilderness", "outdoors")),
     )
     for category, needles in rules:
         if any(needle in text for needle in needles):

@@ -39,7 +39,14 @@ def _stub_pipeline(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
     monkeypatch.setenv("PIXABAY_API_KEY", "fixture-key-never-written")
     monkeypatch.setattr(entry, "analyze_references", lambda *args, **kwargs: {"style_profile": {}, "run_report": {"analyzed": 1, "reused": 0, "failed": 0}})
     monkeypatch.setattr(entry, "analyze_editing_grammar", lambda *args, **kwargs: {"status": "ok", "run_report": {"analyzed": 1, "reused": 0}, "reliability": {"score": 1.0}})
-    monkeypatch.setattr(entry, "analyze_bgm", lambda *args, **kwargs: {"audio_profile": {"duration_seconds": 8.0}})
+    def analyze_bgm_fixture(
+        _bgm: Path, _cache: Path, output_path: Path, _duration: float
+    ) -> dict[str, object]:
+        result: dict[str, object] = {"audio_profile": {"duration_seconds": 8.0}}
+        entry._write_json(Path(output_path), result)
+        return result
+
+    monkeypatch.setattr(entry, "analyze_bgm", analyze_bgm_fixture)
     selected = []
     for index in range(4):
         path = root / "materials" / f"asset-{index}.mp4"
@@ -86,3 +93,56 @@ def test_explicit_existing_run_id_fails_before_overwrite(tmp_path: Path, monkeyp
     entry.run(args)
     with pytest.raises(FileExistsError, match="not overwritten"):
         entry.run(args)
+
+
+def test_failed_run_resumes_from_existing_stage_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "references").mkdir()
+    (tmp_path / "music.wav").write_bytes(b"audio")
+    _stub_pipeline(monkeypatch, tmp_path)
+    args = _args(tmp_path, run_id="resume-run")
+    working_pixabay = entry.run_pixabay_pipeline
+
+    def fail_once(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise RuntimeError("intentional stage interruption")
+
+    monkeypatch.setattr(entry, "run_pixabay_pipeline", fail_once)
+    with pytest.raises(RuntimeError, match="intentional stage interruption"):
+        entry.run(args)
+
+    run_dir = tmp_path / "output" / "run-id-test" / "resume-run"
+    assert (run_dir / "audiomap.json").is_file()
+    assert not (run_dir / "run-id-test_montage.mp4").exists()
+
+    monkeypatch.setattr(entry, "run_pixabay_pipeline", working_pixabay)
+    args.resume_run = True
+    report = entry.run(args)
+
+    assert report["passed"] is True
+    assert report["resumed"] is True
+    assert report["stages"]["references"]["status"] == "resumed"
+    assert report["stages"]["bgm"]["status"] == "resumed"
+    assert Path(report["artifacts"]["video"]).is_file()
+
+
+def test_legacy_cli_names_and_primary_invocation_remain_compatible() -> None:
+    parser = entry.build_parser()
+    parsed = parser.parse_args(
+        [
+            "--bgm", "music.mp3",
+            "--theme", "city night",
+            "--duration", "12.5",
+            "--ratio", "16:9",
+            "--output-dir", "output",
+            "--max-source-reuse", "2",
+            "--max-source-share", "0.25",
+        ]
+    )
+
+    assert parsed.bgm == "music.mp3"
+    assert parsed.theme == "city night"
+    assert parsed.duration == pytest.approx(12.5)
+    assert parsed.ratio == "16:9"
+    assert parsed.max_reuse_per_asset == 2
+    assert parsed.max_asset_screen_share == pytest.approx(0.25)

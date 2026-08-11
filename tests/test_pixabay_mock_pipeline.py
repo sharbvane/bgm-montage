@@ -297,6 +297,9 @@ def test_mock_pipeline_expands_filters_downloads_selected_only_and_reuses_cache(
     )
     assert first["sufficiency"]["theoretical_screen_coverage_seconds"] >= 12.0 * 0.95
     assert manifest["status"] == "ok"
+    assert manifest["manifest_type"] == "asset_manifest"
+    assert manifest["asset_manifest_schema_version"] == 1
+    assert manifest["assets"] == manifest["sources"]
     assert manifest["sufficiency"]["passed"] is True
 
     required_source_fields = {
@@ -311,6 +314,17 @@ def test_mock_pipeline_expands_filters_downloads_selected_only_and_reuses_cache(
         "face_content_risk",
         "fingerprint",
         "reuse_mode",
+        "canonical_source_id",
+        "download_url",
+        "file_hash",
+        "ratio",
+        "semantic_tags",
+        "download_status",
+        "available",
+        "failure_reason",
+        "historical_usage_count",
+        "usage_history",
+        "usable_segments",
     }
     for source in manifest["sources"]:
         assert required_source_fields <= source.keys()

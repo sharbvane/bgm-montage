@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -26,6 +27,7 @@ from montage import MontageError, build_timeline, parse_ratio, render_timeline, 
 from pixabay_pipeline import InsufficientMaterialError as PixabayInsufficientMaterialError
 from pixabay_pipeline import material_theme_directory, run_pixabay_pipeline, update_usage_intervals
 from runtime_paths import RuntimePaths, discover_project_root
+from timeline_planner import plan_timeline_slots
 from validate_output import validate_output
 
 
@@ -56,8 +58,24 @@ def _assert_writable_tree_separate(name: str, writable: Path, reference_dir: Pat
 
 def _write_json(path: Path, data: Any) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
     return path
+
+
+def _file_fingerprint(path: Path) -> dict[str, Any]:
+    stat = path.stat()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha256": digest.hexdigest()}
+
+
+def _json_copy(source: Path, destination: Path) -> Path:
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    return _write_json(destination, payload)
 
 
 def _first_number(data: Any, keys: set[str]) -> float | None:
@@ -101,6 +119,85 @@ def _audio_payload(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _read_json(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected a JSON object: {path}")
+    return payload
+
+
+def _media_result_from_manifest(path: Path) -> dict[str, Any]:
+    payload = _read_json(path)
+    selected = payload.get("selected") or payload.get("sources") or payload.get("assets") or []
+    return {
+        **payload,
+        "selected": selected,
+        "selected_assets": selected,
+        "sources_manifest": str(path),
+    }
+
+
+def _arg(args: argparse.Namespace, name: str, default: Any) -> Any:
+    value = getattr(args, name, default)
+    return default if value is None else value
+
+
+def _merge_reference_audio_learning(
+    reference_result: dict[str, Any],
+    style_profile: dict[str, Any],
+    editing_grammar: dict[str, Any],
+) -> dict[str, Any]:
+    """Expose the learned audio/cut relation in the style payload consumers use."""
+
+    merged = dict(style_profile)
+    merged["reference_audio_editing_grammar"] = {
+        "status": editing_grammar.get("status"),
+        "reliability": editing_grammar.get("reliability", {}),
+        "cut_alignment": editing_grammar.get("cut_alignment", {}),
+        "shot_duration_model": editing_grammar.get("shot_duration_model", {}),
+        "ending_structure": editing_grammar.get("ending_structure", {}),
+        "montage_policy": editing_grammar.get("montage_policy", {}),
+        "application": (
+            "Consumed by pre-download slot planning, boundary weighting, shot-duration allocation, "
+            "scale/motion progression, transition choice, and ending structure."
+        ),
+    }
+    reference_result["style_profile"] = merged
+    reference_result["style"] = merged
+    return merged
+
+
+def _invocation_payload(
+    *,
+    bgm_path: Path,
+    reference_dir: Path,
+    material_dir: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    return {
+        "bgm": {"path": str(bgm_path), "fingerprint": _file_fingerprint(bgm_path)},
+        "reference_dir": str(reference_dir),
+        "material_dir": str(material_dir),
+        "theme": args.theme,
+        "duration": float(args.duration),
+        "ratio": args.ratio,
+        "assets": _arg(args, "assets", None),
+        "min_resolution": [int(args.min_width), int(args.min_height)],
+        "candidate_pool_multiplier": int(_arg(args, "candidate_pool_multiplier", 6)),
+        "max_search_pages": int(_arg(args, "max_search_pages", 3)),
+        "max_reuse_per_asset": int(_arg(args, "max_reuse_per_asset", 1)),
+        "max_asset_screen_share": float(_arg(args, "max_asset_screen_share", 0.30)),
+        "min_repeat_gap_shots": int(_arg(args, "min_repeat_gap_shots", 3)),
+        "min_repeat_gap_seconds": float(_arg(args, "min_repeat_gap_seconds", 6.0)),
+    }
+
+
+def _invocation_digest(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def _material_sources_path(media_result: dict[str, Any]) -> Path | None:
     for key in ("sources_manifest", "sources_path", "manifest_path"):
         value = media_result.get(key)
@@ -131,43 +228,9 @@ def _copy_or_create_sources(media_result: dict[str, Any], destination: Path) -> 
     )
 
 
-def _apply_usage_to_manifest(manifest: Path, plan: dict[str, Any]) -> None:
-    try:
-        payload = json.loads(manifest.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    if isinstance(payload, list):
-        sources = payload
-    elif isinstance(payload, dict):
-        sources = payload.get("sources", payload.get("selected", payload.get("assets", [])))
-    else:
-        return
-    if not isinstance(sources, list):
-        return
-    for source in sources:
-        if not isinstance(source, dict):
-            continue
-        source_id = str(source.get("pixabay_id", source.get("id", source.get("asset_id", ""))))
-        source_path = str(source.get("local_path", source.get("path", "")))
-        intervals = []
-        for shot in plan.get("shots", []):
-            shot_id = str(shot.get("pixabay_id", shot.get("asset_id", "")))
-            if (source_id and source_id == shot_id) or (source_path and Path(source_path) == Path(str(shot.get("local_path", "")))):
-                intervals.append(
-                    {
-                        "output_start": shot.get("output_start"),
-                        "output_end": shot.get("output_end"),
-                        "source_start": shot.get("source_start"),
-                        "source_end": shot.get("source_end"),
-                        "speed": shot.get("speed"),
-                    }
-                )
-        source["usage_intervals"] = intervals
-        source["actual_usage_intervals"] = intervals
-    manifest.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    """Run the v1.2 pipeline, checkpointing every reusable stage."""
+
     load_dotenv(PROJECT_ROOT / ".env", override=False)
     if not os.getenv("PIXABAY_API_KEY"):
         raise RuntimeError(f"PIXABAY_API_KEY is missing. Put it in {PROJECT_ROOT / '.env'}.")
@@ -183,7 +246,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     parse_ratio(args.ratio)
     if args.duration <= 0:
         raise ValueError("--duration must be greater than zero")
+    if int(_arg(args, "candidate_pool_multiplier", 6)) < 1:
+        raise ValueError("--candidate-pool-multiplier must be at least 1")
+    if int(_arg(args, "max_search_pages", 3)) < 1:
+        raise ValueError("--max-search-pages must be at least 1")
+    if int(_arg(args, "max_reuse_per_asset", 1)) < 1:
+        raise ValueError("--max-reuse-per-asset must be at least 1")
+    if not 0 < float(_arg(args, "max_asset_screen_share", 0.30)) <= 1:
+        raise ValueError("--max-asset-screen-share must be in (0, 1]")
 
+    resume = bool(_arg(args, "resume_run", False))
+    if resume and not getattr(args, "run_id", None):
+        raise ValueError("--resume-run requires an explicit --run-id")
     slug = _safe_slug(args.project_name or args.theme)
     run_id = _safe_slug(
         getattr(args, "run_id", None)
@@ -191,10 +265,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "run",
     )
     run_dir = output_root / slug / run_id
-    if run_dir.exists():
-        raise FileExistsError(
-            f"Run directory already exists; choose another --run-id. Existing output was not overwritten: {run_dir}"
-        )
     _assert_writable_tree_separate("output run directory", run_dir, reference_dir)
     _assert_writable_tree_separate(
         "material theme directory", material_theme_directory(material_dir, args.theme), reference_dir
@@ -202,162 +272,385 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     cache_root = Path(args.cache_dir).expanduser().resolve()
     for cache_name in ("references", "bgm", "pixabay"):
         _assert_writable_tree_separate(f"{cache_name} cache directory", cache_root / cache_name, reference_dir)
-    run_dir.mkdir(parents=True, exist_ok=True)
+
+    invocation = _invocation_payload(
+        bgm_path=bgm_path,
+        reference_dir=reference_dir,
+        material_dir=material_dir,
+        args=args,
+    )
+    invocation_digest = _invocation_digest(invocation)
+    state_path = run_dir / "run_state.json"
+    if run_dir.exists() and not resume:
+        raise FileExistsError(
+            f"Run directory already exists; choose another --run-id. Existing output was not overwritten: {run_dir}"
+        )
+    if run_dir.exists() and resume:
+        if not state_path.is_file():
+            raise FileNotFoundError(f"Cannot safely resume without run_state.json: {state_path}")
+        existing_state = _read_json(state_path)
+        if existing_state.get("invocation_digest") != invocation_digest:
+            raise ValueError("Resume invocation differs from the original run; use a new --run-id")
+        previous_report = run_dir / "run_report.json"
+        if previous_report.is_file():
+            prior = _read_json(previous_report)
+            prior_video = Path(str(prior.get("artifacts", {}).get("video", "")))
+            if prior.get("passed") is True and prior_video.is_file():
+                return prior
+    else:
+        run_dir.mkdir(parents=True, exist_ok=False)
     cache_root.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        state_path,
+        {
+            "schema_version": "1.2",
+            "run_id": run_id,
+            "invocation_digest": invocation_digest,
+            "invocation": invocation,
+            "resumed": resume,
+        },
+    )
+
+    run_report_path = run_dir / "run_report.json"
     report: dict[str, Any] = {
-        "schema_version": 2,
-        "skill_version": "1.1",
+        "schema_version": "1.2",
+        "skill_version": "1.2",
         "run_id": run_id,
         "started_at": datetime.now(timezone.utc).isoformat(),
+        "resumed": resume,
         "theme": args.theme,
         "requested_duration_seconds": args.duration,
         "ratio": args.ratio,
-        "inputs": {"bgm": str(bgm_path), "reference_dir": str(reference_dir), "material_dir": str(material_dir)},
+        "inputs": {
+            "bgm": str(bgm_path),
+            "reference_dir": str(reference_dir),
+            "material_dir": str(material_dir),
+        },
         "api_key_configured": True,
         "stages": {},
-        "artifacts": {},
+        "artifacts": {"run_state": str(state_path), "run_report": str(run_report_path)},
+        "passed": False,
     }
 
-    style_path = run_dir / "style_profile.json"
-    print(f"[1/6] Analyzing reference style and shot semantics ({reference_dir})", flush=True)
-    reference_result = analyze_references(
-        reference_dir,
-        cache_root / "references",
-        style_path,
-        semantic_required=not getattr(args, "allow_semantic_fallback", False),
-    )
-    style_profile = _style_payload(reference_result)
-    if not style_path.is_file():
+    def checkpoint() -> None:
+        _write_json(run_report_path, report)
+
+    checkpoint()
+    try:
+        style_path = run_dir / "style_profile.json"
+        print(f"[1/7] Analyzing reference style and shot semantics ({reference_dir})", flush=True)
+        if resume and style_path.is_file():
+            reference_result = _read_json(style_path)
+            reference_resumed = True
+        else:
+            reference_result = analyze_references(
+                reference_dir,
+                cache_root / "references",
+                style_path,
+                semantic_required=not getattr(args, "allow_semantic_fallback", False),
+            )
+            reference_resumed = False
+        style_profile = _style_payload(reference_result)
+        reference_run_report = (
+            reference_result.get("run_report", {})
+            if isinstance(reference_result.get("run_report"), dict)
+            else {}
+        )
+        report["stages"]["references"] = {
+            "status": "resumed" if reference_resumed else "ok",
+            "analyzed": reference_run_report.get("analyzed"),
+            "reused": reference_run_report.get("reused"),
+            "failed": reference_run_report.get("failed"),
+        }
+        report["artifacts"]["style_profile"] = str(style_path)
+        checkpoint()
+
+        editing_grammar_path = run_dir / "editing_grammar.json"
+        print("[2/7] Learning reference audio-to-cut editing grammar", flush=True)
+        if resume and editing_grammar_path.is_file():
+            editing_grammar = _read_json(editing_grammar_path)
+            grammar_resumed = True
+        else:
+            editing_grammar = analyze_editing_grammar(
+                reference_dir,
+                reference_result,
+                cache_root / "references",
+                editing_grammar_path,
+            )
+            grammar_resumed = False
+        style_profile = _merge_reference_audio_learning(reference_result, style_profile, editing_grammar)
         _write_json(style_path, reference_result)
-    reference_run_report = reference_result.get("run_report", {}) if isinstance(reference_result.get("run_report"), dict) else {}
-    report["stages"]["references"] = {
-        "status": "ok",
-        "analyzed": reference_result.get("analyzed_count", reference_result.get("analyzed", reference_run_report.get("analyzed"))),
-        "reused": reference_result.get("reused_count", reference_result.get("reused", reference_run_report.get("reused"))),
-        "failed": reference_run_report.get("failed"),
-    }
-    report["artifacts"]["style_profile"] = str(style_path)
+        report["stages"]["editing_grammar"] = {
+            "status": "resumed" if grammar_resumed else editing_grammar.get("status"),
+            "reliability": editing_grammar.get("reliability"),
+            "analyzed": editing_grammar.get("run_report", {}).get("analyzed"),
+            "reused": editing_grammar.get("run_report", {}).get("reused"),
+        }
+        report["artifacts"]["editing_grammar"] = str(editing_grammar_path)
+        checkpoint()
 
-    editing_grammar_path = run_dir / "editing_grammar.json"
-    print("[2/6] Learning reference audio-to-cut editing grammar", flush=True)
-    editing_grammar = analyze_editing_grammar(
-        reference_dir,
-        reference_result,
-        cache_root / "references",
-        editing_grammar_path,
-    )
-    report["stages"]["editing_grammar"] = {
-        "status": editing_grammar.get("status"),
-        "reliability": editing_grammar.get("reliability"),
-        "analyzed": editing_grammar.get("run_report", {}).get("analyzed"),
-        "reused": editing_grammar.get("run_report", {}).get("reused"),
-    }
-    report["artifacts"]["editing_grammar"] = str(editing_grammar_path)
-
-    bgm_profile_path = run_dir / "bgm_profile.json"
-    print(f"[3/6] Analyzing BGM structure ({bgm_path.name})", flush=True)
-    bgm_result = analyze_bgm(bgm_path, cache_root / "bgm", bgm_profile_path, args.duration)
-    audio_profile = _audio_payload(bgm_result)
-    if not bgm_profile_path.is_file():
+        audiomap_path = run_dir / "audiomap.json"
+        bgm_profile_path = run_dir / "bgm_profile.json"
+        print(f"[3/7] Analyzing deterministic BGM structure ({bgm_path.name})", flush=True)
+        if resume and audiomap_path.is_file():
+            bgm_result = _read_json(audiomap_path)
+            bgm_resumed = True
+        else:
+            bgm_result = analyze_bgm(bgm_path, cache_root / "bgm", audiomap_path, args.duration)
+            bgm_resumed = False
+        audio_profile = _audio_payload(bgm_result)
         _write_json(bgm_profile_path, bgm_result)
-    bgm_duration = _first_number(audio_profile, {"duration", "duration_seconds", "analyzed_duration_seconds"})
-    target_duration = min(args.duration, bgm_duration) if bgm_duration and bgm_duration > 0 else args.duration
-    target_duration = round(float(target_duration), 4)
-    if target_duration < 0.5:
-        raise RuntimeError("BGM analysis returned less than 0.5 seconds of usable audio")
-    report["actual_duration_seconds"] = target_duration
-    report["stages"]["bgm"] = {"status": "ok", "duration_seconds": bgm_duration, "target_seconds": target_duration}
-    report["artifacts"]["bgm_profile"] = str(bgm_profile_path)
-
-    desired_assets = args.assets or max(4, min(30, math.ceil(target_duration / 1.7) + 3))
-    print(f"[4/6] Searching, ranking, and downloading {desired_assets} Pixabay candidates", flush=True)
-    try:
-        media_result = run_pixabay_pipeline(
-            args.theme,
-            style_profile,
-            audio_profile,
-            material_dir,
-            cache_root / "pixabay",
-            desired_assets,
-            args.ratio,
-            min_resolution=(args.min_width, args.min_height),
-            dry_run=False,
-            target_duration=target_duration,
+        bgm_duration = _first_number(
+            audio_profile, {"duration", "duration_seconds", "analyzed_duration_seconds"}
         )
-    except PixabayInsufficientMaterialError as exc:
-        report["stages"]["pixabay"] = {"status": "insufficient_material", "error": _strip_secret(str(exc))}
-        manifest = material_theme_directory(material_dir, args.theme) / "sources.json"
-        if manifest.is_file():
-            report["artifacts"]["sources"] = str(manifest)
+        target_duration = min(args.duration, bgm_duration) if bgm_duration and bgm_duration > 0 else args.duration
+        target_duration = round(float(target_duration), 4)
+        if target_duration < 0.5:
+            raise RuntimeError("BGM analysis returned less than 0.5 seconds of usable audio")
+        report["actual_duration_seconds"] = target_duration
+        report["stages"]["bgm"] = {
+            "status": "resumed" if bgm_resumed else "ok",
+            "duration_seconds": bgm_duration,
+            "target_seconds": target_duration,
+            "rhythm_mode": (audio_profile.get("rhythm_mode") or {}).get("mode"),
+            "analysis_digest": audio_profile.get("analysis_digest"),
+        }
+        report["artifacts"].update(
+            {"audiomap": str(audiomap_path), "bgm_profile_compat": str(bgm_profile_path)}
+        )
+        checkpoint()
+
+        timeline_path = run_dir / "timeline.json"
+        print("[4/7] Planning music-event shot slots before material acquisition", flush=True)
+        if resume and timeline_path.is_file():
+            timeline_plan = _read_json(timeline_path)
+            timeline_resumed = True
+        else:
+            timeline_plan = plan_timeline_slots(
+                audio_profile,
+                target_duration,
+                style_profile,
+                editing_grammar,
+            )
+            _write_json(timeline_path, timeline_plan)
+            timeline_resumed = False
+        slot_count = len(timeline_plan.get("slots", []))
+        if slot_count <= 0:
+            raise RuntimeError("Pre-download timeline planner returned no shot slots")
+        report["stages"]["timeline_planning"] = {
+            "status": "resumed" if timeline_resumed else "ok",
+            "slots": slot_count,
+            "rhythm_mode": timeline_plan.get("rhythm_mode"),
+            "event_snap_ratio": timeline_plan.get("metrics", {}).get("event_snap_ratio"),
+        }
+        report["artifacts"]["timeline"] = str(timeline_path)
+        checkpoint()
+
+        desired_assets = int(
+            _arg(
+                args,
+                "assets",
+                max(slot_count, max(4, min(30, math.ceil(target_duration / 1.7) + 3))),
+            )
+        )
+        asset_manifest_path = run_dir / "asset_manifest.json"
+        sources_path = run_dir / "sources.json"
+        print(
+            f"[5/7] Searching a >= {_arg(args, 'candidate_pool_multiplier', 6)}x pool and selecting {desired_assets} Pixabay assets",
+            flush=True,
+        )
+        material_sources_path: Path | None = None
+        if resume and asset_manifest_path.is_file():
+            media_result = _media_result_from_manifest(asset_manifest_path)
+            material_candidate = material_theme_directory(material_dir, args.theme) / "sources.json"
+            material_sources_path = material_candidate if material_candidate.is_file() else None
+            pixabay_resumed = True
+        else:
+            media_result = run_pixabay_pipeline(
+                args.theme,
+                style_profile,
+                audio_profile,
+                material_dir,
+                cache_root / "pixabay",
+                desired_assets,
+                args.ratio,
+                min_resolution=(args.min_width, args.min_height),
+                dry_run=False,
+                target_duration=target_duration,
+                timeline_plan=timeline_plan,
+                candidate_pool_multiplier=int(_arg(args, "candidate_pool_multiplier", 6)),
+                max_search_pages=int(_arg(args, "max_search_pages", 3)),
+            )
+            material_sources_path = _material_sources_path(media_result)
+            _copy_or_create_sources(media_result, asset_manifest_path)
+            pixabay_resumed = False
+        if not asset_manifest_path.is_file():
+            _copy_or_create_sources(media_result, asset_manifest_path)
+        _json_copy(asset_manifest_path, sources_path)
+        selected = media_result.get("selected") or media_result.get("selected_assets") or []
+        if not selected:
+            raise RuntimeError("Pixabay search completed without any selected local videos")
+        report["stages"]["pixabay"] = {
+            "status": "resumed" if pixabay_resumed else "ok",
+            "selected": len(selected),
+            "candidate_count": media_result.get("candidate_count"),
+            "candidate_pool_gate": media_result.get("candidate_pool_gate"),
+            "search_rounds": len(media_result.get("search_rounds", [])),
+            "rejections": len(media_result.get("rejections", [])),
+        }
+        report["artifacts"].update(
+            {"asset_manifest": str(asset_manifest_path), "sources_compat": str(sources_path)}
+        )
+        checkpoint()
+
+        content_policy = {
+            "max_reuse_per_asset": int(_arg(args, "max_reuse_per_asset", 1)),
+            "max_asset_screen_share": float(_arg(args, "max_asset_screen_share", 0.30)),
+            "min_repeat_gap_shots": int(_arg(args, "min_repeat_gap_shots", 3)),
+            "min_repeat_gap_seconds": float(_arg(args, "min_repeat_gap_seconds", 6.0)),
+        }
+        max_rework_attempts = max(0, int(_arg(args, "max_rework_attempts", 2)))
+        final_output = run_dir / f"{slug}_montage.mp4"
+        edit_decisions_path = run_dir / "edit_decisions.json"
+        edit_plan_path = run_dir / "edit_plan.json"
+        render_report_path = run_dir / "render_report.json"
+        validation_path = run_dir / "validation.json"
+        attempts: list[dict[str, Any]] = []
+        successful_plan: dict[str, Any] | None = None
+        successful_validation: dict[str, Any] | None = None
+        print(
+            f"[6/7] Assigning assets, rendering, and auto-reworking up to {max_rework_attempts} time(s)",
+            flush=True,
+        )
+        for attempt_index in range(max_rework_attempts + 1):
+            attempt_number = attempt_index + 1
+            attempt_dir = run_dir / "attempts" / f"attempt_{attempt_number:02d}"
+            attempt_dir.mkdir(parents=True, exist_ok=True)
+            attempt_plan_path = attempt_dir / "edit_decisions.json"
+            attempt_video = attempt_dir / f"{slug}_attempt_{attempt_number:02d}.mp4"
+            attempt_report_path = attempt_dir / "render_report.json"
+            seed = f"{args.theme}|{bgm_path.name}|{run_id}|attempt={attempt_number}"
+            try:
+                plan = build_timeline(
+                    audio_profile,
+                    media_result,
+                    target_duration,
+                    style_profile,
+                    seed=seed,
+                    editing_grammar=editing_grammar,
+                    content_policy=content_policy,
+                    ratio=args.ratio,
+                    timeline_plan=timeline_plan,
+                    theme=args.theme,
+                )
+                plan["run_id"] = run_id
+                plan["attempt"] = attempt_number
+                write_plan(plan, attempt_plan_path)
+                if not (resume and attempt_video.is_file()):
+                    render_timeline(plan, bgm_path, attempt_video, args.ratio, style_profile)
+                validation = validate_output(
+                    attempt_video,
+                    expected_duration=target_duration,
+                    expected_ratio=args.ratio,
+                    report_path=attempt_report_path,
+                    frames_dir=attempt_dir / "validation_frames",
+                    edit_plan=plan,
+                    audiomap=audio_profile,
+                    expected_fps=30.0,
+                )
+                attempt_record = {
+                    "attempt": attempt_number,
+                    "status": "passed" if validation.get("passed") else "failed_qa",
+                    "seed": seed,
+                    "plan": str(attempt_plan_path),
+                    "video": str(attempt_video),
+                    "report": str(attempt_report_path),
+                    "failed_checks": [
+                        key for key, passed in validation.get("checks", {}).items() if not passed
+                    ],
+                }
+                attempts.append(attempt_record)
+                report["stages"]["render_attempts"] = attempts
+                checkpoint()
+                if validation.get("passed"):
+                    successful_plan = plan
+                    successful_validation = validation
+                    if final_output.exists():
+                        raise FileExistsError(f"Final output already exists and was not overwritten: {final_output}")
+                    os.replace(attempt_video, final_output)
+                    break
+            except (TimelineInsufficientMaterialError, MontageError) as exc:
+                attempts.append(
+                    {
+                        "attempt": attempt_number,
+                        "status": "failed_edit_or_render",
+                        "seed": seed,
+                        "error": _strip_secret(str(exc)),
+                        "plan": str(attempt_plan_path),
+                    }
+                )
+                report["stages"]["render_attempts"] = attempts
+                checkpoint()
+
+        if successful_plan is None or successful_validation is None:
+            failures = [item.get("failed_checks") or item.get("error") for item in attempts]
+            raise RuntimeError(
+                "All render/QA attempts failed; no montage was delivered. "
+                f"Attempt diagnostics: {failures}"
+            )
+
+        write_plan(successful_plan, edit_decisions_path)
+        _json_copy(edit_decisions_path, edit_plan_path)
+        successful_validation["rework"] = {
+            "attempts": attempts,
+            "successful_attempt": successful_plan.get("attempt"),
+            "automatic_rework_count": max(0, int(successful_plan.get("attempt", 1)) - 1),
+        }
+        _write_json(render_report_path, successful_validation)
+        _write_json(validation_path, successful_validation)
+        # Historical usage is committed only after the final video passes QA.
+        for manifest in {
+            path for path in (material_sources_path, asset_manifest_path) if path is not None and path.is_file()
+        }:
+            # Usage history is part of the success contract.  The stage helper
+            # performs a locked, fail-closed read/modify/write; falling back to
+            # an unlocked legacy rewrite here could clobber another concurrent
+            # run, so a real persistence error must fail the run explicitly.
+            update_usage_intervals(manifest, successful_plan)
+        if asset_manifest_path.is_file():
+            _json_copy(asset_manifest_path, sources_path)
+
+        report["stages"]["render"] = {
+            "status": "ok",
+            "shots": len(successful_plan.get("shots", [])),
+            "successful_attempt": successful_plan.get("attempt"),
+        }
+        report["stages"]["validation"] = {
+            "status": "ok",
+            "checks": successful_validation.get("checks", {}),
+        }
+        report["artifacts"].update(
+            {
+                "edit_decisions": str(edit_decisions_path),
+                "edit_plan_compat": str(edit_plan_path),
+                "render_report": str(render_report_path),
+                "validation_compat": str(validation_path),
+                "video": str(final_output),
+            }
+        )
+        report["finished_at"] = datetime.now(timezone.utc).isoformat()
+        report["passed"] = True
+        checkpoint()
+        print("[7/7] Final full-decode QA passed; usage history committed", flush=True)
+        return report
+    except Exception as exc:
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
         report["passed"] = False
-        failed_report = run_dir / "run_report.json"
-        report["artifacts"]["run_report"] = str(failed_report)
-        _write_json(failed_report, report)
+        report["failure"] = {"type": type(exc).__name__, "message": _strip_secret(str(exc))}
+        if isinstance(exc, (PixabayInsufficientMaterialError, TimelineInsufficientMaterialError)):
+            report["failure"]["category"] = "insufficient_material"
+        checkpoint()
         raise
-    selected = media_result.get("selected") or media_result.get("selected_assets") or []
-    if not selected:
-        raise RuntimeError("Pixabay search completed without any selected local videos")
-    report["stages"]["pixabay"] = {
-        "status": "ok",
-        "selected": len(selected),
-        "search_rounds": len(media_result.get("search_rounds", [])),
-        "rejections": len(media_result.get("rejections", [])),
-    }
-
-    material_sources_path = _material_sources_path(media_result)
-    sources_path = _copy_or_create_sources(media_result, run_dir / "sources.json")
-    edit_plan_path = run_dir / "edit_plan.json"
-    print("[5/6] Building grammar-driven timeline and rendering", flush=True)
-    try:
-        plan = build_timeline(
-            audio_profile,
-            media_result,
-            target_duration,
-            style_profile,
-            seed=f"{args.theme}|{bgm_path.name}",
-            editing_grammar=editing_grammar,
-            ratio=args.ratio,
-        )
-    except TimelineInsufficientMaterialError as exc:
-        report["stages"]["timeline"] = {"status": "insufficient_material", "error": _strip_secret(str(exc))}
-        report["finished_at"] = datetime.now(timezone.utc).isoformat()
-        report["passed"] = False
-        failed_report = run_dir / "run_report.json"
-        report["artifacts"]["run_report"] = str(failed_report)
-        _write_json(failed_report, report)
-        raise
-    write_plan(plan, edit_plan_path)
-    output_path = run_dir / f"{slug}_montage.mp4"
-    render_timeline(plan, bgm_path, output_path, args.ratio, style_profile)
-    for manifest in {path for path in (material_sources_path, sources_path) if path is not None}:
-        try:
-            update_usage_intervals(manifest, plan)
-        except Exception:
-            _apply_usage_to_manifest(manifest, plan)
-    report["stages"]["render"] = {"status": "ok", "shots": len(plan.get("shots", []))}
-    report["artifacts"].update({"edit_plan": str(edit_plan_path), "sources": str(sources_path), "video": str(output_path)})
-
-    print("[6/6] Running full-decode and media quality validation", flush=True)
-    validation_path = run_dir / "validation.json"
-    validation = validate_output(
-        output_path,
-        expected_duration=target_duration,
-        expected_ratio=args.ratio,
-        report_path=validation_path,
-        frames_dir=run_dir / "validation_frames",
-        edit_plan=plan,
-    )
-    report["stages"]["validation"] = {"status": "ok" if validation["passed"] else "failed", "checks": validation["checks"]}
-    report["artifacts"]["validation"] = str(validation_path)
-    report["finished_at"] = datetime.now(timezone.utc).isoformat()
-    report["passed"] = bool(validation["passed"])
-    run_report_path = run_dir / "run_report.json"
-    report["artifacts"]["run_report"] = str(run_report_path)
-    _write_json(run_report_path, report)
-    if not validation["passed"]:
-        raise RuntimeError(f"Render completed but validation failed; inspect {validation_path}")
-    return report
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -372,12 +665,53 @@ def build_parser() -> argparse.ArgumentParser:
         "--run-id",
         help="Optional unique run directory name; defaults to UTC timestamp plus random suffix and never overwrites.",
     )
+    parser.add_argument(
+        "--resume-run",
+        action="store_true",
+        help="Resume a failed run with the exact same inputs; requires --run-id and validates run_state.json.",
+    )
     parser.add_argument("--reference-dir", default=str(PROJECT_ROOT / "参考视频"))
     parser.add_argument("--material-dir", default=str(PROJECT_ROOT / "视频素材"))
     parser.add_argument("--cache-dir", default=str(PROJECT_ROOT / ".bgm-montage-cache"))
     parser.add_argument("--assets", type=int, help="Override final asset count (default derives from duration)")
     parser.add_argument("--min-width", type=int, default=1280)
     parser.add_argument("--min-height", type=int, default=720)
+    parser.add_argument(
+        "--candidate-pool-multiplier",
+        type=int,
+        default=6,
+        help="Minimum metadata candidates per planned shot slot before downloads (default: 6).",
+    )
+    parser.add_argument(
+        "--max-search-pages",
+        type=int,
+        default=3,
+        help="Maximum Pixabay pages per expanded query round (default: 3).",
+    )
+    parser.add_argument(
+        "--max-reuse-per-asset",
+        "--max-source-reuse",
+        dest="max_reuse_per_asset",
+        type=int,
+        default=1,
+        help="Maximum uses of one canonical source in this montage (default: 1).",
+    )
+    parser.add_argument(
+        "--max-asset-screen-share",
+        "--max-source-share",
+        dest="max_asset_screen_share",
+        type=float,
+        default=0.30,
+        help="Maximum cumulative output share for one canonical source (default: 0.30).",
+    )
+    parser.add_argument("--min-repeat-gap-shots", type=int, default=3)
+    parser.add_argument("--min-repeat-gap-seconds", type=float, default=6.0)
+    parser.add_argument(
+        "--max-rework-attempts",
+        type=int,
+        default=2,
+        help="Automatic re-edit attempts after the first failed render QA (default: 2).",
+    )
     parser.add_argument(
         "--allow-semantic-fallback",
         action="store_true",

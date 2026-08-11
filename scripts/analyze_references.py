@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Read-only reference-video analysis for the bgm-montage skill.
 
-The v1.1 analyzer combines explainable OpenCV measurements with a real,
+The v1.2 analyzer combines explainable OpenCV measurements with a real,
 pretrained CLIP zero-shot vision model.  Semantic output is always labelled
 with its backend and limitations; when the model cannot be loaded the result
 is explicitly degraded instead of pretending that heuristics are semantics.
@@ -44,10 +44,14 @@ from visual_semantics import (
 )
 
 
-ANALYZER_VERSION = "1.1.0"
-MIGRATABLE_ANALYZER_VERSIONS: set[str] = set()
+ANALYZER_VERSION = "1.2.0"
+# v1.2 derives its additional pacing/transition/diversity fields from the
+# shot-level records already stored by v1.1.  Reusing that evidence avoids an
+# expensive model pass while the existing fingerprint check still forces
+# changed and newly added reference files through the full analyzer.
+MIGRATABLE_ANALYZER_VERSIONS: set[str] = {"1.1.0"}
 CACHE_SCHEMA_VERSION = 2
-PROFILE_SCHEMA_VERSION = "1.1"
+PROFILE_SCHEMA_VERSION = "1.2"
 VIDEO_EXTENSIONS = {
     ".mp4",
     ".mov",
@@ -603,9 +607,26 @@ def _transition_metrics(previous: Mapping[str, Any], current: Mapping[str, Any],
         "rotation_rate": 0.0,
         "tracking_inlier_ratio": 0.0,
         "residual_motion": 0.0,
+        "transition_type": "hard_cut" if is_cut else "continuous",
     }
     if is_cut:
         return result
+
+    # Conservative transition hints.  The analyzer intentionally keeps the
+    # ``_like`` suffix because sparse sampling cannot prove an authored
+    # dissolve/fade.  These labels are style evidence, never a claim that an
+    # arbitrary reference effect can be reproduced exactly.
+    previous_brightness = _finite_float(previous.get("brightness"))
+    current_brightness = _finite_float(current.get("brightness"))
+    brightness_delta = current_brightness - previous_brightness
+    if (
+        abs(brightness_delta) >= 0.16
+        and min(previous_brightness, current_brightness) <= 0.22
+        and histogram_distance < 0.62
+    ):
+        result["transition_type"] = "fade_like"
+    elif histogram_distance >= 0.30 and pixel_difference >= 0.10:
+        result["transition_type"] = "dissolve_like"
 
     points = cv2.goodFeaturesToTrack(
         previous_gray,
@@ -1008,6 +1029,197 @@ def _build_shot_semantics(
     return shots
 
 
+def _shot_signature(shot: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return a deliberately coarse signature for repetition estimation."""
+
+    return tuple(
+        str(shot.get(key, "unresolved")).strip().lower()
+        for key in ("subject", "scene", "shot_scale", "composition", "camera_motion")
+    )
+
+
+def _enrich_v12_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
+    """Derive the v1.2 style-learning contract from cached shot evidence.
+
+    This function is intentionally deterministic and only consumes fields that
+    v1.1 already cached.  It can therefore migrate unchanged reference videos
+    without re-running CLIP/OpenCV, while new/modified videos still take the
+    complete analysis path.
+    """
+
+    analysis["schema_version"] = PROFILE_SCHEMA_VERSION
+    raw_shots = analysis.get("shots", [])
+    shots = [shot for shot in raw_shots if isinstance(shot, Mapping)]
+    duration = max(
+        0.0,
+        _finite_float(analysis.get("metadata", {}).get("duration_seconds")),
+        max((_finite_float(shot.get("end_seconds")) for shot in shots), default=0.0),
+    )
+    durations = [
+        max(0.0, _finite_float(shot.get("duration_seconds")))
+        for shot in shots
+        if _finite_float(shot.get("duration_seconds")) > 0
+    ]
+    duration_distribution = {
+        "count": len(durations),
+        "minimum": _round(min(durations) if durations else 0.0, 3),
+        "p10": _round(_percentile(durations, 0.10), 3),
+        "p25": _round(_percentile(durations, 0.25), 3),
+        "median": _round(_median(durations), 3),
+        "mean": _round(_mean(durations), 3),
+        "p75": _round(_percentile(durations, 0.75), 3),
+        "p90": _round(_percentile(durations, 0.90), 3),
+        "maximum": _round(max(durations) if durations else 0.0, 3),
+        "buckets": {
+            "under_1_5s": sum(value < 1.5 for value in durations),
+            "1_5_to_4_5s": sum(1.5 <= value < 4.5 for value in durations),
+            "4_5s_and_over": sum(value >= 4.5 for value in durations),
+        },
+    }
+
+    motion_weights = {
+        "static_like": 0.05,
+        "drift_or_subject_motion": 0.35,
+        "pan_left_like": 0.55,
+        "pan_right_like": 0.55,
+        "tilt_up_like": 0.60,
+        "tilt_down_like": 0.60,
+        "zoom_in_like": 0.72,
+        "zoom_out_like": 0.68,
+        "handheld_or_complex": 0.78,
+        "complex_or_subject_motion": 0.75,
+    }
+    direction_distribution = _distribution(
+        str(shot.get("camera_motion", "unresolved")) for shot in shots
+    )
+    pace: list[dict[str, Any]] = []
+    phase_names = ("opening", "early_middle", "late_middle", "ending")
+    if duration > 0:
+        for index, phase_name in enumerate(phase_names):
+            start = duration * index / len(phase_names)
+            end = duration * (index + 1) / len(phase_names)
+            local = [
+                shot
+                for shot in shots
+                if start <= (
+                    _finite_float(shot.get("start_seconds"))
+                    + _finite_float(shot.get("end_seconds"))
+                ) / 2.0 < end + (1e-6 if index == len(phase_names) - 1 else 0.0)
+            ]
+            local_durations = [
+                _finite_float(shot.get("duration_seconds"))
+                for shot in local
+                if _finite_float(shot.get("duration_seconds")) > 0
+            ]
+            local_motion = _mean(
+                motion_weights.get(str(shot.get("camera_motion", "")), 0.30)
+                for shot in local
+            )
+            pace.append(
+                {
+                    "phase": phase_name,
+                    "start_seconds": _round(start, 3),
+                    "end_seconds": _round(end, 3),
+                    "shot_count": len(local),
+                    "cuts_per_minute": _round(max(0, len(local) - 1) / max((end - start) / 60.0, 1e-6), 2),
+                    "median_shot_duration_seconds": _round(_median(local_durations), 3),
+                    "visual_motion_intensity": _round(local_motion),
+                }
+            )
+
+    adjacency_keys = ("subject", "scene", "shot_scale", "composition", "camera_motion")
+    adjacency_change: dict[str, float] = {}
+    pair_count = max(0, len(shots) - 1)
+    for key in adjacency_keys:
+        changes = sum(
+            str(shots[index - 1].get(key, "")) != str(shots[index].get(key, ""))
+            for index in range(1, len(shots))
+        )
+        adjacency_change[key] = _round(changes / pair_count if pair_count else 0.0)
+
+    signatures = [_shot_signature(shot) for shot in shots]
+    repeated_signature_count = len(signatures) - len(set(signatures))
+    key_candidates: list[tuple[float, int, Mapping[str, Any]]] = []
+    for index, shot in enumerate(shots):
+        categories = shot.get("semantic", {}).get("categories", {}) if isinstance(shot.get("semantic"), Mapping) else {}
+        semantic_confidence = max(
+            (
+                _finite_float(payload.get("confidence"))
+                for payload in categories.values()
+                if isinstance(payload, Mapping)
+            ),
+            default=0.0,
+        )
+        score = motion_weights.get(str(shot.get("camera_motion", "")), 0.30) * 0.55 + semantic_confidence * 0.45
+        key_candidates.append((score, index, shot))
+    key_shots = []
+    for score, index, shot in sorted(key_candidates, key=lambda item: (-item[0], item[1]))[:5]:
+        midpoint = (
+            _finite_float(shot.get("start_seconds")) + _finite_float(shot.get("end_seconds"))
+        ) / 2.0
+        key_shots.append(
+            {
+                "shot_index": int(shot.get("index", index)),
+                "time_seconds": _round(midpoint, 3),
+                "normalized_position": _round(midpoint / duration if duration else 0.0),
+                "score": _round(score),
+                "subject": shot.get("subject"),
+                "scene": shot.get("scene"),
+                "shot_scale": shot.get("shot_scale"),
+                "camera_motion": shot.get("camera_motion"),
+            }
+        )
+
+    rhythm = analysis.setdefault("editing_rhythm", {})
+    if not isinstance(rhythm, dict):
+        rhythm = {}
+        analysis["editing_rhythm"] = rhythm
+    transition_distribution = rhythm.get("transition_type_distribution")
+    if not isinstance(transition_distribution, Mapping):
+        detected_cuts = int(_finite_float(rhythm.get("detected_cuts")))
+        transition_distribution = {"hard_cut": detected_cuts} if detected_cuts else {"continuous": 1}
+        rhythm["transition_type_distribution"] = transition_distribution
+        rhythm["transition_method"] = "migrated_cut_records_only"
+    rhythm["shot_duration_distribution_seconds"] = duration_distribution
+    rhythm["pace_over_time"] = pace
+    rhythm["fastest_phase"] = max(pace, key=lambda item: item["cuts_per_minute"], default={}).get("phase", "unresolved")
+    rhythm["key_shot_positions"] = key_shots
+
+    motion = analysis.setdefault("camera_motion", {})
+    if isinstance(motion, dict):
+        motion["direction_distribution"] = direction_distribution
+        motion["adjacent_direction_change_ratio"] = adjacency_change.get("camera_motion", 0.0)
+
+    analysis["editing_style_learning"] = {
+        "shot_duration_distribution_seconds": duration_distribution,
+        "pace_over_time": pace,
+        "transition_type_distribution": dict(transition_distribution),
+        "motion_direction_distribution": direction_distribution,
+        "adjacent_change_ratios": adjacency_change,
+        "key_shot_positions": key_shots,
+        "structural_reuse_estimate": {
+            "repeated_signature_count": repeated_signature_count,
+            "repeated_signature_ratio": _round(repeated_signature_count / len(signatures) if signatures else 0.0),
+            "method": "coarse_subject_scene_scale_composition_motion_signature",
+            "limitation": "This estimates structural repetition; it does not identify original source-file reuse.",
+        },
+        "implemented_scope": [
+            "shot-duration distribution",
+            "four-phase pacing change",
+            "conservative hard-cut/fade-like/dissolve-like hints",
+            "motion-direction and adjacent visual variation",
+            "appearance-based key-shot positions",
+        ],
+        "unsupported_effects": [
+            "effect-specific template reconstruction",
+            "mask/compositing reverse engineering",
+            "speed-ramp curve reconstruction",
+            "source-media reuse identification from the finished reference alone",
+        ],
+    }
+    return analysis
+
+
 def _analyze_one(
     path: Path,
     relative_path: str,
@@ -1129,6 +1341,10 @@ def _analyze_one(
 
     cuts = [transition for transition in transitions if transition["is_cut"]]
     cut_times = [_finite_float(transition["time_seconds"]) for transition in cuts]
+    transition_type_distribution = _distribution(
+        str(transition.get("transition_type", "hard_cut" if transition.get("is_cut") else "continuous"))
+        for transition in transitions
+    )
     effective_duration = duration or (decoded_times[-1] if decoded_times else 0.0)
     boundaries = [0.0] + cut_times + ([effective_duration] if effective_duration > 0 else [])
     shot_durations = [
@@ -1248,7 +1464,7 @@ def _analyze_one(
         subject_regions,
     )
 
-    return {
+    analysis = {
         "schema_version": PROFILE_SCHEMA_VERSION,
         "relative_path": relative_path,
         "metadata": dict(metadata),
@@ -1334,6 +1550,8 @@ def _analyze_one(
             "p25_shot_duration_seconds": _round(_percentile(shot_durations, 0.25), 3),
             "p75_shot_duration_seconds": _round(_percentile(shot_durations, 0.75), 3),
             "cut_times_seconds": [_round(value, 3) for value in cut_times],
+            "transition_type_distribution": transition_type_distribution,
+            "transition_method": "sampled_brightness_histogram_change_heuristic",
             "method": "sampled_histogram_and_pixel_change_detection",
         },
         "subtitle_layout": {
@@ -1350,6 +1568,7 @@ def _analyze_one(
         "search_hints": search_hints,
         "warnings": warnings,
     }
+    return _enrich_v12_analysis(analysis)
 
 
 def _video_summary(analysis: Mapping[str, Any]) -> dict[str, Any]:
@@ -1370,6 +1589,7 @@ def _video_summary(analysis: Mapping[str, Any]) -> dict[str, Any]:
         "semantic_analysis": analysis.get("semantic_analysis"),
         "subject_profile": analysis.get("subject_profile"),
         "shots": analysis.get("shots", []),
+        "editing_style_learning": analysis.get("editing_style_learning", {}),
         "sampling": analysis.get("sampling"),
         "warnings": analysis.get("warnings", []),
     }
@@ -1505,6 +1725,70 @@ def _aggregate(analyses: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     motion_distribution = _average_distributions(
         analysis.get("camera_motion", {}).get("distribution", {}) for analysis in analyses
     )
+    motion_direction_distribution = _average_distributions(
+        analysis.get("camera_motion", {}).get("direction_distribution", {}) for analysis in analyses
+    )
+    transition_type_distribution = _average_distributions(
+        analysis.get("editing_rhythm", {}).get("transition_type_distribution", {}) for analysis in analyses
+    )
+    all_shot_durations = [
+        _finite_float(shot.get("duration_seconds"))
+        for analysis in analyses
+        for shot in analysis.get("shots", [])
+        if isinstance(shot, Mapping) and _finite_float(shot.get("duration_seconds")) > 0
+    ]
+    corpus_duration_distribution = {
+        "count": len(all_shot_durations),
+        "minimum": _round(min(all_shot_durations) if all_shot_durations else 0.0, 3),
+        "p10": _round(_percentile(all_shot_durations, 0.10), 3),
+        "p25": _round(_percentile(all_shot_durations, 0.25), 3),
+        "median": _round(_median(all_shot_durations), 3),
+        "mean": _round(_mean(all_shot_durations), 3),
+        "p75": _round(_percentile(all_shot_durations, 0.75), 3),
+        "p90": _round(_percentile(all_shot_durations, 0.90), 3),
+        "maximum": _round(max(all_shot_durations) if all_shot_durations else 0.0, 3),
+    }
+    pace_over_time: list[dict[str, Any]] = []
+    for phase in ("opening", "early_middle", "late_middle", "ending"):
+        rows = [
+            row
+            for analysis in analyses
+            for row in analysis.get("editing_rhythm", {}).get("pace_over_time", [])
+            if isinstance(row, Mapping) and row.get("phase") == phase
+        ]
+        pace_over_time.append(
+            {
+                "phase": phase,
+                "cuts_per_minute": _round(_mean(_finite_float(row.get("cuts_per_minute")) for row in rows), 2),
+                "median_shot_duration_seconds": _round(
+                    _median([_finite_float(row.get("median_shot_duration_seconds")) for row in rows]), 3
+                ),
+                "visual_motion_intensity": _round(
+                    _mean(_finite_float(row.get("visual_motion_intensity")) for row in rows)
+                ),
+            }
+        )
+    adjacent_change_ratios = {
+        key: _round(
+            _mean(
+                _finite_float(
+                    analysis.get("editing_style_learning", {}).get("adjacent_change_ratios", {}).get(key)
+                )
+                for analysis in analyses
+            )
+        )
+        for key in ("subject", "scene", "shot_scale", "composition", "camera_motion")
+    }
+    structural_reuse_ratio = _round(
+        _mean(
+            _finite_float(
+                analysis.get("editing_style_learning", {})
+                .get("structural_reuse_estimate", {})
+                .get("repeated_signature_ratio")
+            )
+            for analysis in analyses
+        )
+    )
     brightness = _mean(analysis.get("color_tone", {}).get("brightness_mean", 0.0) for analysis in analyses)
     saturation = _mean(analysis.get("color_tone", {}).get("saturation_mean", 0.0) for analysis in analyses)
     contrast = _mean(analysis.get("color_tone", {}).get("contrast_mean", 0.0) for analysis in analyses)
@@ -1614,6 +1898,7 @@ def _aggregate(analyses: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "camera_motion": {
             "dominant": _dominant(motion_distribution),
             "distribution": motion_distribution,
+            "direction_distribution": motion_direction_distribution,
             "motion_strength_median_per_second": _round(motion_strength),
         },
         "editing_rhythm": {
@@ -1624,6 +1909,10 @@ def _aggregate(analyses: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "median_shot_duration_seconds": _round(median_shot_duration, 3),
             "average_shot_duration_seconds": _round(median_shot_duration, 3),
             "median_per_video_shot_duration_seconds": _round(median_shot_duration, 3),
+            "shot_duration_distribution_seconds": corpus_duration_distribution,
+            "pace_over_time": pace_over_time,
+            "fastest_phase": max(pace_over_time, key=lambda item: item["cuts_per_minute"], default={}).get("phase", "unresolved"),
+            "transition_type_distribution": transition_type_distribution,
         },
         "subtitle_layout": {
             "possible_text_overlay_frame_ratio": _round(text_presence),
@@ -1638,6 +1927,23 @@ def _aggregate(analyses: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         },
         "semantic_profile": corpus_semantics,
         "subject_profile": subject_profile,
+        "editing_style_learning": {
+            "shot_duration_distribution_seconds": corpus_duration_distribution,
+            "pace_over_time": pace_over_time,
+            "transition_type_distribution": transition_type_distribution,
+            "motion_direction_distribution": motion_direction_distribution,
+            "adjacent_change_ratios": adjacent_change_ratios,
+            "structural_reuse_estimate": {
+                "repeated_signature_ratio": structural_reuse_ratio,
+                "method": "mean coarse per-video visual-structure signature repetition",
+                "limitation": "This is not source-file reuse identification.",
+            },
+            "unsupported_effects": [
+                "effect-specific template reconstruction",
+                "mask/compositing reverse engineering",
+                "speed-ramp curve reconstruction",
+            ],
+        },
         "search_hints": hints,
     }
 
@@ -1744,7 +2050,10 @@ def analyze_references(
     if cache_warning:
         report["cache_warning"] = cache_warning
     elif migration_mode and cache_compatible:
-        report["cache_migration"] = f"{old_analyzer_version} -> {ANALYZER_VERSION}; reused signal metrics and refreshed derived topic/search fields"
+        report["cache_migration"] = (
+            f"{old_analyzer_version} -> {ANALYZER_VERSION}; reused shot/semantic signal metrics "
+            "and derived v1.2 pacing, transition, motion-direction, key-shot, and diversity fields"
+        )
     elif old_cache and not cache_compatible:
         report["cache_warning"] = "cache schema, analyzer version, or source root changed; full reanalysis"
 
@@ -1773,7 +2082,7 @@ def analyze_references(
             analysis = copy.deepcopy(old_entry["analysis"])
             entry = copy.deepcopy(old_entry)
             if migration_mode:
-                analysis = _refresh_topic_and_search_hints(analysis)
+                analysis = _enrich_v12_analysis(analysis)
                 entry["analysis"] = analysis
                 entry["migrated_at"] = _utc_now()
                 report["migrated"] += 1

@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -27,11 +27,11 @@ def _make_fixture_skill(base: Path) -> Path:
     _write(root / ".env.example", "PIXABAY_API_KEY=your_pixabay_api_key_here\n")
     _write(
         root / "SKILL.md",
-        "---\nname: bgm-montage\ndescription: Test fixture.\n---\n\n# BGM Montage v1.1\n",
+        "---\nname: bgm-montage\ndescription: Test fixture.\n---\n\n# BGM Montage v1.2\n",
     )
     _write(root / "requirements.txt", "requests>=2,<3\n")
     _write(root / "requirements.lock.txt", "requests==2.34.2\n")
-    _write(root / "CHANGELOG.md", "# Changelog\n\n## v1.1\n")
+    _write(root / "CHANGELOG.md", "# Changelog\n\n## v1.2\n")
     _write(root / "TEST_REPORT.md", "# Test Report\n")
     _write(root / "agents" / "openai.yaml", 'interface:\n  display_name: "BGM Montage"\n')
     _write(root / "references" / "usage.md", "# Usage\n")
@@ -56,7 +56,7 @@ def test_windows_unicode_paths_and_portable_allowlisted_zip(tmp_path: Path) -> N
     _write(root / "references" / "debug.log")
     (root / "tests" / "render.mp4").write_bytes(b"not media")
 
-    destination = tmp_path / "发布 包" / "bgm-montage-v1.1.zip"
+    destination = tmp_path / "发布 包" / "bgm-montage-v1.2.zip"
     report = package_skill.build_package(root, destination)
     assert Path(report["output"]) == destination.resolve()
     assert report["path_separator"] == "/"
@@ -70,9 +70,14 @@ def test_windows_unicode_paths_and_portable_allowlisted_zip(tmp_path: Path) -> N
         assert all(name.startswith(".agents/skills/bgm-montage/") for name in names)
         assert ".agents/skills/bgm-montage/.env.example" in names
         assert ".agents/skills/bgm-montage/requirements.lock.txt" in names
+        assert ".agents/skills/bgm-montage/scripts/timeline_planner.py" in names
         assert ".agents/skills/bgm-montage/tests/test_smoke.py" in names
         assert not any(name.endswith("/.env") or "/.venv/" in name for name in names)
-        assert not any("cache" in name.casefold() for name in names)
+        assert not any(
+            {part.casefold() for part in PurePosixPath(name).parts}
+            & {part.casefold() for part in package_skill.FORBIDDEN_PARTS}
+            for name in names
+        )
         assert not any(name.endswith((".mp4", ".pyc", ".log")) for name in names)
 
         extracted = tmp_path / "解压 目标"
@@ -94,6 +99,28 @@ def test_package_requires_dependency_lock(tmp_path: Path) -> None:
     (root / "requirements.lock.txt").unlink()
     with pytest.raises(package_skill.PackagingError, match="requirements.lock.txt"):
         package_skill.build_package(root, tmp_path / "missing-lock.zip")
+
+
+def test_package_requires_v12_timeline_planner(tmp_path: Path) -> None:
+    root = _make_fixture_skill(tmp_path / "项目")
+    (root / "scripts" / "timeline_planner.py").unlink()
+    with pytest.raises(package_skill.PackagingError, match="timeline_planner.py"):
+        package_skill.build_package(root, tmp_path / "missing-timeline.zip")
+
+
+def test_required_symlink_is_rejected_before_zip_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _make_fixture_skill(tmp_path / "项目")
+    required = (root / "SKILL.md").resolve()
+    original = package_skill.Path.is_symlink
+
+    def pretend_required_is_link(self: Path) -> bool:
+        return self.resolve() == required or original(self)
+
+    monkeypatch.setattr(package_skill.Path, "is_symlink", pretend_required_is_link)
+    with pytest.raises(package_skill.PackagingError, match="SKILL.md"):
+        package_skill.build_package(root, tmp_path / "symlink.zip")
 
 
 def test_package_refuses_silent_overwrite(tmp_path: Path) -> None:

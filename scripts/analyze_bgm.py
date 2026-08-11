@@ -22,9 +22,11 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
 
-SCHEMA_VERSION = "1.0"
-ANALYZER_VERSION = "1.0.2"
+SCHEMA_VERSION = "1.2"
+ANALYZER_VERSION = "1.2.1"
 DEFAULT_SAMPLE_RATE = 22_050
+RHYTHM_MODES = ("beat_cut", "phrase_flow")
+ANALYSIS_CONFIG_VERSION = "audiomap-v1.2-defaults-2"
 
 
 def _finite_float(value: Any, digits: int = 5) -> float:
@@ -57,9 +59,43 @@ def _cache_key(fingerprint: dict[str, Any], target_duration: Optional[float]) ->
         "target_duration": None if target_duration is None else round(float(target_duration), 6),
         "analyzer_version": ANALYZER_VERSION,
         "schema_version": SCHEMA_VERSION,
+        "analysis_config_version": ANALYSIS_CONFIG_VERSION,
+        "sample_rate": DEFAULT_SAMPLE_RATE,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _analysis_digest(profile: dict[str, Any]) -> str:
+    """Hash only deterministic, source-signal-derived fields."""
+
+    canonical_keys = (
+        "duration_seconds",
+        "tempo",
+        "rhythm_mode",
+        "events",
+        "curves",
+        "intervals",
+        "phrases",
+        "sections",
+        "loop_groups",
+        "key_moments",
+        "timbre",
+        "vocal",
+        "editing_guidance",
+        "reliability",
+        "analysis_parameters",
+    )
+    canonical = {key: profile.get(key) for key in canonical_keys}
+    return hashlib.sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
     ).hexdigest()
 
 
@@ -401,6 +437,253 @@ def _mood_label(
     return "balanced/forward", traits
 
 
+def _classify_rhythm_mode(
+    *,
+    tempo: float,
+    beat_confidence: float,
+    interval_cv: float,
+    pulse_strength: float,
+    onset_density: float,
+    transient_salience: float,
+    beat_count: int,
+    duration: float,
+) -> dict[str, Any]:
+    """Choose beat-led cuts only when the measured pulse is genuinely reliable.
+
+    The decision is deliberately conservative.  A plausible BPM alone is not
+    enough: the beat intervals must be regular, the tracked grid must cover a
+    useful part of the analysis window, and the onset/pulse evidence must be
+    present.  This keeps ambient and rubato material in ``phrase_flow`` mode.
+    """
+
+    tempo_valid = 30.0 <= tempo <= 260.0
+    regularity = max(0.0, min(1.0, 1.0 - interval_cv / 0.42))
+    expected_beats = duration * tempo / 60.0 if tempo_valid else 0.0
+    coverage = min(1.0, beat_count / max(4.0, expected_beats * 0.72)) if expected_beats else 0.0
+    density_score = min(1.0, max(0.0, onset_density) / 2.2)
+    pulse = max(0.0, min(1.0, pulse_strength))
+    transient = max(0.0, min(1.0, transient_salience))
+    confidence = max(0.0, min(1.0, beat_confidence))
+    score = (
+        0.29 * confidence
+        + 0.22 * regularity
+        + 0.16 * coverage
+        + 0.10 * pulse
+        + 0.05 * density_score
+        + 0.18 * transient
+    )
+    minimum_beats = max(4, int(math.floor(duration * 0.30)))
+    beat_led = bool(
+        tempo_valid
+        and beat_count >= minimum_beats
+        and confidence >= 0.42
+        and regularity >= 0.52
+        and coverage >= 0.45
+        and transient >= 0.14
+        and score >= 0.56
+    )
+    mode = "beat_cut" if beat_led else "phrase_flow"
+    reasons: list[str] = []
+    if beat_led:
+        reasons.extend(("stable measured beat intervals", "usable beat-grid coverage"))
+        if transient >= 0.45 or pulse >= 0.45:
+            reasons.append("clear transient or pulse evidence")
+    else:
+        if not tempo_valid or confidence < 0.42:
+            reasons.append("low beat-tracking confidence")
+        if regularity < 0.52:
+            reasons.append("unstable beat intervals")
+        if coverage < 0.45 or beat_count < minimum_beats:
+            reasons.append("insufficient beat-grid coverage")
+        if transient < 0.14:
+            reasons.append("low transient salience despite a plausible tempo")
+        elif pulse < 0.30 and density_score < 0.30:
+            reasons.append("sparse transient evidence")
+        if not reasons:
+            reasons.append("phrase continuity is safer than per-beat cutting")
+    distance = abs(score - 0.56) / 0.44
+    return {
+        "mode": mode,
+        "confidence": _finite_float(min(1.0, 0.52 + 0.48 * distance), 4),
+        "suitability_score": _finite_float(score, 4),
+        "beat_interval_stability": _finite_float(regularity, 4),
+        "beat_grid_coverage": _finite_float(coverage, 4),
+        "onset_density_score": _finite_float(density_score, 4),
+        "transient_salience": _finite_float(transient, 4),
+        "reasons": reasons,
+    }
+
+
+def _mean_between(values: Any, times: Any, start: float, end: float, np: Any) -> float:
+    left = int(np.searchsorted(times, start, side="left"))
+    right = int(np.searchsorted(times, end, side="right"))
+    left = max(0, min(len(values) - 1, left))
+    right = max(left + 1, min(len(values), right))
+    return float(np.mean(values[left:right]))
+
+
+def _detect_energy_events(
+    *,
+    times: Any,
+    energy: Any,
+    density: Any,
+    onset: Any,
+    accent: Any,
+    silence_intervals: Sequence[dict[str, Any]],
+    low_energy_intervals: Sequence[dict[str, Any]],
+    duration: float,
+    frame_rate: float,
+    np: Any,
+) -> dict[str, list[dict[str, Any]]]:
+    """Detect deterministic edit-significant energy events from signal curves."""
+
+    if len(times) == 0:
+        return {"hard_stops": [], "drops": [], "surges": [], "climaxes": []}
+    window = max(1, int(round(0.34 * frame_rate)))
+    before = np.roll(energy, window)
+    after = np.roll(energy, -window)
+    before[:window] = energy[0]
+    after[-window:] = energy[-1]
+    change = after - before
+    rise_floor = max(0.105, float(np.percentile(change, 88)))
+    rise_peaks = _pick_peak_indices(
+        change,
+        distance=max(1, int(round(0.85 * frame_rate))),
+        height=rise_floor,
+        prominence=0.025,
+        np=np,
+    )
+    drops: list[dict[str, Any]] = []
+    surges: list[dict[str, Any]] = []
+    for index in rise_peaks:
+        delta = float(change[index])
+        if delta < 0.105:
+            continue
+        time_value = float(times[index])
+        if time_value <= 0.08 or time_value >= duration - 0.08:
+            continue
+        after_level = _mean_between(
+            energy, times, time_value, min(duration, time_value + 0.55), np
+        )
+        before_level = _mean_between(
+            energy, times, max(0.0, time_value - 0.55), time_value, np
+        )
+        local_onset = float(onset[index])
+        local_density = float(density[index])
+        strength = max(
+            0.0,
+            min(
+                1.0,
+                0.48 * min(1.0, delta / 0.42)
+                + 0.24 * after_level
+                + 0.16 * local_onset
+                + 0.12 * local_density,
+            ),
+        )
+        record = {
+            "time": _finite_float(time_value, 4),
+            "strength": _finite_float(strength, 4),
+            "confidence": _finite_float(0.42 + 0.50 * strength, 4),
+            "energy_before": _finite_float(before_level, 4),
+            "energy_after": _finite_float(after_level, 4),
+            "energy_delta": _finite_float(after_level - before_level, 4),
+            "onset_strength": _finite_float(local_onset, 4),
+            "density": _finite_float(local_density, 4),
+        }
+        if delta >= 0.19 and after_level >= 0.54 and (
+            local_onset >= 0.48 or local_density >= 0.46
+        ):
+            record["type"] = "drop"
+            drops.append(record)
+        else:
+            record["type"] = "surge"
+            surges.append(record)
+
+    rise_event_limit = max(2, int(math.ceil(duration / 4.0)))
+    combined_rises = drops + surges
+    if len(combined_rises) > rise_event_limit:
+        selected_rises = sorted(
+            combined_rises,
+            key=lambda item: (
+                float(item.get("strength", 0.0)) + (0.06 if item.get("type") == "drop" else 0.0),
+                -float(item.get("time", 0.0)),
+            ),
+            reverse=True,
+        )[:rise_event_limit]
+        selected_ids = {id(item) for item in selected_rises}
+        drops = [item for item in drops if id(item) in selected_ids]
+        surges = [item for item in surges if id(item) in selected_ids]
+        drops.sort(key=lambda item: float(item["time"]))
+        surges.sort(key=lambda item: float(item["time"]))
+
+    hard_stops: list[dict[str, Any]] = []
+    stop_candidates = sorted(
+        {
+            round(float(region.get("start", -1.0)), 4)
+            for region in (*silence_intervals, *low_energy_intervals)
+            if 0.08 < float(region.get("start", -1.0)) < duration - 0.05
+        }
+    )
+    for time_value in stop_candidates:
+        before_level = _mean_between(
+            energy, times, max(0.0, time_value - 0.42), time_value, np
+        )
+        after_level = _mean_between(
+            energy, times, time_value, min(duration, time_value + 0.32), np
+        )
+        delta = before_level - after_level
+        if before_level < 0.28 or delta < 0.22:
+            continue
+        strength = max(0.0, min(1.0, 0.58 * delta / 0.55 + 0.42 * before_level))
+        hard_stops.append(
+            {
+                "type": "hard_stop",
+                "time": _finite_float(time_value, 4),
+                "strength": _finite_float(strength, 4),
+                "confidence": _finite_float(0.45 + 0.48 * strength, 4),
+                "energy_before": _finite_float(before_level, 4),
+                "energy_after": _finite_float(after_level, 4),
+                "energy_delta": _finite_float(-delta, 4),
+            }
+        )
+
+    impact = _smooth(
+        0.60 * energy + 0.24 * density + 0.16 * accent,
+        max(1, int(round(0.45 * frame_rate))),
+        np,
+    )
+    climaxes: list[dict[str, Any]] = []
+    if impact.size:
+        usable = np.flatnonzero((times >= min(0.20, duration * 0.05)) & (times <= duration - min(0.20, duration * 0.05)))
+        if usable.size:
+            ranked = sorted(usable, key=lambda index: float(impact[index]), reverse=True)
+            selected: list[int] = []
+            for index in ranked:
+                if float(impact[index]) < 0.40:
+                    break
+                if all(abs(float(times[index]) - float(times[other])) >= 2.0 for other in selected):
+                    selected.append(int(index))
+                if len(selected) >= 2:
+                    break
+            for index in sorted(selected):
+                climaxes.append(
+                    {
+                        "type": "climax",
+                        "time": _finite_float(times[index], 4),
+                        "strength": _finite_float(impact[index], 4),
+                        "confidence": _finite_float(0.45 + 0.48 * float(impact[index]), 4),
+                        "energy": _finite_float(energy[index], 4),
+                        "density": _finite_float(density[index], 4),
+                    }
+                )
+    return {
+        "hard_stops": hard_stops,
+        "drops": drops,
+        "surges": surges,
+        "climaxes": climaxes,
+    }
+
+
 def _adaptive_energy_points(
     times: Any,
     energy: Any,
@@ -606,6 +889,33 @@ def _analyze_signal(
             sorted(ranked[: max(64, int(analyzed_duration * 4))]), dtype=int
         )
 
+    onset_height = float(np.percentile(onset, 62)) if onset.size else 1.0
+    onset_peaks = _pick_peak_indices(
+        onset,
+        distance=max(1, int(round(0.085 * frame_rate))),
+        height=max(0.08, onset_height),
+        prominence=0.025,
+        np=np,
+    )
+    if len(onset_peaks) > max(96, int(analyzed_duration * 8)):
+        ranked_onsets = sorted(onset_peaks, key=lambda index: float(onset[index]), reverse=True)
+        onset_peaks = np.asarray(
+            sorted(ranked_onsets[: max(96, int(analyzed_duration * 8))]), dtype=int
+        )
+    onset_markers = np.zeros(frame_count, dtype=float)
+    onset_markers[onset_peaks] = 1.0
+    density_window = max(1, min(frame_count, int(round(1.0 * frame_rate))))
+    density_per_second = np.convolve(
+        onset_markers,
+        np.ones(density_window, dtype=float),
+        mode="same",
+    ) * frame_rate / density_window
+    density_normalized = _smooth(
+        _robust_normalize(density_per_second, np, 5, 95),
+        max(1, int(round(0.20 * frame_rate))),
+        np,
+    )
+
     beats: list[dict[str, Any]] = []
     for index, beat_time in enumerate(beat_times):
         beats.append(
@@ -630,6 +940,25 @@ def _analyze_signal(
                 "time": _finite_float(time_value, 4),
                 "strength": _finite_float(strength, 4),
                 "level": "strong" if strength >= 0.78 else "medium",
+                "nearest_beat_delta_seconds": (
+                    None if nearest_delta is None else _finite_float(nearest_delta, 4)
+                ),
+            }
+        )
+
+    onsets: list[dict[str, Any]] = []
+    for frame_index in onset_peaks:
+        time_value = float(times[frame_index])
+        strength = float(onset[frame_index])
+        nearest_delta: Optional[float] = None
+        if beat_times.size:
+            beat_index = _nearest_index(beat_times, time_value, np)
+            nearest_delta = time_value - float(beat_times[beat_index])
+        onsets.append(
+            {
+                "time": _finite_float(time_value, 4),
+                "strength": _finite_float(strength, 4),
+                "level": "strong" if strength >= 0.72 else "medium" if strength >= 0.42 else "soft",
                 "nearest_beat_delta_seconds": (
                     None if nearest_delta is None else _finite_float(nearest_delta, 4)
                 ),
@@ -682,6 +1011,56 @@ def _analyze_signal(
         start_i = _nearest_index(times, float(pause["start"]), np)
         end_i = _nearest_index(times, float(pause["end"]), np) + 1
         pause["minimum_db_relative_to_peak"] = _finite_float(np.min(rms_db[start_i:end_i]), 2)
+
+    low_energy_mask = (energy <= 0.22) | (
+        rms_db <= min(-18.0, float(np.percentile(rms_db, 22)))
+    )
+    low_energy_intervals = _merge_boolean_regions(
+        low_energy_mask,
+        times,
+        analyzed_duration,
+        np,
+        min_duration=0.45,
+        max_gap=0.20,
+    )
+    for interval in low_energy_intervals:
+        start_i = _nearest_index(times, float(interval["start"]), np)
+        end_i = _nearest_index(times, float(interval["end"]), np) + 1
+        interval["mean_energy"] = _finite_float(np.mean(energy[start_i:end_i]), 4)
+        interval["minimum_db_relative_to_peak"] = _finite_float(
+            np.min(rms_db[start_i:end_i]), 2
+        )
+
+    energy_events = _detect_energy_events(
+        times=times,
+        energy=energy,
+        density=density_normalized,
+        onset=onset,
+        accent=accent_curve,
+        silence_intervals=pauses,
+        low_energy_intervals=low_energy_intervals,
+        duration=analyzed_duration,
+        frame_rate=frame_rate,
+        np=np,
+    )
+    overall_onset_density = len(onsets) / max(analyzed_duration, 1e-9)
+    onset_raw_median = float(np.median(onset_raw)) if onset_raw.size else 0.0
+    onset_raw_p95 = float(np.percentile(onset_raw, 95)) if onset_raw.size else 0.0
+    onset_peak_ratio = onset_raw_p95 / max(1e-6, onset_raw_median)
+    transient_salience = max(
+        0.0,
+        min(1.0, (math.log10(1.0 + onset_peak_ratio) - 0.60) / 2.0),
+    )
+    rhythm_mode = _classify_rhythm_mode(
+        tempo=tempo,
+        beat_confidence=beat_confidence,
+        interval_cv=interval_cv,
+        pulse_strength=pulse_strength,
+        onset_density=overall_onset_density,
+        transient_salience=transient_salience,
+        beat_count=len(beats),
+        duration=analyzed_duration,
+    )
 
     # Section novelty compares feature means on both sides of each point.
     normalized_mfcc = np.vstack(
@@ -746,6 +1125,7 @@ def _analyze_signal(
 
     global_centroid_normalized = _robust_normalize(centroid, np, 5, 95)
     accent_times = np.asarray([float(times[index]) for index in accent_peaks], dtype=float)
+    onset_times = np.asarray([float(times[index]) for index in onset_peaks], dtype=float)
     sections: list[dict[str, Any]] = []
     section_vectors: list[Any] = []
     for section_index, (start, end) in enumerate(zip(section_boundaries[:-1], section_boundaries[1:])):
@@ -759,20 +1139,42 @@ def _analyze_signal(
             np.mean(energy[end_i - quarter : end_i]) - np.mean(energy[start_i : start_i + quarter])
         )
         accent_count = int(np.sum((accent_times >= start) & (accent_times < end)))
-        onset_density = accent_count / max(end - start, 1e-6)
+        accent_density = accent_count / max(end - start, 1e-6)
+        section_onset_count = int(np.sum((onset_times >= start) & (onset_times < end)))
+        section_onset_density = section_onset_count / max(end - start, 1e-6)
+        section_density = float(np.mean(density_normalized[start_i:end_i]))
         section_brightness = float(np.mean(global_centroid_normalized[start_i:end_i]))
         section_vocal = float(np.average(vocal_score[start_i:end_i], weights=energy_weights[start_i:end_i]))
         section_vectors.append(np.mean(structure_features[:, start_i:end_i], axis=1))
         mood, mood_traits = _mood_label(
-            section_energy, onset_density, section_brightness, section_vocal, tempo
+            section_energy, section_onset_density, section_brightness, section_vocal, tempo
         )
-        if tempo > 0:
+        section_rhythm_mode = (
+            "beat_cut"
+            if rhythm_mode["mode"] == "beat_cut"
+            and section_onset_density >= 0.32
+            and float(np.mean(onset[start_i:end_i])) >= 0.10
+            else "phrase_flow"
+        )
+        cut_intensity = max(
+            0.05,
+            min(
+                1.0,
+                0.14
+                + 0.50 * section_energy
+                + 0.26 * section_density
+                + 0.10 * max(0.0, min(1.0, energy_trend + 0.2)),
+            ),
+        )
+        if section_rhythm_mode == "phrase_flow":
+            cut_intensity *= 0.76
+        if tempo > 0 and section_rhythm_mode == "beat_cut":
             beat_seconds = 60.0 / tempo
-            if section_energy >= 0.68 or onset_density >= 2.0:
+            if section_energy >= 0.68 or section_onset_density >= 2.0:
                 shot_range = [max(0.35, beat_seconds), max(0.7, beat_seconds * 2.0)]
                 cut_style = "accent-and-beat cuts"
                 motion = "high"
-            elif section_energy < 0.36 and onset_density < 1.0:
+            elif section_energy < 0.36 and section_onset_density < 1.0:
                 shot_range = [beat_seconds * 4.0, beat_seconds * 8.0]
                 cut_style = "phrase-led flowing cuts"
                 motion = "low"
@@ -781,9 +1183,10 @@ def _analyze_signal(
                 cut_style = "downbeat-led cuts"
                 motion = "medium"
         else:
-            shot_range = [1.5, 3.5]
-            cut_style = "energy-change cuts"
-            motion = "medium"
+            phrase_target = max(1.35, min(6.0, 2.0 + (1.0 - section_energy) * 2.8))
+            shot_range = [max(0.85, phrase_target * 0.72), min(7.5, phrase_target * 1.38)]
+            cut_style = "phrase-flow cuts"
+            motion = "low" if section_energy < 0.40 else "medium"
         sections.append(
             {
                 "index": section_index,
@@ -791,6 +1194,7 @@ def _analyze_signal(
                 "end": _finite_float(end, 4),
                 "duration": _finite_float(end - start, 4),
                 "role": "unassigned",
+                "role_confidence": 0.0,
                 "energy": {
                     "mean": _finite_float(section_energy, 4),
                     "peak": _finite_float(section_peak, 4),
@@ -799,8 +1203,11 @@ def _analyze_signal(
                 },
                 "rhythm": {
                     "accent_count": accent_count,
-                    "accent_density_per_second": _finite_float(onset_density, 4),
-                    "density_label": "dense" if onset_density >= 2.2 else "sparse" if onset_density < 0.75 else "moderate",
+                    "accent_density_per_second": _finite_float(accent_density, 4),
+                    "onset_count": section_onset_count,
+                    "onset_density_per_second": _finite_float(section_onset_density, 4),
+                    "density": _finite_float(section_density, 4),
+                    "density_label": "dense" if section_onset_density >= 2.2 else "sparse" if section_onset_density < 0.75 else "moderate",
                     "pulse_strength": _finite_float(np.mean(onset[start_i:end_i]), 4),
                 },
                 "timbre": {
@@ -813,8 +1220,11 @@ def _analyze_signal(
                 "vocal_likelihood": _finite_float(section_vocal, 4),
                 "estimated_mood": mood,
                 "mood_traits": mood_traits,
+                "rhythm_mode": section_rhythm_mode,
                 "edit_guidance": {
                     "cut_style": cut_style,
+                    "rhythm_mode": section_rhythm_mode,
+                    "cut_intensity": _finite_float(cut_intensity, 4),
                     "recommended_shot_duration_seconds": [
                         _finite_float(shot_range[0], 3),
                         _finite_float(shot_range[1], 3),
@@ -830,31 +1240,68 @@ def _analyze_signal(
         )
 
     if len(sections) == 1:
-        sections[0]["role"] = "main"
+        sections[0]["legacy_role"] = "main"
+        sections[0]["role"] = "climax"
+        sections[0]["role_confidence"] = 0.42
     else:
+        candidate_indices = list(range(1, len(sections) - 1)) or list(range(len(sections)))
         peak_index = max(
-            range(len(sections)),
+            candidate_indices,
             key=lambda index: sections[index]["energy"]["mean"]
-            * (1.0 + 0.15 * sections[index]["rhythm"]["accent_density_per_second"]),
+            * (1.0 + 0.18 * sections[index]["rhythm"]["density"]),
         )
+        drop_times = [float(item["time"]) for item in energy_events["drops"]]
+        climax_times = [float(item["time"]) for item in energy_events["climaxes"]]
+        previous_energy = float(sections[0]["energy"]["mean"])
         for index, section in enumerate(sections):
             energy_value = float(section["energy"]["mean"])
             trend_value = float(section["energy"]["trend"])
+            density_value = float(section["rhythm"]["density"])
             if index == 0:
-                role = "intro"
+                legacy_role = "intro"
             elif index == len(sections) - 1:
-                role = "outro"
+                legacy_role = "outro"
             elif index == peak_index:
-                role = "peak"
+                legacy_role = "peak"
             elif energy_value < 0.34:
-                role = "breakdown"
+                legacy_role = "breakdown"
             elif index < peak_index or trend_value > 0.08:
-                role = "build"
+                legacy_role = "build"
             elif trend_value < -0.08:
-                role = "release"
+                legacy_role = "release"
             else:
-                role = "sustain"
+                legacy_role = "sustain"
+
+            starts_with_drop = any(
+                float(section["start"]) - 0.20 <= time_value <= float(section["start"]) + 1.10
+                for time_value in drop_times
+            )
+            contains_climax = any(
+                float(section["start"]) <= time_value < float(section["end"])
+                for time_value in climax_times
+            )
+            energy_jump = energy_value - previous_energy
+            if index == 0:
+                role, role_confidence = "intro", 0.78
+            elif index == len(sections) - 1:
+                role, role_confidence = "outro", 0.78
+            elif starts_with_drop or (energy_jump >= 0.18 and energy_value >= 0.54):
+                role = "drop"
+                role_confidence = min(0.94, 0.62 + max(0.0, energy_jump) * 0.8)
+            elif index == peak_index or contains_climax:
+                role = "climax"
+                role_confidence = min(0.94, 0.58 + 0.22 * energy_value + 0.16 * density_value)
+            elif energy_value < 0.34 or energy_jump <= -0.17:
+                role = "break"
+                role_confidence = min(0.90, 0.58 + abs(min(0.0, energy_jump)) * 0.8)
+            else:
+                role = "build"
+                role_confidence = min(0.88, 0.52 + 0.18 * max(0.0, trend_value) + 0.12 * density_value)
+            section["legacy_role"] = legacy_role
             section["role"] = role
+            section["role_confidence"] = _finite_float(role_confidence, 4)
+            section["edit_guidance"]["section_role"] = role
+            previous_energy = energy_value
 
     # Detect recurring/loop-like sections from the same MFCC, chroma, energy
     # and onset representation used for boundary discovery.  This is a
@@ -967,6 +1414,47 @@ def _analyze_signal(
         analyzed_duration,
         np,
     )
+    density_points: list[dict[str, Any]] = []
+    onset_strength_points: list[dict[str, Any]] = []
+    for point in energy_points:
+        point_time = float(point["time"])
+        frame_index = _nearest_index(times, point_time, np)
+        density_points.append(
+            {
+                "time": _finite_float(point_time, 4),
+                "onsets_per_second": _finite_float(density_per_second[frame_index], 4),
+                "normalized": _finite_float(density_normalized[frame_index], 4),
+            }
+        )
+        onset_strength_points.append(
+            {
+                "time": _finite_float(point_time, 4),
+                "strength": _finite_float(onset[frame_index], 4),
+            }
+        )
+
+    key_moments: list[dict[str, Any]] = []
+    for event_type in ("hard_stops", "drops", "surges", "climaxes"):
+        for event in energy_events[event_type]:
+            record = dict(event)
+            event_time = float(record.get("time", 0.0))
+            active_section = next(
+                (
+                    section
+                    for section in sections
+                    if float(section["start"]) <= event_time < float(section["end"]) + 1e-6
+                ),
+                None,
+            )
+            record["section_index"] = active_section.get("index") if active_section else None
+            record["section_role"] = active_section.get("role") if active_section else None
+            key_moments.append(record)
+    key_moments.sort(key=lambda item: (float(item.get("time", 0.0)), str(item.get("type", ""))))
+
+    phrase_boundary_events = [
+        {"time": _finite_float(value, 4), "confidence": _finite_float(0.52 + 0.34 * rhythm_mode["suitability_score"], 4)}
+        for value in phrase_boundaries[1:-1]
+    ]
     timbre = _feature_summary(
         0,
         frame_count,
@@ -995,6 +1483,7 @@ def _analyze_signal(
             "energy": section["energy"]["mean"],
             "energy_trend": section["energy"]["trend_label"],
             "rhythm_density": section["rhythm"]["density_label"],
+            "rhythm_mode": section["rhythm_mode"],
             "mood": section["estimated_mood"],
             "timbre": section["timbre"]["brightness_label"],
             "vocal_likelihood": section["vocal_likelihood"],
@@ -1003,7 +1492,102 @@ def _analyze_signal(
         for section in sections
     ]
 
+    recommended_targets = [
+        sum(section["edit_guidance"]["recommended_shot_duration_seconds"])
+        / max(1, len(section["edit_guidance"]["recommended_shot_duration_seconds"]))
+        for section in sections
+    ]
+    overall_recommended = _finite_float(
+        np.median(recommended_targets) if recommended_targets else 2.5, 3
+    )
+    tempo_profile = {
+        "bpm": _finite_float(tempo, 3),
+        "beat_period_seconds": _finite_float(60.0 / tempo, 5) if tempo > 0 else None,
+        "confidence": _finite_float(beat_confidence, 4),
+        "interval_cv": _finite_float(interval_cv, 4),
+        "stability": rhythm_mode["beat_interval_stability"],
+        "pulse_strength": _finite_float(pulse_strength, 4),
+        "meter": f"{meter}/4",
+        "meter_confidence": _finite_float(meter_confidence, 4),
+    }
+    event_map = {
+        "beats": beats,
+        "downbeats": [
+            {"time": _finite_float(value, 4), "strength": _finite_float(beats[index]["strength"], 4)}
+            for index, value in zip(downbeat_indices, downbeat_times)
+        ],
+        "onsets": onsets,
+        "accents": accents,
+        "hard_stops": energy_events["hard_stops"],
+        "drops": energy_events["drops"],
+        "surges": energy_events["surges"],
+        "climaxes": energy_events["climaxes"],
+        "phrase_boundaries": phrase_boundary_events,
+        "section_boundaries": boundary_records,
+    }
+
     return {
+        "artifact_type": "audiomap",
+        "duration_seconds": _finite_float(analyzed_duration, 5),
+        "tempo": tempo_profile,
+        "rhythm_mode": rhythm_mode,
+        "events": event_map,
+        "curves": {
+            "energy": {"points": energy_points, "sampling": energy_sampling},
+            "density": {
+                "points": density_points,
+                "unit": "detected_onsets_per_second",
+                "window_seconds": 1.0,
+            },
+            "onset_strength": {"points": onset_strength_points},
+        },
+        "intervals": {
+            "silence": pauses,
+            "low_energy": low_energy_intervals,
+            "vocal_likely": vocal_intervals,
+        },
+        "onsets": onsets,
+        "density_curve": density_points,
+        "silence_intervals": pauses,
+        "low_energy_intervals": low_energy_intervals,
+        "hard_stops": energy_events["hard_stops"],
+        "drops": energy_events["drops"],
+        "surges": energy_events["surges"],
+        "climaxes": energy_events["climaxes"],
+        "key_moments": key_moments,
+        "editing_guidance": {
+            "rhythm_mode": rhythm_mode["mode"],
+            "recommended_shot_duration_seconds": overall_recommended,
+            "cut_intensity": _finite_float(
+                np.mean([section["edit_guidance"]["cut_intensity"] for section in sections])
+                if sections
+                else 0.4,
+                4,
+            ),
+            "strategy": (
+                "snap eligible boundaries to measured beats and strong accents"
+                if rhythm_mode["mode"] == "beat_cut"
+                else "follow phrases, section changes and energy arcs; do not cut every beat"
+            ),
+        },
+        "reliability": {
+            "overall": _finite_float(
+                0.46 * beat_confidence
+                + 0.24 * rhythm_mode["beat_interval_stability"]
+                + 0.18 * min(1.0, len(onsets) / max(4.0, analyzed_duration))
+                + 0.12 * min(1.0, len(sections) / 4.0),
+                4,
+            ),
+            "tempo": _finite_float(beat_confidence, 4),
+            "meter": _finite_float(meter_confidence, 4),
+            "structure": _finite_float(
+                np.mean([boundary.get("confidence", 0.0) for boundary in boundary_records])
+                if boundary_records
+                else 0.0,
+                4,
+            ),
+            "disclosure": "All musical events and roles are deterministic signal-derived estimates.",
+        },
         "global": {
             "tempo_bpm_estimate": _finite_float(tempo, 3),
             "bpm": _finite_float(tempo, 3),
@@ -1018,6 +1602,8 @@ def _analyze_signal(
                 np.percentile(rms_db, 95) - np.percentile(rms_db, 5), 3
             ),
             "accent_density_per_second": _finite_float(len(accents) / analyzed_duration, 4),
+            "onset_density_per_second": _finite_float(overall_onset_density, 4),
+            "rhythm_mode": rhythm_mode["mode"],
         },
         "beats": beats,
         "downbeats": [_finite_float(value, 4) for value in downbeat_times],
@@ -1049,6 +1635,9 @@ def _analyze_signal(
             "hop_length": hop_length,
             "frame_rate_hz": _finite_float(frame_rate, 4),
             "bars_per_phrase_assumption": bars_per_phrase,
+            "onset_raw_median": _finite_float(onset_raw_median, 6),
+            "onset_raw_p95": _finite_float(onset_raw_p95, 6),
+            "transient_salience": _finite_float(transient_salience, 4),
         },
     }
 
@@ -1143,6 +1732,9 @@ def analyze_bgm(
         "analyzer": {
             "name": "bgm-montage signal analyzer",
             "version": ANALYZER_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "analysis_config_version": ANALYSIS_CONFIG_VERSION,
+            "deterministic": True,
             "basis": "decoded audio waveform",
             "disclosure": (
                 "Tempo, beats, downbeats, phrases, sections, vocal likelihood, moods and edit "
@@ -1178,7 +1770,7 @@ def analyze_bgm(
             "hit": False,
             "cache_key": key,
             "cache_file": str(cache_file),
-            "invalidation": "SHA-256 file content + target_duration + analyzer/schema version",
+            "invalidation": "SHA-256 file content + target_duration + analyzer/schema/config version + sample rate",
         },
         **signal_profile,
         "estimation_notes": [
@@ -1186,9 +1778,12 @@ def analyze_bgm(
             "Downbeats approximate a 3/4 or 4/4 accent phase; meter confidence should be respected.",
             "Phrases group four estimated bars and also preserve strong section boundaries.",
             "Sections come from MFCC, chroma, energy and onset novelty, aligned to nearby estimated downbeats.",
+            "beat_cut is enabled only when confidence, interval stability, grid coverage and pulse evidence pass conservative gates.",
+            "Drops, surges, hard stops and climaxes are deterministic energy/onset/density estimates for editing, not musicological labels.",
             "Mood and editing guidance are deterministic heuristics over measured energy, rhythm and timbre.",
         ],
     }
+    result["analysis_digest"] = _analysis_digest(result)
     _write_json(cache_file, result)
     if destination is not None:
         _write_json(destination, result)
@@ -1196,10 +1791,21 @@ def analyze_bgm(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    project_root = Path(
-        os.environ.get("BGM_MONTAGE_PROJECT_ROOT", Path(__file__).resolve().parents[2])
-    ).expanduser().resolve()
-    default_cache = project_root / ".bgm-montage-cache" / "bgm"
+    try:
+        from runtime_paths import RuntimePaths
+
+        default_cache = RuntimePaths.build().bgm_cache
+    except Exception:
+        explicit = os.environ.get("BGM_MONTAGE_PROJECT_ROOT", "").strip()
+        if explicit:
+            project_root = Path(explicit).expanduser().resolve()
+        else:
+            skill_root = Path(__file__).resolve().parent.parent
+            if skill_root.parent.name == "skills" and skill_root.parent.parent.name == ".agents":
+                project_root = skill_root.parent.parent.parent.resolve()
+            else:
+                project_root = Path.cwd().resolve()
+        default_cache = project_root / ".bgm-montage-cache" / "bgm"
     parser = argparse.ArgumentParser(
         description=(
             "Estimate BGM tempo, beats, phrases, sections, energy, timbre, vocals, pauses and accents "
