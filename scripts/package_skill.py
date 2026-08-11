@@ -48,6 +48,9 @@ REQUIRED_SCRIPTS = (
     "validate_output.py",
     "visual_intelligence.py",
     "visual_semantics.py",
+    "material_usage_policy.py",
+    "youtube_pipeline.py",
+    "youtube_first_pipeline.py",
 )
 REQUIRED_EXACT_FILES = (
     Path("agents/openai.yaml"),
@@ -354,7 +357,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Canonical bgm-montage Skill directory",
     )
     parser.add_argument("--output", help="Destination .zip path")
-    parser.add_argument("--version", default="1.3", help="Version used by the default ZIP filename")
+    parser.add_argument("--version", default="1.3.3", help="Version used by the default ZIP filename")
     parser.add_argument("--force", action="store_true", help="Explicitly replace an existing ZIP")
     return parser
 

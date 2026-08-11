@@ -1,24 +1,23 @@
-# bgm-montage v1.3 使用说明
+# bgm-montage v1.3.3 使用说明
 
 ## YouTube-first acquisition
 
-Use `--source-provider youtube` when YouTube should be searched before Pixabay. This mode requires `yt-dlp` and a configured JavaScript runtime, does not require `PIXABAY_API_KEY`, and preserves the existing v1.3 reference analysis, BGM analysis, timeline planning, source-window selection, rendering, and QA stages.
+The unified entry defaults to `--source-provider youtube-first`. It first reuses machine-wide indexed YouTube assets, then generates task-specific multi-round queries from the visual profile, downloads and analyzes candidates, and invokes Pixabay only when hard candidate-pool, diversity, quality, or style-fit gates remain short. Explicit `youtube` and `pixabay` modes remain available. `yt-dlp` is installed by the formal lock file; a JavaScript runtime is still required for YouTube extraction. The stable reference/BGM/timeline/edit/render/QA core is unchanged.
 
 ```powershell
 & $Python (Join-Path $SkillRoot "scripts\bgm_montage.py") `
-  --source-provider youtube `
-  --search-query "shelf cloud over highway raw footage" `
-  --search-query "supercell storm field raw video 4k" `
+  --source-provider youtube-first `
+  --search-query "optional high-priority visual direction" `
   --youtube-results-per-query 8 `
   --youtube-max-download-candidates 30 `
   --exclude-youtube-id "REJECTED_ID" `
   --bgm ".\music\track.mp3" `
-  --theme "cinematic approaching storm landscape" `
+  --theme "task-specific cinematic landscape" `
   --ratio 16:9 `
   --output-dir ".\renders"
 ```
 
-Provider-compatible manifests record the YouTube ID, title, channel, page URL, actual query, download section, local path, quality analysis, and usable source windows. After contact-sheet review, pass a curated manifest with `--asset-manifest PATH`; this skips acquisition only and leaves the v1.3 editing core active.
+Provider-compatible manifests record the generated query plan, YouTube ID, title, channel, page URL, download section, local path, quality analysis, global index reuse, fallback reason, merge score, and usable source windows. `--search-query` is optional and additive; it never disables automatic query generation. After contact-sheet review, pass a curated manifest with `--asset-manifest PATH`; this skips acquisition only and leaves the stable editing core active.
 
 `--usage-mode local_evaluation` is the default. It applies zero authorization/copyright weight, does not restrict ordinary YouTube material, does not generate license-oriented search terms, and suppresses repeated rights reminders in reports. Use `--usage-mode publish` only after the user explicitly states that the current video will be publicly distributed, commercially used, or externally shared; publication policy is then task-specific rather than inferred.
 
@@ -68,10 +67,10 @@ $env:BGM_MONTAGE_PROJECT_ROOT = ".\造球计划"
 从发布 ZIP 安装到全局 Codex Skill 时，先解压到临时目录，再同步 ZIP 内部的标准路径；不要把 ZIP 直接解压到全局 `skills` 根目录，否则会形成错误的 `.agents/skills` 嵌套。以下流程保留已有 `.venv`，并先备份旧源码：
 
 ```powershell
-$Package = ".\skills\造球计划\bgm-montage-v1.3.zip"
+$Package = ".\skills\造球计划\bgm-montage-v1.3.3.zip"
 $GlobalSkill = Join-Path $env:USERPROFILE ".codex\skills\bgm-montage"
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$Stage = Join-Path ([IO.Path]::GetTempPath()) "bgm-montage-v1.3-$Stamp"
+$Stage = Join-Path ([IO.Path]::GetTempPath()) "bgm-montage-v1.3.3-$Stamp"
 $Backup = Join-Path $env:USERPROFILE ".codex\skills\.backups\bgm-montage-$Stamp"
 
 New-Item -ItemType Directory -Path $Stage, $Backup -Force | Out-Null
@@ -432,12 +431,12 @@ py -3.11 -m venv $JianYingVenv
 & $Python -m pytest -q (Join-Path $SkillRoot "tests")
 ```
 
-构建 v1.3 ZIP：
+构建 v1.3.3 ZIP：
 
 ```powershell
 & $Python (Join-Path $SkillRoot "scripts\package_skill.py") `
   --version 1.3 `
-  --output ".\skills\造球计划\bgm-montage-v1.3.zip"
+  --output ".\skills\造球计划\bgm-montage-v1.3.3.zip"
 ```
 
 ZIP 成员使用标准 `/` 分隔符，并以 `.agents/skills/bgm-montage/` 为根前缀。真实 `.env`、API Key、`.venv`、模型、缓存、下载素材、测试输出和成片不进入发布包。目标 ZIP 已存在时默认拒绝覆盖；只有明确传入 `--force` 才替换。
@@ -445,11 +444,11 @@ ZIP 成员使用标准 `/` 分隔符，并以 `.agents/skills/bgm-montage/` 为�
 Windows 解压：
 
 ```powershell
-Expand-Archive -LiteralPath ".\downloads\bgm-montage-v1.3.zip" `
+Expand-Archive -LiteralPath ".\downloads\bgm-montage-v1.3.3.zip" `
   -DestinationPath ".\my-montage-project"
 ```
 
-Linux/Docker 可使用 `unzip bgm-montage-v1.3.zip -d /workspace/project` 或 `python -m zipfile -e ...`。这只表示 ZIP 路径兼容；本版本不宣称已完成 Linux/Docker 的依赖、模型、FFmpeg 或剪映现场运行验证。
+Linux/Docker 可使用 `unzip bgm-montage-v1.3.3.zip -d /workspace/project` 或 `python -m zipfile -e ...`。这只表示 ZIP 路径兼容；本版本不宣称已完成 Linux/Docker 的依赖、模型、FFmpeg 或剪映现场运行验证。
 
 ## 12. 能力状态
 

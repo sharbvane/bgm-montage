@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified entry point for reference-style, BGM-driven montage creation."""
+"""bgm-montage v1.3.3 unified reference-style, BGM-driven montage entry."""
 
 from __future__ import annotations
 
@@ -34,6 +34,8 @@ from validate_output import validate_output
 from visual_intelligence import build_visual_style_profile
 from youtube_pipeline import InsufficientMaterialError as YouTubeInsufficientMaterialError
 from youtube_pipeline import run_youtube_pipeline
+from youtube_first_pipeline import InsufficientMaterialError as YouTubeFirstInsufficientMaterialError
+from youtube_first_pipeline import run_youtube_first_pipeline
 from material_usage_policy import USAGE_MODES, apply_usage_policy, material_usage_policy, normalize_usage_mode
 
 
@@ -319,10 +321,10 @@ def _export_jianying_draft(
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    """Run the v1.3 pipeline, checkpointing every reusable stage."""
+    """Run the v1.3.3 pipeline, checkpointing every reusable stage."""
 
     load_dotenv(PROJECT_ROOT / ".env", override=False)
-    source_provider = str(_arg(args, "source_provider", "pixabay")).lower()
+    source_provider = str(_arg(args, "source_provider", "youtube-first")).lower()
     usage_mode = normalize_usage_mode(_arg(args, "usage_mode", "local_evaluation"))
     if source_provider == "pixabay" and not os.getenv("PIXABAY_API_KEY"):
         raise RuntimeError(f"PIXABAY_API_KEY is missing. Put it in {PROJECT_ROOT / '.env'}.")
@@ -395,7 +397,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _write_json(
         state_path,
         {
-            "schema_version": "1.3",
+            "schema_version": "1.3.3",
             "run_id": run_id,
             "invocation_digest": invocation_digest,
             "invocation": invocation,
@@ -405,8 +407,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     run_report_path = run_dir / "run_report.json"
     report: dict[str, Any] = {
-        "schema_version": "1.3",
-        "skill_version": "1.3",
+        "schema_version": "1.3.3",
+        "skill_version": "1.3.3",
         "run_id": run_id,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "resumed": resume,
@@ -421,7 +423,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "source_provider": source_provider,
         "usage_mode": usage_mode,
         "material_usage_policy": material_usage_policy(usage_mode),
-        "api_key_configured": bool(os.getenv("PIXABAY_API_KEY")) if source_provider == "pixabay" else None,
+        "api_key_configured": bool(os.getenv("PIXABAY_API_KEY")) if source_provider in {"pixabay", "youtube-first"} else None,
         "stages": {},
         "artifacts": {"run_state": str(state_path), "run_report": str(run_report_path)},
         "passed": False,
@@ -589,7 +591,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             _copy_or_create_sources(media_result, asset_manifest_path)
             pixabay_resumed = True
         else:
-            if source_provider == "youtube":
+            if source_provider == "youtube-first":
+                media_result = run_youtube_first_pipeline(
+                    args.theme,
+                    style_profile,
+                    audio_profile,
+                    material_dir,
+                    cache_root,
+                    desired_assets,
+                    args.ratio,
+                    min_resolution=(args.min_width, args.min_height),
+                    target_duration=target_duration,
+                    timeline_plan=timeline_plan,
+                    candidate_pool_multiplier=int(_arg(args, "candidate_pool_multiplier", 6)),
+                    max_search_pages=int(_arg(args, "max_search_pages", 3)),
+                    priority_queries=list(_arg(args, "priority_queries", []) or []),
+                    visual_cohesion_profile=visual_request,
+                    excluded_youtube_ids=list(_arg(args, "excluded_youtube_ids", []) or []),
+                    excluded_pixabay_ids=list(_arg(args, "excluded_pixabay_ids", []) or []),
+                    results_per_query=int(_arg(args, "youtube_results_per_query", 8)),
+                    max_download_candidates=int(_arg(args, "youtube_max_download_candidates", 36)),
+                    max_search_rounds=int(_arg(args, "youtube_max_search_rounds", 3)),
+                    wide_aerial_only=bool(_arg(args, "wide_aerial_only", False)),
+                    usage_mode=usage_mode,
+                )
+            elif source_provider == "youtube":
                 media_result = run_youtube_pipeline(
                     args.theme,
                     style_profile,
@@ -607,6 +633,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     excluded_youtube_ids=list(_arg(args, "excluded_youtube_ids", []) or []),
                     results_per_query=int(_arg(args, "youtube_results_per_query", 8)),
                     max_download_candidates=int(_arg(args, "youtube_max_download_candidates", 36)),
+                    max_search_rounds=int(_arg(args, "youtube_max_search_rounds", 3)),
                     usage_mode=usage_mode,
                 )
             else:
@@ -843,7 +870,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
         report["passed"] = False
         report["failure"] = {"type": type(exc).__name__, "message": _strip_secret(str(exc))}
-        if isinstance(exc, (PixabayInsufficientMaterialError, YouTubeInsufficientMaterialError, TimelineInsufficientMaterialError)):
+        if isinstance(exc, (PixabayInsufficientMaterialError, YouTubeInsufficientMaterialError, YouTubeFirstInsufficientMaterialError, TimelineInsufficientMaterialError)):
             report["failure"]["category"] = "insufficient_material"
         checkpoint()
         raise
@@ -851,6 +878,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version="bgm-montage 1.3.3")
     parser.add_argument("--bgm", required=True, help="Input BGM/audio file")
     parser.add_argument("--theme", required=True, help="Theme used to generate English visual search queries")
     parser.add_argument("--duration", required=True, type=float, help="Requested output duration in seconds")
@@ -871,9 +899,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", default=str(PROJECT_ROOT / ".bgm-montage-cache"))
     parser.add_argument(
         "--source-provider",
-        choices=("pixabay", "youtube"),
-        default="pixabay",
-        help="Material acquisition provider. YouTube mode uses yt-dlp and does not require PIXABAY_API_KEY.",
+        choices=("youtube-first", "youtube", "pixabay"),
+        default="youtube-first",
+        help="Material strategy (default: youtube-first with automatic Pixabay fallback).",
     )
     parser.add_argument(
         "--usage-mode",
@@ -909,6 +937,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--youtube-results-per-query", type=int, default=8)
     parser.add_argument("--youtube-max-download-candidates", type=int, default=36)
+    parser.add_argument("--youtube-max-search-rounds", type=int, default=3)
     parser.add_argument(
         "--exclude-youtube-id",
         dest="excluded_youtube_ids",

@@ -54,6 +54,7 @@ def _stub_pipeline(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
         path.write_bytes(b"fixture")
         selected.append({"pixabay_id": index, "local_path": str(path), "duration_seconds": 8.0})
     monkeypatch.setattr(entry, "run_pixabay_pipeline", lambda *args, **kwargs: {"selected": selected, "search_rounds": [], "rejections": []})
+    monkeypatch.setattr(entry, "run_youtube_first_pipeline", lambda *args, **kwargs: {"selected": selected, "search_rounds": [], "rejections": [], "candidate_count": 24, "candidate_pool_gate": {"passed": True}})
     plan = {"duration_seconds": 8.0, "shots": []}
     monkeypatch.setattr(entry, "build_timeline", lambda *args, **kwargs: plan)
     monkeypatch.setattr(entry, "write_plan", lambda value, path: entry._write_json(Path(path), value))
@@ -102,12 +103,12 @@ def test_failed_run_resumes_from_existing_stage_artifacts(
     (tmp_path / "music.wav").write_bytes(b"audio")
     _stub_pipeline(monkeypatch, tmp_path)
     args = _args(tmp_path, run_id="resume-run")
-    working_pixabay = entry.run_pixabay_pipeline
+    working_youtube_first = entry.run_youtube_first_pipeline
 
     def fail_once(*_args: object, **_kwargs: object) -> dict[str, object]:
         raise RuntimeError("intentional stage interruption")
 
-    monkeypatch.setattr(entry, "run_pixabay_pipeline", fail_once)
+    monkeypatch.setattr(entry, "run_youtube_first_pipeline", fail_once)
     with pytest.raises(RuntimeError, match="intentional stage interruption"):
         entry.run(args)
 
@@ -115,7 +116,7 @@ def test_failed_run_resumes_from_existing_stage_artifacts(
     assert (run_dir / "audiomap.json").is_file()
     assert not (run_dir / "run-id-test_montage.mp4").exists()
 
-    monkeypatch.setattr(entry, "run_pixabay_pipeline", working_pixabay)
+    monkeypatch.setattr(entry, "run_youtube_first_pipeline", working_youtube_first)
     args.resume_run = True
     report = entry.run(args)
 

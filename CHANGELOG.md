@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.3.3 — 2026-08-11
+
+- Default provider strategy is now true `youtube-first`: machine-wide local reuse, dynamic multi-round YouTube discovery, sampled-frame filtering, automatic Pixabay fallback, provider-neutral merge/deduplication, and a hard combined sufficiency gate.
+- Removed global storm vocabulary from YouTube query expansion and metadata scoring. Query plans now come from the same task-specific subject/environment/mood/weather/light/color/scale/depth/camera model used by the existing visual intelligence layer; explicit queries are optional high-priority additions.
+- Added the machine-wide YouTube `asset_index.json`, per-task rescoring, no-network cache completion, formal `yt-dlp` dependency locking, and v1.3.3 regression coverage while preserving the v1.3 editing and render core.
+
 ## v1.3.2 — 2026-08-11
 
 - Added an auditable `local_evaluation` default and explicit `publish` mode. Local evaluation applies zero copyright/license ranking weight, no ordinary-YouTube penalty, no authorization filter, no licensing-query generation, and no recurring rights warning; source choice remains quality-first.

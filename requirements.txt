@@ -13,3 +13,4 @@ torch>=2.7,<2.8
 torchvision>=0.22,<0.23
 transformers>=4.53,<4.54
 pytest>=8.4,<9
+yt-dlp>=2026.7.4,<2027
