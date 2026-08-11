@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from montage import adjacent_diversity_issues, canonical_source_key, parse_ratio
+from visual_intelligence import evaluate_sequence_consistency
 
 
 def _run(command: list[str], timeout: int = 600) -> subprocess.CompletedProcess[str]:
@@ -507,6 +508,7 @@ def validate_output(
     plan_metrics: dict[str, Any] | None = None
     alignment_metrics: dict[str, Any] | None = None
     climax_metrics: dict[str, Any] | None = None
+    visual_consistency_metrics: dict[str, Any] | None = None
     if plan_payload is not None:
         shots = [shot for shot in plan_payload.get("shots", []) if isinstance(shot, dict)]
         policy = plan_payload.get("content_policy", {}) if isinstance(plan_payload.get("content_policy"), dict) else {}
@@ -598,6 +600,15 @@ def validate_output(
         climax_metrics = _climax_metrics(shots, audiomap_payload, duration)
         if climax_metrics is not None:
             checks["climax_visual_response"] = bool(climax_metrics.get("passed"))
+        visual_profile = (
+            plan_payload.get("visual_style_profile")
+            if isinstance(plan_payload.get("visual_style_profile"), dict)
+            else {}
+        )
+        if str(plan_payload.get("schema_version") or "") == "1.3" or visual_profile:
+            visual_consistency_metrics = evaluate_sequence_consistency(shots, visual_profile)
+            checks["visual_style_profile_present"] = bool(visual_profile)
+            checks["visual_sequence_consistency"] = bool(visual_consistency_metrics.get("passed"))
         plan_metrics = {
             "shot_count": len(shots),
             "unique_asset_count": unique,
@@ -616,6 +627,7 @@ def validate_output(
             if planned_durations
             else 0.0,
             "terminal_planned_minimum_seconds": planned_terminal_minimum,
+            "visual_sequence_consistency": visual_consistency_metrics,
         }
 
     representative_frames: list[str] = []
@@ -672,7 +684,7 @@ def validate_output(
             checks["event_frames"] = len(event_frames) == len(ordered_times)
 
     report = {
-        "schema_version": "1.2",
+        "schema_version": "1.3",
         "artifact_type": "render_report",
         "path": str(path),
         "sha256": media_sha256,
@@ -719,6 +731,7 @@ def validate_output(
         "edit_plan_metrics": plan_metrics,
         "music_cut_alignment": alignment_metrics,
         "climax_visual_response": climax_metrics,
+        "visual_sequence_consistency": visual_consistency_metrics,
     }
     if report_path:
         output = Path(report_path).expanduser().resolve()

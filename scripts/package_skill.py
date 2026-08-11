@@ -25,6 +25,7 @@ REQUIRED_ROOT_FILES = (
     "TEST_REPORT.md",
     "requirements.txt",
     "requirements.lock.txt",
+    "requirements-jianying.lock.txt",
 )
 OPTIONAL_ROOT_FILES = (
     "requirements-dev.txt",
@@ -37,12 +38,15 @@ REQUIRED_SCRIPTS = (
     "analyze_editing_grammar.py",
     "analyze_references.py",
     "bgm_montage.py",
+    "edit_schema.py",
+    "jianying_export.py",
     "montage.py",
     "package_skill.py",
     "pixabay_pipeline.py",
     "runtime_paths.py",
     "timeline_planner.py",
     "validate_output.py",
+    "visual_intelligence.py",
     "visual_semantics.py",
 )
 REQUIRED_EXACT_FILES = (
@@ -350,7 +354,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Canonical bgm-montage Skill directory",
     )
     parser.add_argument("--output", help="Destination .zip path")
-    parser.add_argument("--version", default="1.2", help="Version used by the default ZIP filename")
+    parser.add_argument("--version", default="1.3", help="Version used by the default ZIP filename")
     parser.add_argument("--force", action="store_true", help="Explicitly replace an existing ZIP")
     return parser
 

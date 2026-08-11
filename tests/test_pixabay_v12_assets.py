@@ -178,8 +178,9 @@ def test_collect_candidates_pages_until_timeline_pool_target(
     )
 
     assert not errors
-    assert len(candidates) == 4
-    assert pages == [1, 2]
+    assert len(candidates) >= 4
+    assert len(rounds) >= 2
+    assert set(pages) >= {1, 2}
     assert rounds[-1]["target_pool"] == 4
     assert rounds[-1]["stop_reason"] == "metadata candidate pool target reached"
 

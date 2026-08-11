@@ -167,7 +167,8 @@ def test_slots_use_nonzero_nonoverlapping_best_segments_and_real_labels(tmp_path
         theme="dynamic environment",
         ratio="16:9",
     )
-    assert plan["schema_version"] == "1.2"
+    assert plan["schema_version"] == "1.3"
+    assert plan["compatible_readers"] == ["1.2", "1.3"]
     assert plan["timeline_plan_applied"] is True
     assert len({shot["canonical_source_key"] for shot in plan["shots"]}) == 4
     assert all(shot["source_start"] >= 0.55 for shot in plan["shots"])

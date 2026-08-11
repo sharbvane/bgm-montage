@@ -16,6 +16,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from visual_intelligence import (
+    asset_profile_fit,
+    asset_visual_features,
+    build_light_grade,
+    build_visual_style_profile,
+    evaluate_sequence_consistency,
+    transition_match,
+)
+
 
 class MontageError(RuntimeError):
     """Raised when a montage plan cannot be built or rendered."""
@@ -397,6 +406,17 @@ def _extract_assets(media_result: Any) -> list[dict[str, Any]]:
         if not path.is_file():
             continue
         quality = item.get("quality", {}) if isinstance(item.get("quality"), dict) else {}
+        visual_analysis = (
+            quality.get("visual_analysis", {})
+            if isinstance(quality.get("visual_analysis"), dict)
+            else {}
+        )
+        mean_hsv = quality.get("mean_hsv", {}) if isinstance(quality.get("mean_hsv"), dict) else {}
+        motion_signals = (
+            quality.get("motion_signals", {})
+            if isinstance(quality.get("motion_signals"), dict)
+            else {}
+        )
         duration = _as_float(
             item.get("duration", item.get("duration_seconds", quality.get("duration", quality.get("duration_seconds")))),
             0.0,
@@ -437,8 +457,14 @@ def _extract_assets(media_result: Any) -> list[dict[str, Any]]:
                 "color_tendency": _label_value(
                     item, ("color_tendency", "color_label", "dominant_color", "tone"), "unknown"
                 ),
+                "mean_hsv": {
+                    "hue_degrees": _as_float(mean_hsv.get("hue_degrees"), 0.0),
+                    "saturation": _as_float(mean_hsv.get("saturation"), 0.0),
+                    "value": _as_float(mean_hsv.get("value"), 0.0),
+                },
+                "motion_signals": dict(motion_signals),
                 "motion_label": _label_value(
-                    item, ("motion_label", "camera_motion", "camera_motion_label"), "unknown"
+                    item, ("motion_label", "camera_motion", "camera_motion_label"), str(visual_analysis.get("motion_type") or "unknown")
                 ),
                 "motion_direction": _label_value(
                     item, ("motion_direction", "camera_motion_direction", "direction"), "unknown"
@@ -449,6 +475,7 @@ def _extract_assets(media_result: Any) -> list[dict[str, Any]]:
                 "quality_score": _score_value(
                     item, ("overall_score", "quality_score", "visual_quality_score", "score"), 0.65
                 ),
+                "visual_analysis": dict(visual_analysis),
                 "history_usage_count": int(
                     max(
                         0.0,
@@ -478,6 +505,10 @@ def _extract_assets(media_result: Any) -> list[dict[str, Any]]:
                     )
                 ),
             }
+        if normalized_asset["motion_direction"] == "unknown":
+            normalized_asset["motion_direction"] = str(
+                quality.get("motion_direction", motion_signals.get("motion_direction", "unknown"))
+            ).strip().lower()
         normalized_asset["canonical_source_key"] = canonical_source_key(normalized_asset)
         tags = str(normalized_asset.get("tags", "")).lower()
         normalized_asset["is_aerial"] = bool(
@@ -1036,6 +1067,43 @@ def adjacent_diversity_issues(previous: dict[str, Any], current: dict[str, Any])
     return issues
 
 
+def _asset_hsv(asset: dict[str, Any]) -> tuple[float, float, float] | None:
+    hsv = asset.get("mean_hsv") if isinstance(asset.get("mean_hsv"), dict) else {}
+    saturation = _as_float(hsv.get("saturation"), -1.0)
+    value = _as_float(hsv.get("value"), -1.0)
+    if saturation < 0.0 or value <= 0.0:
+        return None
+    return _as_float(hsv.get("hue_degrees"), 0.0) % 360.0, saturation, value
+
+
+def _adjacent_cohesion(previous: dict[str, Any] | None, asset: dict[str, Any]) -> tuple[float, float]:
+    if previous is None:
+        return 0.5, 0.5
+    left, right = _asset_hsv(previous), _asset_hsv(asset)
+    if left is None or right is None:
+        color_match = 0.45
+    else:
+        lh, ls, lv = left
+        rh, rs, rv = right
+        hue_distance = min(abs(lh - rh), 360.0 - abs(lh - rh)) / 180.0
+        hue_weight = min(0.30, max(0.04, min(ls, rs) * 0.5))
+        color_match = max(
+            0.0,
+            1.0 - hue_weight * hue_distance - 0.38 * abs(ls - rs) - 0.48 * abs(lv - rv),
+        )
+    left_direction = _meaningful_label(previous.get("motion_direction"))
+    right_direction = _meaningful_label(asset.get("motion_direction"))
+    if left_direction is None or right_direction is None:
+        motion_match = 0.45
+    elif left_direction == right_direction:
+        motion_match = 1.0
+    elif "static" in {left_direction, right_direction}:
+        motion_match = 0.20
+    else:
+        motion_match = 0.55
+    return color_match, motion_match
+
+
 def timeline_diversity_issues(shots: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {"left_index": index - 1, "right_index": index, "issues": adjacent_diversity_issues(shots[index - 1], shots[index])}
@@ -1054,7 +1122,9 @@ def _candidate_score(
     spec: OutputSpec,
     theme: str,
     seed: str,
+    visual_profile: dict[str, Any] | None = None,
 ) -> tuple[float, dict[str, float]]:
+    visual_profile = visual_profile or {}
     asset_text = [
         asset.get("tags"), asset.get("scene_category"), asset.get("subject_label"),
         asset.get("search_query"), asset.get("search_queries"), asset.get("semantic"),
@@ -1093,6 +1163,10 @@ def _candidate_score(
     history = min(1.0, _as_float(asset.get("history_usage_count"), 0.0) / 10.0)
     face_penalty = _as_float(asset.get("face_risk"), 0.0)
     difference_penalty = 0.0
+    visual_fit = asset_profile_fit(asset, visual_profile)
+    visual_transition = transition_match(previous, asset, visual_profile)
+    adjacent_color_match = visual_transition["color"]
+    adjacent_motion_match = visual_transition["motion"]
     if previous is not None:
         preview = {
             "canonical_source_key": asset["canonical_source_key"],
@@ -1106,7 +1180,10 @@ def _candidate_score(
             "is_aerial": asset.get("is_aerial"),
         }
         issues = adjacent_diversity_issues(previous, preview)
-        difference_penalty = sum(1.0 if issue == "same_source" else 0.16 for issue in issues)
+        difference_penalty = sum(
+            1.0 if issue == "same_source" else (0.07 if issue in {"consecutive_static", "same_direction_aerial"} else 0.025)
+            for issue in issues
+        )
     digest = hashlib.sha256(
         f"{seed}|{slot['index']}|{asset['canonical_source_key']}".encode("utf-8")
     ).digest()
@@ -1126,6 +1203,20 @@ def _candidate_score(
         "history_penalty": history,
         "face_penalty": face_penalty,
         "adjacent_similarity_penalty": difference_penalty,
+        "adjacent_color_match": adjacent_color_match,
+        "adjacent_motion_match": adjacent_motion_match,
+        "visual_profile_fit": visual_fit["total"],
+        "world_fit": visual_fit["world"],
+        "color_profile_fit": visual_fit["color"],
+        "time_weather_fit": visual_fit["time_weather"],
+        "camera_language_fit": visual_fit["camera_language"],
+        "aesthetic_quality": visual_fit["aesthetic"],
+        "cinematic_quality": visual_fit["cinematic"],
+        "visual_transition_match": visual_transition["total"],
+        "transition_scale_match": visual_transition["scale"],
+        "transition_world_match": visual_transition["world"],
+        "transition_texture_match": visual_transition["texture"],
+        "transition_composition_match": visual_transition["composition"],
         "seed_jitter": jitter,
     }
     score = (
@@ -1140,6 +1231,10 @@ def _candidate_score(
         + 0.06 * ratio_fit
         + 0.04 * resolution
         + 0.07 * max(0.0, min(1.0, _as_float(asset.get("score"), 0.5)))
+        + 0.16 * visual_fit["total"]
+        + 0.15 * visual_transition["total"]
+        + 0.08 * visual_fit["aesthetic"]
+        + 0.04 * visual_fit["cinematic"]
         + 0.055 * jitter
         - 0.10 * history
         - 0.16 * face_penalty
@@ -1175,6 +1270,8 @@ def _shot_from_choice(
         "pixabay_id": asset.get("pixabay_id", asset.get("id")),
         "page_url": asset.get("page_url", asset.get("pageURL")),
         "search_query": asset.get("search_query", asset.get("query")),
+        "search_queries": asset.get("search_queries", []),
+        "tags": asset.get("tags", ""),
         "source_start": round(window["source_start"], 4),
         "source_end": round(window["source_end"], 4),
         "source_segment_score": round(window["segment_score"], 4),
@@ -1200,10 +1297,22 @@ def _shot_from_choice(
         "subject_label": asset.get("subject_label"),
         "composition": asset.get("composition"),
         "color_tendency": asset.get("color_tendency"),
+        "mean_hsv": asset.get("mean_hsv", {}),
+        "motion_signals": asset.get("motion_signals", {}),
+        "quality": asset.get("quality", {}),
+        "visual_analysis": asset.get("visual_analysis", {}),
+        "visual_features": asset_visual_features(asset),
         "is_static_like": bool(asset.get("is_static_like")),
         "is_aerial": bool(asset.get("is_aerial")),
         "face_content_risk": round(_as_float(asset.get("face_risk"), 0.0), 4),
         "crop_plan": plan_subject_crop(asset, spec),
+        "transform": {
+            "crop": plan_subject_crop(asset, spec),
+            "scale": {"x": 1.0, "y": 1.0},
+            "position": {"x": 0.0, "y": 0.0},
+            "rotation_degrees": 0.0,
+            "opacity": 1.0,
+        },
         "transition_in": "hard_cut",
         "transition_out": _normalize_transition(slot.get("transition")),
         "audio_section_index": slot.get("section_index"),
@@ -1212,6 +1321,10 @@ def _shot_from_choice(
         "selection_score_components": components,
         "candidate_scores": candidate_log,
         "grammar_influence": grammar_influence,
+        "timeline_start": round(_as_float(slot["start"]), 4),
+        "timeline_end": round(_as_float(slot["end"]), 4),
+        "duration": round(_as_float(slot["duration"]), 4),
+        "source_path": asset["local_path"],
     }
 
 
@@ -1230,7 +1343,7 @@ def build_timeline(
 ) -> dict[str, Any]:
     """Assign real assets and safe source intervals to music-derived slots.
 
-    ``timeline_plan``/``slots`` are optional v1.2 inputs.  When absent, the
+    ``timeline_plan``/``slots`` are optional v1.2-compatible inputs.  When absent, the
     v1.1 signal-driven boundary planner remains available for compatibility.
     The same seed is reproducible; changing it changes near-tie ordering so a
     bounded QA rework attempt can produce a genuinely different edit.
@@ -1240,6 +1353,13 @@ def build_timeline(
         raise MontageError("Target duration must be positive.")
     style_profile = style_profile or {}
     editing_grammar = editing_grammar or {}
+    embedded_visual = style_profile.get("visual_style_profile")
+    visual_profile = (
+        dict(embedded_visual)
+        if isinstance(embedded_visual, dict) and str(embedded_visual.get("schema_version")) == "1.3"
+        else build_visual_style_profile(theme, style_profile, audio_profile, "")
+    )
+    style_profile = {**style_profile, "visual_style_profile": visual_profile}
     spec = parse_ratio(ratio)
     assets = _extract_assets(media_result)
     musical_times = extract_musical_times(audio_profile, duration)
@@ -1277,6 +1397,8 @@ def build_timeline(
     slot_records = _coerce_timeline_slots(timeline_plan, slots, duration)
     policy_input = dict(content_policy or {})
     policy = {**default_content_policy(duration), **policy_input}
+    policy["visual_style_profile_digest"] = visual_profile.get("profile_digest")
+    policy["visual_style_profile_schema"] = visual_profile.get("schema_version")
     if slot_records is None:
         scale_matrix = _mapping_at(editing_grammar, ("scale_transition_matrix", "shot_scale_transition_matrix"))
         motion_matrix = _mapping_at(editing_grammar, ("motion_transition_matrix", "camera_motion_transition_matrix"))
@@ -1439,6 +1561,7 @@ def build_timeline(
                 spec,
                 theme or str((timeline_plan or {}).get("theme", "")),
                 seed,
+                visual_profile,
             )
             score += 0.10 * window["window_score"]
             options.append({"asset": asset, "window": window, "score": score, "components": components})
@@ -1450,7 +1573,11 @@ def build_timeline(
         used_scenes = {str(shot.get("scene_category") or "general") for shot in timeline}
         if len(used_scenes) < int(policy["min_scene_categories"]):
             novel_scene = [
-                option for option in options if str(option["asset"].get("scene_category") or "general") not in used_scenes
+                option
+                for option in options
+                if str(option["asset"].get("scene_category") or "general") not in used_scenes
+                and option["components"].get("world_fit", 0.0) >= 0.50
+                and option["components"].get("visual_transition_match", 0.0) >= 0.40
             ]
             if novel_scene:
                 options = novel_scene
@@ -1511,7 +1638,8 @@ def build_timeline(
     severe_limit = int(policy.get("max_adjacent_similarity_dimensions", 3))
     # Greedy scoring already penalizes similarity.  This second pass replaces a
     # remaining obviously repetitive shot with an unused ranked alternative.
-    for _ in range(2):
+    repair_passes = 2
+    for _ in range(repair_passes):
         changed = False
         used_now = {shot["canonical_source_key"] for shot in timeline}
         for index in range(1, len(timeline)):
@@ -1565,6 +1693,61 @@ def build_timeline(
         if not changed:
             break
 
+    visual_repairs: list[dict[str, Any]] = []
+    used_now = {shot["canonical_source_key"] for shot in timeline}
+    for index in range(1, len(timeline)):
+        previous = timeline[index - 1]
+        current = timeline[index]
+        following = timeline[index + 1] if index + 1 < len(timeline) else None
+        current_left = transition_match(previous, current, visual_profile)["total"]
+        current_right = transition_match(current, following, visual_profile)["total"] if following else 0.55
+        current_pair_score = (current_left + current_right) / 2.0
+        if current_pair_score >= 0.48:
+            continue
+        best_replacement: dict[str, Any] | None = None
+        best_pair_score = current_pair_score
+        for option in current.get("_alternatives", []):
+            asset = option["asset"]
+            if asset["canonical_source_key"] in used_now:
+                continue
+            slot = slot_records[index]
+            replacement = _shot_from_choice(
+                slot,
+                asset,
+                option["window"],
+                option["score"],
+                option["components"],
+                spec,
+                current["desired_shot_role"],
+                current["desired_motion"],
+                current["desired_motion_label"],
+                current["candidate_scores"],
+                current["grammar_influence"],
+            )
+            replacement["transition_in"] = current.get("transition_in", "hard_cut")
+            replacement["transition_out"] = current.get("transition_out", "hard_cut")
+            left_score = transition_match(previous, replacement, visual_profile)["total"]
+            right_score = transition_match(replacement, following, visual_profile)["total"] if following else 0.55
+            pair_score = (left_score + right_score) / 2.0
+            if pair_score > best_pair_score + 0.045:
+                best_pair_score = pair_score
+                best_replacement = replacement
+        if best_replacement is not None:
+            old_key = current["canonical_source_key"]
+            timeline[index] = best_replacement
+            used_now.discard(old_key)
+            used_now.add(best_replacement["canonical_source_key"])
+            visual_repairs.append(
+                {
+                    "slot_index": index,
+                    "replaced_source": old_key,
+                    "replacement_source": best_replacement["canonical_source_key"],
+                    "pair_score_before": round(current_pair_score, 5),
+                    "pair_score_after": round(best_pair_score, 5),
+                    "reason": "visual continuity repair",
+                }
+            )
+
     for index, shot in enumerate(timeline):
         shot.pop("_alternatives", None)
         shot["index"] = index
@@ -1600,6 +1783,7 @@ def build_timeline(
     actual_max_share = max(screen_time.values(), default=0.0) / duration
     actual_face_share = prominent_face_time / duration
     after_repair = timeline_diversity_issues(timeline)
+    sequence_consistency = evaluate_sequence_consistency(timeline, visual_profile)
     final_failures: list[str] = []
     if len(used_assets) < int(policy["min_unique_assets"]):
         final_failures.append(f"used unique canonical sources {len(used_assets)} < {policy['min_unique_assets']}")
@@ -1615,6 +1799,11 @@ def build_timeline(
         final_failures.append("adjacent shots reuse the same canonical source")
     if any(len(item["issues"]) > severe_limit + 2 for item in after_repair):
         final_failures.append("adjacent visual diversity remained severely insufficient after repair")
+    if not sequence_consistency["passed"]:
+        final_failures.extend(
+            f"visual sequence consistency: {failure}"
+            for failure in sequence_consistency.get("failures", [])
+        )
     if final_failures:
         raise InsufficientMaterialError("Timeline sufficiency gate failed: " + "; ".join(final_failures))
 
@@ -1633,7 +1822,9 @@ def build_timeline(
         ).encode("utf-8")
     ).hexdigest()[:16]
     return {
-        "schema_version": "1.2",
+        "schema_version": "1.3",
+        "timeline_schema_version": 3,
+        "compatible_readers": ["1.2", "1.3"],
         "legacy_schema_version": 2,
         "artifact_type": "edit_decisions",
         "duration_seconds": round(duration, 4),
@@ -1644,6 +1835,8 @@ def build_timeline(
         "timeline_plan_digest": slot_digest,
         "timeline_plan_applied": timeline_plan is not None or slots is not None,
         "content_policy": policy,
+        "visual_style_profile": visual_profile,
+        "visual_sequence_consistency": sequence_consistency,
         "sufficiency": {
             **sufficiency,
             "used_unique_assets": len(used_assets),
@@ -1662,6 +1855,7 @@ def build_timeline(
         "diversity": {
             "issues_before_repair": before_repair,
             "repairs": repairs,
+            "visual_continuity_repairs": visual_repairs,
             "issues_after_repair": after_repair,
             "passed": not any("same_source" in item["issues"] for item in after_repair),
         },
@@ -1717,6 +1911,11 @@ def render_timeline(
     spec = parse_ratio(ratio)
     style_profile = style_profile or {}
     brightness, saturation, contrast = _eq_values(style_profile)
+    visual_profile = (
+        plan.get("visual_style_profile")
+        if isinstance(plan.get("visual_style_profile"), dict)
+        else style_profile.get("visual_style_profile", {})
+    )
     duration = _as_float(plan.get("duration_seconds"), 0.0)
     if duration <= 0:
         duration = max(_as_float(shot.get("output_end"), 0.0) for shot in shots)
@@ -1871,6 +2070,22 @@ def render_timeline(
                 f"fade=t=out:st={max(0.0, render_duration - final_fade):.5f}:d={final_fade:.5f}"
             )
         exact_frame_count = render_frame_counts[index - 1]
+        shot_brightness, shot_saturation, shot_contrast = brightness, saturation, contrast
+        grade_filters: list[str] = []
+        if isinstance(visual_profile, dict) and visual_profile:
+            grade = build_light_grade(shot, visual_profile, brightness, saturation, contrast)
+            shot["color_grade"] = grade
+            shot_brightness = _as_float(grade.get("brightness"), brightness)
+            shot_saturation = _as_float(grade.get("saturation"), saturation)
+            shot_contrast = _as_float(grade.get("contrast"), contrast)
+            balance = grade["colorbalance"]
+            if _as_float(grade.get("strength"), 0.0) > 0.01:
+                grade_filters.append(
+                    "colorbalance="
+                    f"rs={balance['rs']:.4f}:gs={balance['gs']:.4f}:bs={balance['bs']:.4f}:"
+                    f"rm={balance['rm']:.4f}:gm={balance['gm']:.4f}:bm={balance['bm']:.4f}:"
+                    f"rh={balance['rh']:.4f}:gh={balance['gh']:.4f}:bh={balance['bh']:.4f}:pl=1"
+                )
         suffix = ",".join(
             [
                     f"fps={fps}",
@@ -1878,7 +2093,8 @@ def render_timeline(
                     "settb=AVTB",
                     f"setpts=N/({fps}*TB)",
                     "setsar=1",
-                f"eq=brightness={brightness:.5f}:saturation={saturation:.5f}:contrast={contrast:.5f}",
+                f"eq=brightness={shot_brightness:.5f}:saturation={shot_saturation:.5f}:contrast={shot_contrast:.5f}",
+                *grade_filters,
                 *fade_filters,
                 "format=yuv420p",
             ]

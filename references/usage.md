@@ -1,4 +1,4 @@
-# bgm-montage v1.2 使用说明
+# bgm-montage v1.3 使用说明
 
 ## 1. 运行环境
 
@@ -14,6 +14,7 @@ Skill 的标准项目结构是：
   references/
   tests/
   requirements.lock.txt
+  requirements-jianying.lock.txt
   .env.example
 ```
 
@@ -45,10 +46,10 @@ $env:BGM_MONTAGE_PROJECT_ROOT = ".\造球计划"
 从发布 ZIP 安装到全局 Codex Skill 时，先解压到临时目录，再同步 ZIP 内部的标准路径；不要把 ZIP 直接解压到全局 `skills` 根目录，否则会形成错误的 `.agents/skills` 嵌套。以下流程保留已有 `.venv`，并先备份旧源码：
 
 ```powershell
-$Package = ".\skills\造球计划\bgm-montage-v1.2.zip"
+$Package = ".\skills\造球计划\bgm-montage-v1.3.zip"
 $GlobalSkill = Join-Path $env:USERPROFILE ".codex\skills\bgm-montage"
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$Stage = Join-Path ([IO.Path]::GetTempPath()) "bgm-montage-v1.2-$Stamp"
+$Stage = Join-Path ([IO.Path]::GetTempPath()) "bgm-montage-v1.3-$Stamp"
 $Backup = Join-Path $env:USERPROFILE ".codex\skills\.backups\bgm-montage-$Stamp"
 
 New-Item -ItemType Directory -Path $Stage, $Backup -Force | Out-Null
@@ -107,6 +108,7 @@ $env:BGM_MONTAGE_PROJECT_ROOT = $ProjectRoot
   --theme "serene mountain and coastal journey" `
   --duration 30 `
   --ratio 9:16 `
+  --visual-style "清透自然、晨雾、平缓推进、近景细节与宽景交替" `
   --output-dir (Join-Path $ProjectRoot "成片") `
   --reference-dir (Join-Path $ProjectRoot "参考视频") `
   --material-dir (Join-Path $ProjectRoot "视频素材") `
@@ -129,12 +131,18 @@ $env:BGM_MONTAGE_PROJECT_ROOT = $ProjectRoot
 - `--assets`：覆盖按时长/镜头槽位推导的最终入选素材数量。
 - `--candidate-pool-multiplier`：每个计划镜头槽位所需的元数据候选倍数，默认 `6`。
 - `--max-search-pages`：每轮扩展查询的 Pixabay 最大页数，默认 `3`。
+- `--search-query`：显式指定优先 Pixabay 查询，可重复传入多组地点或地貌词；启用后不再用泛化主题扩展替代这些查询，也不以宽松匹配的本地素材预填候选池。
+- `--wide-aerial-only`：只保留航拍、广角或 FPV/跟随视角候选，并排除抽象、AI/CGI、微距特写、人物、动物和旗帜类元数据命中。
+- `--visual-style`：本次任务的自由文本视觉方向；省略或传 `auto` 时由主题、参考画像和 BGM 自动形成。旧参数名 `--visual-cohesion-profile` 仍作为兼容别名，但不再接受固定枚举，也不会触发地点白名单。
+- `--exclude-pixabay-id ID`：联系表实际画面复核后，按 Pixabay ID 硬性排除偏题素材；可重复传入。
 - `--min-width` / `--min-height`：候选素材最小分辨率，默认 `1280` / `720`。
 - `--max-reuse-per-asset`（兼容别名 `--max-source-reuse`）：同一 canonical source 在本片中的最大使用次数，默认 `1`。
 - `--max-asset-screen-share`（兼容别名 `--max-source-share`）：单一来源累计画面占比，默认 `0.30`。
 - `--min-repeat-gap-shots` / `--min-repeat-gap-seconds`：允许有限复用时的最小镜头/时间间隔，默认 `3` 镜头和 `6` 秒。
 - `--max-rework-attempts`：第一次渲染 QA 失败后的最大自动重新选片/重渲染次数，默认 `2`。
 - `--allow-semantic-fallback`：CLIP 不可用时明确允许参考分析使用 structural fallback。未传时统一入口要求 CLIP 可用。
+- `--jianying-draft`：最终 MP4 通过 QA 后，额外从同一份 `edit_decisions.json` 生成剪映专业版可编辑草稿。
+- `--jianying-draft-name` / `--jianying-draft-root` / `--jianying-python`：分别覆盖草稿名、剪映项目根和含 pyJianYingDraft 的独立 Python。未指定 Python 时会检查项目 `.venv-pyjianyingdraft`、Skill `.venv-jianying` 和当前解释器。
 
 ### 不覆盖与断点续跑
 
@@ -146,16 +154,18 @@ $env:BGM_MONTAGE_PROJECT_ROOT = $ProjectRoot
 
 未给 `--run-id` 时会生成 UTC 时间戳和随机后缀。运行目录存在且未传 `--resume-run` 时直接失败；不会静默覆盖历史成片。`--resume-run` 会校验 BGM 指纹、主题、时长、比例、素材/缓存路径和主要约束，然后复用已成功写出的阶段产物。已经成功且成片仍存在的运行会直接返回既有报告。
 
-## 4. v1.2 产物契约
+## 4. v1.3 产物契约
 
 成功运行至少包含：
 
 - `<project-slug>_montage.mp4`：H.264/AAC、30 fps 的正式成片。
 - `audiomap.json`：全流程唯一可信的 BGM 结构分析。
 - `timeline.json`：正式下载前生成的镜头槽位计划。
-- `asset_manifest.json`：候选、搜索轮次、拒绝原因、来源、缓存/下载状态、质量信号、可用区间和实际使用区间。
-- `edit_decisions.json`：逐镜头素材、源区间、速度、音乐锚点、景别/运动目标、裁剪、转场、内容策略和选片理由。
-- `render_report.json`：最终成片的结构化媒体 QA。
+- `visual_style_profile.json`：本次任务的动态世界观、色彩、时间天气、摄影、运动与审美门槛。
+- `asset_manifest.json`：候选、搜索意图/轮次、拒绝原因、来源、缓存/下载状态、审美/语义/镜头元数据、哈希、可用区间和实际使用区间。
+- `edit_decisions.json`：schema `1.3` 的统一时间线真值；逐镜保留原始路径、源/目标区间、恒速、裁剪/基础变换、视觉匹配评分，并含 BGM 独立轨。原 v1.2 字段仍保留。
+- `render_report.json`：最终成片的结构化媒体、节奏和序列视觉一致性 QA。
+- `jianying_draft_report.json`（可选）：草稿路径、独立视频片段/BGM 轨验证、原素材引用和无法原生映射的差异。
 - `style_profile.json`：参考视频的视觉/节奏/语义风格画像。
 - `editing_grammar.json`：参考音频事件与参考切点的结构化关系。
 - `run_state.json`：断点续跑输入摘要与指纹。
@@ -164,7 +174,7 @@ $env:BGM_MONTAGE_PROJECT_ROOT = $ProjectRoot
 
 v1.1 兼容别名仍会生成：
 
-| v1.2 主产物 | v1.1 兼容别名 |
+| v1.3 主产物 | 兼容别名 |
 |---|---|
 | `audiomap.json` | `bgm_profile.json` |
 | `asset_manifest.json` | `sources.json` |
@@ -217,9 +227,11 @@ v1.1 兼容别名仍会生成：
 
 同一成片默认每个 canonical source 只使用一次。即使文件名、主题目录或 Pixabay ID 不同，只要最终指纹/复用来源相同，仍按同一来源计算次数、累计占比、重复间隔和源区间重叠。
 
-正式下载前先检查候选池：默认至少需要 `镜头槽位数 × 6` 个元数据候选，并验证重点槽位候选覆盖。搜索会依次使用主题、参考风格、BGM 段落意图、同义词、主体/场景/情绪/动作/环境和更宽但仍相关的视觉概念，同时增加查询页数并重新检索本地缓存。仍不足时抛出明确的素材不足错误并保留查询、淘汰和缺口记录，不进入重复渲染。
+正式下载前先检查候选池：默认至少需要 `镜头槽位数 × 6` 个元数据候选，并验证重点槽位候选覆盖。v1.3 先从本次画像提取主题、情绪、环境/地貌、用户明确地点、天气、光线、摄影方式与镜头运动，再按 precision、adjacent 和 quality-recall 多轮组合查询。地点完全来自用户/参考资料，不存在内置目的地白名单；泛词只在末轮补召回。仍不足时保留查询意图、淘汰和缺口记录并失败。
 
-最终入选还检查独立来源、场景/主体/景别/运动多样性、连续可用时长、分辨率、清晰度、曝光、稳定性、文字/水印风险、比例、色调、人脸风险和片内占比。环境、建筑、自然、交通、无人场景、背影和俯拍默认优先；清晰正脸、人物特写、自拍、采访、摆拍和人物占画面较大的素材明显降权并受成片人脸占比约束。
+最终入选还检查独立来源、近似内容、连续可用时长、分辨率、清晰度、曝光、稳定性、文字/水印风险、纵深、构图、视觉冲击、光线氛围、色彩、摄影机运动价值、电影感和普通旅游记录风险。主题相关只代表候选资格；审美分低于动态门槛时自动尝试后续素材，不通过平淡镜头补满。人像主题会动态放宽人物风险，非人像主题仍限制显著正脸占比。
+
+完整分析结果写入统一素材索引，包含语义/场景、世界/地貌族、景别、运动类型与方向、HSV 色彩、时间/天气、审美分、哈希和 Pixabay 来源。缓存由分析 schema、引擎版本和文件 SHA-256 共同校验；v1.2 旧字段保留，但第一次被 v1.3 选中时会升级分析。
 
 下载后会分析素材内部区间，优先动作已开始且仍在进行、稳定、清晰、非黑帧/片头片尾、视觉变化足够的连续窗口；不会默认从源视频 0 秒开始，也不会用最后一帧冻结补时长。
 
@@ -248,7 +260,9 @@ CLIP 是采样帧零样本语义增强，用于估计主体、场景、外观动
 - 主体感知裁剪、完整画面 fit 或模糊背景填充；
 - 统一亮度/饱和度/对比度和 BGM 淡入淡出。
 
-未实现：复杂 wipe/遮罩、match cut、速度坡度、光流补帧、字幕内容/样式复刻、OCR、动态字幕/图形、人物身份识别、可靠时序动作识别、逐帧主体跟踪，以及参考视频复杂特效的自动检测与复刻。文档中的 `fade_like` / `dissolve_like` 仅是保守的参考风格提示，不代表可复刻任意特效。
+镜头顺序会在音乐槽位不变的前提下，对推进/拉远/俯冲/横移方向、景别、颜色亮度、世界族、纹理和构图连续性评分并做有限替换。它实现的是“镜头关系驱动的匹配剪辑”，不是额外堆叠特效。
+
+未实现：复杂 wipe/遮罩、语义级轮廓变形 match cut、速度坡度、光流补帧、字幕内容/样式复刻、OCR、动态字幕/图形、人物身份识别、可靠时序动作识别、逐帧主体跟踪，以及参考视频复杂特效的自动检测与复刻。
 
 ## 9. 自动 QA 与返工
 
@@ -265,6 +279,7 @@ CLIP 是采样帧零样本语义增强，用于估计主体、场景、外观动
 - 相邻镜头多样性、明显人脸占比、主体裁剪安全；
 - `beat_cut` / `phrase_flow` 对应的音乐事件对齐；
 - climax/drop 相对舒缓段的镜头密度和视觉运动响应。
+- 全片世界观、色彩、时间天气、镜头语言和相邻视觉匹配分；严重断裂或平均一致性不足会使该选片尝试失败。
 
 检查帧覆盖开头、结尾、段落边界、drop、surge、climax、hard stop 和稳定种子的随机时间点；渲染先把全部镜头量化到统一帧网格，避免逐段帧率取整累积后截短尾镜。确定性 QA 失败时，统一入口使用新的尝试种子重新分配素材、规划源区间并重渲染，默认最多返工 2 次。全部尝试失败时 `run_report.json` 保留诊断，运行返回失败，不把该成片宣称为成功，也不提交 Pixabay 使用历史。
 
@@ -364,6 +379,29 @@ QA 能发现确定性的媒体/时间线问题，但不能替代人工审美复�
   --frames-dir ".\renders\project\run-id\validation_frames"
 ```
 
+### 10.7 剪映草稿适配
+
+剪映依赖保持在独立环境，避免污染核心视频/机器学习依赖：
+
+```powershell
+$JianYingVenv = Join-Path $ProjectRoot ".venv-pyjianyingdraft"
+py -3.11 -m venv $JianYingVenv
+& (Join-Path $JianYingVenv "Scripts\python.exe") -m pip install `
+  -r (Join-Path $SkillRoot "requirements-jianying.lock.txt")
+```
+
+单独从已有时间线创建草稿：
+
+```powershell
+& (Join-Path $JianYingVenv "Scripts\python.exe") `
+  (Join-Path $SkillRoot "scripts\jianying_export.py") `
+  ".\renders\project\run-id\edit_decisions.json" `
+  --draft-name "project_run-id_可编辑" `
+  --report ".\renders\project\run-id\jianying_draft_report.json"
+```
+
+适配器默认查找 `%LOCALAPPDATA%\JianyingPro\User Data\Projects\com.lveditor.draft` 并要求其中存在 `root_meta_info.json`。写入前备份根索引；已存在同名草稿时拒绝覆盖。每个视频镜头和 BGM 都是独立原始素材引用，不复制素材。切点、source range、target range、恒速、基础 scale/position/rotation/opacity 可原生映射；非完整裁剪矩形、FFmpeg 调色和无原生等价项写入 `unmapped_or_approximate`，不得静默伪装成功。
+
 ## 11. 测试与打包
 
 运行自动化测试：
@@ -372,12 +410,12 @@ QA 能发现确定性的媒体/时间线问题，但不能替代人工审美复�
 & $Python -m pytest -q (Join-Path $SkillRoot "tests")
 ```
 
-构建 v1.2 ZIP：
+构建 v1.3 ZIP：
 
 ```powershell
 & $Python (Join-Path $SkillRoot "scripts\package_skill.py") `
-  --version 1.2 `
-  --output ".\skills\造球计划\bgm-montage-v1.2.zip"
+  --version 1.3 `
+  --output ".\skills\造球计划\bgm-montage-v1.3.zip"
 ```
 
 ZIP 成员使用标准 `/` 分隔符，并以 `.agents/skills/bgm-montage/` 为根前缀。真实 `.env`、API Key、`.venv`、模型、缓存、下载素材、测试输出和成片不进入发布包。目标 ZIP 已存在时默认拒绝覆盖；只有明确传入 `--force` 才替换。
@@ -385,16 +423,16 @@ ZIP 成员使用标准 `/` 分隔符，并以 `.agents/skills/bgm-montage/` 为�
 Windows 解压：
 
 ```powershell
-Expand-Archive -LiteralPath ".\downloads\bgm-montage-v1.2.zip" `
+Expand-Archive -LiteralPath ".\downloads\bgm-montage-v1.3.zip" `
   -DestinationPath ".\my-montage-project"
 ```
 
-Linux/Docker 可使用 `unzip bgm-montage-v1.2.zip -d /workspace/project` 或 `python -m zipfile -e ...`。这只表示 ZIP 路径兼容；本版本不宣称已完成 Linux/Docker 的依赖、模型和 FFmpeg 现场运行验证。
+Linux/Docker 可使用 `unzip bgm-montage-v1.3.zip -d /workspace/project` 或 `python -m zipfile -e ...`。这只表示 ZIP 路径兼容；本版本不宣称已完成 Linux/Docker 的依赖、模型、FFmpeg 或剪映现场运行验证。
 
 ## 12. 能力状态
 
-已实现：确定性 `audiomap`、`beat_cut`/`phrase_flow`、下载前时间线、参考视觉与音频语法缓存、Pixabay 查询扩展、跨项目素材复用、候选/素材充足度门槛、片内来源约束、低人脸策略、素材内部最佳区间、相邻多样性、主体感知裁剪/填充、硬切/淡入淡出/短叠化、FFmpeg 渲染、完整解码 QA、音乐对齐/高潮响应检查、自动重新选片渲染、断点续跑和 v1.1 兼容别名。
+已实现：v1.2 的确定性 `audiomap`、`beat_cut`/`phrase_flow`、下载前时间线、参考视觉/音频语法、跨项目素材复用、来源约束、内部最佳区间、裁剪、FFmpeg 渲染和完整 QA；以及 v1.3 的动态多轴检索、审美评分/缓存、世界观与色彩画像、序列一致性、镜头视觉匹配、schema 迁移、BGM 独立轨和可选剪映可编辑草稿。
 
 实验性增强：采样帧 CLIP 零样本主体/场景/外观动作/情绪分类；采样显著区域与正脸几何裁剪；参考视频淡化/叠化提示。这些能力会在报告中保留模型和降级状态，不能当作逐帧真值。
 
-尚未实现：复杂特效复刻、复杂遮罩/wipe、match cut、速度坡度、OCR、字幕样式复制、动态字幕/图形、人物身份识别、可靠时序动作识别和逐帧主体跟踪。
+尚未实现：复杂特效复刻、复杂遮罩/wipe、语义级轮廓变形 match cut、速度坡度、OCR、字幕样式复制、动态字幕/图形、人物身份识别、可靠时序动作识别、逐帧主体跟踪，以及 FFmpeg 调色到剪映的无损原生映射。

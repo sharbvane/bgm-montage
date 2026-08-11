@@ -1,7 +1,7 @@
 interface:
   display_name: "BGM Montage"
   short_description: "Plan, source, render, and QA BGM-led Pixabay montages"
-  default_prompt: "Use $bgm-montage v1.2 to learn the read-only reference style, build an audiomap and music-event timeline, reuse or search Pixabay footage, enforce diversity and low-face policies, render without overwriting prior runs, and deliver only after automatic QA passes. If CLIP is unavailable, use structural fallback only when I explicitly allow it."
+  default_prompt: "Use $bgm-montage v1.3 to derive a task-specific visual profile from my request, read-only references, and BGM; intelligently reuse or search Pixabay footage; prioritize aesthetic quality, whole-film cohesion, visual match cuts, and low repetition; render without overwriting prior runs; optionally create an editable JianYing draft; and deliver only after automatic QA passes. If CLIP is unavailable, use structural fallback only when I explicitly allow it."
 
 policy:
   allow_implicit_invocation: true

@@ -27,11 +27,12 @@ def _make_fixture_skill(base: Path) -> Path:
     _write(root / ".env.example", "PIXABAY_API_KEY=your_pixabay_api_key_here\n")
     _write(
         root / "SKILL.md",
-        "---\nname: bgm-montage\ndescription: Test fixture.\n---\n\n# BGM Montage v1.2\n",
+        "---\nname: bgm-montage\ndescription: Test fixture.\n---\n\n# BGM Montage v1.3\n",
     )
     _write(root / "requirements.txt", "requests>=2,<3\n")
     _write(root / "requirements.lock.txt", "requests==2.34.2\n")
-    _write(root / "CHANGELOG.md", "# Changelog\n\n## v1.2\n")
+    _write(root / "requirements-jianying.lock.txt", "# optional JianYing adapter lock\n")
+    _write(root / "CHANGELOG.md", "# Changelog\n\n## v1.3\n")
     _write(root / "TEST_REPORT.md", "# Test Report\n")
     _write(root / "agents" / "openai.yaml", 'interface:\n  display_name: "BGM Montage"\n')
     _write(root / "references" / "usage.md", "# Usage\n")
@@ -56,7 +57,7 @@ def test_windows_unicode_paths_and_portable_allowlisted_zip(tmp_path: Path) -> N
     _write(root / "references" / "debug.log")
     (root / "tests" / "render.mp4").write_bytes(b"not media")
 
-    destination = tmp_path / "发布 包" / "bgm-montage-v1.2.zip"
+    destination = tmp_path / "发布 包" / "bgm-montage-v1.3.zip"
     report = package_skill.build_package(root, destination)
     assert Path(report["output"]) == destination.resolve()
     assert report["path_separator"] == "/"
@@ -70,6 +71,7 @@ def test_windows_unicode_paths_and_portable_allowlisted_zip(tmp_path: Path) -> N
         assert all(name.startswith(".agents/skills/bgm-montage/") for name in names)
         assert ".agents/skills/bgm-montage/.env.example" in names
         assert ".agents/skills/bgm-montage/requirements.lock.txt" in names
+        assert ".agents/skills/bgm-montage/requirements-jianying.lock.txt" in names
         assert ".agents/skills/bgm-montage/scripts/timeline_planner.py" in names
         assert ".agents/skills/bgm-montage/tests/test_smoke.py" in names
         assert not any(name.endswith("/.env") or "/.venv/" in name for name in names)
@@ -101,7 +103,7 @@ def test_package_requires_dependency_lock(tmp_path: Path) -> None:
         package_skill.build_package(root, tmp_path / "missing-lock.zip")
 
 
-def test_package_requires_v12_timeline_planner(tmp_path: Path) -> None:
+def test_package_requires_preserved_timeline_planner(tmp_path: Path) -> None:
     root = _make_fixture_skill(tmp_path / "项目")
     (root / "scripts" / "timeline_planner.py").unlink()
     with pytest.raises(package_skill.PackagingError, match="timeline_planner.py"):

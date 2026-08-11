@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import shutil
+import subprocess
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -22,6 +23,7 @@ from dotenv import load_dotenv
 from analyze_bgm import analyze_bgm
 from analyze_references import analyze_references
 from analyze_editing_grammar import analyze_editing_grammar
+from edit_schema import normalize_edit_decisions, write_edit_decisions
 from montage import InsufficientMaterialError as TimelineInsufficientMaterialError
 from montage import MontageError, build_timeline, parse_ratio, render_timeline, write_plan
 from pixabay_pipeline import InsufficientMaterialError as PixabayInsufficientMaterialError
@@ -29,6 +31,7 @@ from pixabay_pipeline import material_theme_directory, run_pixabay_pipeline, upd
 from runtime_paths import RuntimePaths, discover_project_root
 from timeline_planner import plan_timeline_slots
 from validate_output import validate_output
+from visual_intelligence import build_visual_style_profile
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -185,10 +188,17 @@ def _invocation_payload(
         "min_resolution": [int(args.min_width), int(args.min_height)],
         "candidate_pool_multiplier": int(_arg(args, "candidate_pool_multiplier", 6)),
         "max_search_pages": int(_arg(args, "max_search_pages", 3)),
+        "priority_queries": list(_arg(args, "priority_queries", []) or []),
+        "wide_aerial_only": bool(_arg(args, "wide_aerial_only", False)),
+        "visual_style": str(_arg(args, "visual_style", "auto")),
+        "excluded_pixabay_ids": list(_arg(args, "excluded_pixabay_ids", []) or []),
         "max_reuse_per_asset": int(_arg(args, "max_reuse_per_asset", 1)),
         "max_asset_screen_share": float(_arg(args, "max_asset_screen_share", 0.30)),
         "min_repeat_gap_shots": int(_arg(args, "min_repeat_gap_shots", 3)),
         "min_repeat_gap_seconds": float(_arg(args, "min_repeat_gap_seconds", 6.0)),
+        "jianying_draft": bool(_arg(args, "jianying_draft", False)),
+        "jianying_draft_name": _arg(args, "jianying_draft_name", None),
+        "jianying_draft_root": str(_arg(args, "jianying_draft_root", "") or ""),
     }
 
 
@@ -228,8 +238,79 @@ def _copy_or_create_sources(media_result: dict[str, Any], destination: Path) -> 
     )
 
 
+def _find_jianying_python(explicit: str | None = None) -> Path:
+    candidates = [
+        Path(explicit).expanduser() if explicit else None,
+        PROJECT_ROOT / ".venv-pyjianyingdraft" / "Scripts" / "python.exe",
+        SKILL_DIR / ".venv-jianying" / "Scripts" / "python.exe",
+        Path(sys.executable),
+    ]
+    checked: list[str] = []
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        resolved = candidate.resolve()
+        if not resolved.is_file() or str(resolved) in checked:
+            continue
+        checked.append(str(resolved))
+        probe = subprocess.run(
+            [str(resolved), "-c", "import pyJianYingDraft"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+        if probe.returncode == 0:
+            return resolved
+    raise RuntimeError(
+        "Editable JianYing draft was requested, but no compatible Python with pyJianYingDraft was found. "
+        "Pass --jianying-python; the tested dependency is documented in requirements-jianying.lock.txt."
+    )
+
+
+def _export_jianying_draft(
+    args: argparse.Namespace,
+    edit_decisions_path: Path,
+    run_dir: Path,
+    slug: str,
+    run_id: str,
+) -> dict[str, Any]:
+    python = _find_jianying_python(_arg(args, "jianying_python", None))
+    draft_name = str(_arg(args, "jianying_draft_name", None) or f"{slug}_{run_id}_可编辑")
+    report_path = run_dir / "jianying_draft_report.json"
+    command = [
+        str(python),
+        str(SCRIPT_DIR / "jianying_export.py"),
+        str(edit_decisions_path),
+        "--draft-name",
+        draft_name,
+        "--report",
+        str(report_path),
+    ]
+    if _arg(args, "jianying_draft_root", None):
+        command.extend(["--draft-root", str(_arg(args, "jianying_draft_root", None))])
+    process = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=180,
+        check=False,
+    )
+    if process.returncode != 0 or not report_path.is_file():
+        reason = process.stderr.strip() or process.stdout.strip() or f"exit code {process.returncode}"
+        raise RuntimeError(f"JianYing draft export failed: {_strip_secret(reason)[-1800:]}")
+    report = _read_json(report_path)
+    if not report.get("passed"):
+        raise RuntimeError(f"JianYing draft structural validation failed: {report_path}")
+    return report
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    """Run the v1.2 pipeline, checkpointing every reusable stage."""
+    """Run the v1.3 pipeline, checkpointing every reusable stage."""
 
     load_dotenv(PROJECT_ROOT / ".env", override=False)
     if not os.getenv("PIXABAY_API_KEY"):
@@ -303,7 +384,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _write_json(
         state_path,
         {
-            "schema_version": "1.2",
+            "schema_version": "1.3",
             "run_id": run_id,
             "invocation_digest": invocation_digest,
             "invocation": invocation,
@@ -313,8 +394,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     run_report_path = run_dir / "run_report.json"
     report: dict[str, Any] = {
-        "schema_version": "1.2",
-        "skill_version": "1.2",
+        "schema_version": "1.3",
+        "skill_version": "1.3",
         "run_id": run_id,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "resumed": resume,
@@ -420,6 +501,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         checkpoint()
 
+        visual_style_path = run_dir / "visual_style_profile.json"
+        visual_request = str(_arg(args, "visual_style", "auto") or "auto").strip()
+        visual_style_profile = build_visual_style_profile(
+            args.theme,
+            style_profile,
+            audio_profile,
+            "" if visual_request.lower() in {"", "auto", "none"} else visual_request,
+        )
+        style_profile = {**style_profile, "visual_style_profile": visual_style_profile}
+        _write_json(visual_style_path, visual_style_profile)
+        report["stages"]["visual_style"] = {
+            "status": "ok",
+            "profile_digest": visual_style_profile.get("profile_digest"),
+            "profile_confidence": visual_style_profile.get("sequence", {}).get("profile_confidence"),
+            "world_families": visual_style_profile.get("world_model", {}).get("preferred_families", []),
+            "color_profile": visual_style_profile.get("color_profile", {}),
+        }
+        report["artifacts"]["visual_style_profile"] = str(visual_style_path)
+        checkpoint()
+
         timeline_path = run_dir / "timeline.json"
         print("[4/7] Planning music-event shot slots before material acquisition", flush=True)
         if resume and timeline_path.is_file():
@@ -480,6 +581,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 timeline_plan=timeline_plan,
                 candidate_pool_multiplier=int(_arg(args, "candidate_pool_multiplier", 6)),
                 max_search_pages=int(_arg(args, "max_search_pages", 3)),
+                priority_queries=list(_arg(args, "priority_queries", []) or []),
+                wide_aerial_only=bool(_arg(args, "wide_aerial_only", False)),
+                visual_cohesion_profile=visual_request,
+                excluded_pixabay_ids=list(_arg(args, "excluded_pixabay_ids", []) or []),
             )
             material_sources_path = _material_sources_path(media_result)
             _copy_or_create_sources(media_result, asset_manifest_path)
@@ -508,6 +613,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "max_asset_screen_share": float(_arg(args, "max_asset_screen_share", 0.30)),
             "min_repeat_gap_shots": int(_arg(args, "min_repeat_gap_shots", 3)),
             "min_repeat_gap_seconds": float(_arg(args, "min_repeat_gap_seconds", 6.0)),
+            "visual_style_profile_digest": visual_style_profile.get("profile_digest"),
         }
         max_rework_attempts = max(0, int(_arg(args, "max_rework_attempts", 2)))
         final_output = run_dir / f"{slug}_montage.mp4"
@@ -545,7 +651,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 plan["run_id"] = run_id
                 plan["attempt"] = attempt_number
-                write_plan(plan, attempt_plan_path)
+                output_spec = parse_ratio(args.ratio)
+                plan = normalize_edit_decisions(
+                    plan,
+                    bgm_path=bgm_path,
+                    ratio=args.ratio,
+                    width=output_spec.width,
+                    height=output_spec.height,
+                    fps=30.0,
+                )
+                write_edit_decisions(attempt_plan_path, plan)
                 if not (resume and attempt_video.is_file()):
                     render_timeline(plan, bgm_path, attempt_video, args.ratio, style_profile)
                 validation = validate_output(
@@ -599,7 +714,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 f"Attempt diagnostics: {failures}"
             )
 
-        write_plan(successful_plan, edit_decisions_path)
+        write_edit_decisions(
+            edit_decisions_path,
+            successful_plan,
+            bgm_path=bgm_path,
+            ratio=args.ratio,
+            width=parse_ratio(args.ratio).width,
+            height=parse_ratio(args.ratio).height,
+            fps=30.0,
+        )
+        successful_plan = _read_json(edit_decisions_path)
         _json_copy(edit_decisions_path, edit_plan_path)
         successful_validation["rework"] = {
             "attempts": attempts,
@@ -629,6 +753,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "status": "ok",
             "checks": successful_validation.get("checks", {}),
         }
+        report["stages"]["visual_consistency"] = {
+            "status": "ok" if successful_plan.get("visual_sequence_consistency", {}).get("passed") else "not_evaluated",
+            **successful_plan.get("visual_sequence_consistency", {}),
+        }
         report["artifacts"].update(
             {
                 "edit_decisions": str(edit_decisions_path),
@@ -638,10 +766,33 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "video": str(final_output),
             }
         )
+        if bool(_arg(args, "jianying_draft", False)):
+            print("[7/8] Building and structurally validating editable JianYing draft", flush=True)
+            jianying_report = _export_jianying_draft(
+                args,
+                edit_decisions_path,
+                run_dir,
+                slug,
+                run_id,
+            )
+            report["stages"]["jianying_draft"] = {
+                "status": "ok",
+                "draft_path": jianying_report.get("draft_path"),
+                "validation": jianying_report.get("validation", {}),
+                "unmapped_or_approximate_count": len(jianying_report.get("unmapped_or_approximate", [])),
+            }
+            report["artifacts"].update(
+                {
+                    "jianying_draft": jianying_report.get("draft_path"),
+                    "jianying_draft_report": jianying_report.get("report_path", str(run_dir / "jianying_draft_report.json")),
+                }
+            )
+        else:
+            report["stages"]["jianying_draft"] = {"status": "not_requested"}
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
         report["passed"] = True
         checkpoint()
-        print("[7/7] Final full-decode QA passed; usage history committed", flush=True)
+        print("[8/8] Final full-decode QA passed; usage history committed", flush=True)
         return report
     except Exception as exc:
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
@@ -689,6 +840,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum Pixabay pages per expanded query round (default: 3).",
     )
     parser.add_argument(
+        "--search-query",
+        dest="priority_queries",
+        action="append",
+        default=[],
+        help="Exact priority Pixabay query; repeat for multiple location-led searches.",
+    )
+    parser.add_argument(
+        "--wide-aerial-only",
+        action="store_true",
+        help="Exclude abstract/close-up metadata hits and strongly prefer aerial, FPV, and wide footage.",
+    )
+    parser.add_argument(
+        "--visual-style",
+        "--visual-cohesion-profile",
+        dest="visual_style",
+        default="auto",
+        help="Free-form visual direction; auto derives it from theme, references, and BGM.",
+    )
+    parser.add_argument(
+        "--exclude-pixabay-id",
+        dest="excluded_pixabay_ids",
+        action="append",
+        default=[],
+        help="Exclude a visually rejected Pixabay asset ID; repeat after contact-sheet review.",
+    )
+    parser.add_argument(
         "--max-reuse-per-asset",
         "--max-source-reuse",
         dest="max_reuse_per_asset",
@@ -717,6 +894,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow explicit structural-only reference analysis if the pretrained CLIP model is unavailable.",
     )
+    parser.add_argument(
+        "--jianying-draft",
+        action="store_true",
+        help="Also create an editable JianYing Pro draft from edit_decisions after final QA.",
+    )
+    parser.add_argument("--jianying-draft-name", help="Optional unique JianYing project name.")
+    parser.add_argument("--jianying-draft-root", help="Explicit JianYing project root containing root_meta_info.json.")
+    parser.add_argument("--jianying-python", help="Python executable containing the optional pyJianYingDraft dependency.")
     return parser
 
 

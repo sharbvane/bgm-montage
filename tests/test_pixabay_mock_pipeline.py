@@ -217,6 +217,11 @@ def _install_mock_video_backend(
             "face_content_risk": 0.05,
             "subject_profile": subject,
             "scene_category": scene_by_id.get(asset_id, "general"),
+            "analysis_cache": {
+                "schema_version": 2,
+                "engine_version": "1.3.0",
+                "file_sha256": fingerprint["sha256"],
+            },
         }
         media = {
             "duration_seconds": 8.0,
@@ -275,17 +280,15 @@ def test_mock_pipeline_expands_filters_downloads_selected_only_and_reuses_cache(
     assert all(item["queries"] for item in first["search_rounds"])
     assert first["search_rounds"][-1]["stop_reason"] == "maximum bounded expansion reached"
     assert network_calls["api"]
-    assert len(network_calls["thumbnail"]) == 5
+    assert len(network_calls["thumbnail"]) == 4
 
-    # Five usable candidates survived metadata filtering, but only the four
-    # low-face environment candidates were selected and downloaded.
-    assert first["candidate_count"] == 5
+    # The dynamic world/profile filter rejects the unrelated face candidate
+    # before thumbnail ranking; only the four environment clips proceed.
+    assert first["candidate_count"] == 4
     assert len(downloads) == 4
     assert set(downloads) == {101, 102, 103, 104}
     assert 105 not in downloads
-    face_log = next(item for item in manifest["candidate_log"] if item["pixabay_id"] == 105)
-    assert face_log["decision"] == "ranked"
-    assert face_log["face_content_risk"] >= 0.65
+    assert not any(item["pixabay_id"] == 105 for item in manifest["candidate_log"])
 
     assert first["selected_count"] == 4
     assert first["sufficiency"]["passed"] is True
@@ -298,7 +301,7 @@ def test_mock_pipeline_expands_filters_downloads_selected_only_and_reuses_cache(
     assert first["sufficiency"]["theoretical_screen_coverage_seconds"] >= 12.0 * 0.95
     assert manifest["status"] == "ok"
     assert manifest["manifest_type"] == "asset_manifest"
-    assert manifest["asset_manifest_schema_version"] == 1
+    assert manifest["asset_manifest_schema_version"] == 2
     assert manifest["assets"] == manifest["sources"]
     assert manifest["sufficiency"]["passed"] is True
 

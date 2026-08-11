@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -43,8 +44,9 @@ def _candidate() -> dict[str, object]:
 
 
 def _library_entry(origin: Path) -> dict[str, object]:
+    file_hash = hashlib.sha256(origin.read_bytes()).hexdigest()
     fingerprint = {
-        "sha256": "fixture-sha256",
+        "sha256": file_hash,
         "perceptual_hashes": [],
         "duration_seconds": 8.0,
         "width": 1920,
@@ -58,7 +60,17 @@ def _library_entry(origin: Path) -> dict[str, object]:
         "local_path": str(origin),
         "added_at": "2026-01-01T00:00:00+00:00",
         "fingerprint": fingerprint,
-        "quality": {"passed": True, "motion_score": 0.4, "overall_score": 0.9},
+        "file_hash": file_hash,
+        "quality": {
+            "passed": True,
+            "motion_score": 0.4,
+            "overall_score": 0.9,
+            "analysis_cache": {
+                "schema_version": 2,
+                "engine_version": "1.3.0",
+                "file_sha256": file_hash,
+            },
+        },
         "media": {
             "duration_seconds": 8.0,
             "width": 1920,

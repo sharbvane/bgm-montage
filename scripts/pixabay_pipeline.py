@@ -40,6 +40,17 @@ from dotenv import load_dotenv
 from PIL import Image
 
 from runtime_paths import RuntimePaths, migrate_legacy_nested_pixabay_cache
+from visual_intelligence import (
+    ASSET_ANALYSIS_SCHEMA_VERSION,
+    ENGINE_VERSION as VISUAL_ENGINE_VERSION,
+    aggregate_video_aesthetics,
+    analysis_cache_valid,
+    asset_visual_features,
+    build_visual_style_profile,
+    frame_aesthetic_metrics,
+    metadata_profile_fit,
+    plan_visual_search_queries,
+)
 from visual_semantics import (
     aggregate_subject_regions,
     face_content_risk,
@@ -51,11 +62,11 @@ from visual_semantics import (
 
 PIXABAY_VIDEO_API = "https://pixabay.com/api/videos/"
 CACHE_TTL_SECONDS = 24 * 60 * 60
-SCHEMA_VERSION = 3
-ASSET_MANIFEST_SCHEMA_VERSION = 1
+SCHEMA_VERSION = 4
+ASSET_MANIFEST_SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = (10, 45)
 DOWNLOAD_TIMEOUT = (15, 180)
-USER_AGENT = "bgm-montage/1.2 (Pixabay video workflow)"
+USER_AGENT = "bgm-montage/1.3 (Pixabay video workflow)"
 
 _FACE_DETECTOR: Any | None = None
 
@@ -881,69 +892,27 @@ def generate_visual_queries(
     audio_profile: Mapping[str, Any] | None,
     expansion_level: int = 0,
 ) -> list[str]:
-    """Generate deterministic English Pixabay terms, each at most 100 chars."""
+    """Generate task-specific, multi-axis queries without location allowlists."""
 
-    style_profile = _style_payload(style_profile)
-    theme_words = _theme_terms(theme)
-    positive = _collect_profile_words(style_profile, ("positive_terms",))[:10]
-    topics = _unique_terms(
-        [
-            *_collect_profile_words(style_profile, ("topic", "subject", "content", "object", "tag")),
-            *positive,
-        ]
-    )[:8]
-    moods = _collect_profile_words(style_profile, ("mood", "emotion", "atmosphere", "tone"))[:5]
-    palette = _collect_profile_words(style_profile, ("color", "colour", "palette", "grade", "lighting"))[:4]
-    motion = _collect_profile_words(
-        style_profile,
-        ("motion", "movement", "camera", "editing", "pace", "camera_terms", "rhythm_terms"),
-    )[:4]
-    scale = _collect_profile_words(style_profile, ("shot_scale_terms", "shot_scale"))[:3]
-    audio = _audio_descriptors(audio_profile)
-    base = _unique_terms([*theme_words[:5], *topics[:3]])
-    anchor = theme_words[0]
-    scene_terms = _scene_concepts(theme_words + topics)
-    queries: list[str] = []
+    visual_profile = _resolve_visual_profile(theme, style_profile, audio_profile)
+    return [
+        str(record["query"])
+        for record in plan_visual_search_queries(visual_profile, expansion_level)
+        if record.get("query")
+    ][:6]
 
-    if expansion_level == 0:
-        queries.extend(
-            (
-                _clean_query([*base[:6], *moods[:2], "cinematic"]),
-                _clean_query([anchor, scene_terms[0], *palette[:2]]),
-                _clean_query([anchor, scene_terms[1], *motion[:2], *scale[:1]]),
-                _clean_query([anchor, *audio[:2], scene_terms[2]]),
-            )
-        )
-    elif expansion_level == 1:
-        synonyms: list[str] = []
-        for term in theme_words[:4]:
-            synonyms.extend(_WORD_SYNONYMS.get(term, ()))
-        synonyms = _unique_terms(synonyms) or ["visual", "cinematic", "authentic"]
-        queries.extend(
-            (
-                _clean_query([*synonyms[:3], scene_terms[0]]),
-                _clean_query([*theme_words[:2], scene_terms[2], "wide shot"]),
-                _clean_query([*theme_words[:2], scene_terms[3], "close up"]),
-                _clean_query([*synonyms[1:4], *moods[:2]]),
-            )
-        )
-    else:
-        # The final expansion deliberately broadens visual concepts while keeping
-        # the theme anchor so sparse subjects still return usable alternatives.
-        queries.extend(
-            (
-                _clean_query([anchor, "aerial wide view"]),
-                _clean_query([anchor, "close detail texture"]),
-                _clean_query(
-                    [anchor, "people authentic lifestyle"]
-                    if _human_focused_theme(theme_words)
-                    else [anchor, "empty environment architecture landscape"]
-                ),
-                _clean_query([anchor, "environment atmosphere motion"]),
-                _clean_query(theme_words[:2]),
-            )
-        )
-    return _unique_terms(query for query in queries if query)[:6]
+
+def _resolve_visual_profile(
+    theme: str,
+    style_profile: Mapping[str, Any] | None,
+    audio_profile: Mapping[str, Any] | None,
+    visual_request: str = "",
+) -> dict[str, Any]:
+    style = _style_payload(style_profile)
+    embedded = style.get("visual_style_profile")
+    if isinstance(embedded, Mapping) and str(embedded.get("schema_version") or "") == "1.3":
+        return dict(embedded)
+    return build_visual_style_profile(theme, style, _audio_payload(audio_profile), visual_request)
 
 
 def _search_cache_path(cache_dir: Path, query: str, page: int, per_page: int) -> Path:
@@ -1146,6 +1115,7 @@ def _image_signals(image_bgr: np.ndarray, target_color: Mapping[str, float]) -> 
             "perceptual_hash": None,
             "subject_profile": {},
             "face_content_risk": 0.5,
+            "aesthetic_metrics": frame_aesthetic_metrics(np.empty((0, 0, 3), dtype=np.uint8)),
         }
     height, width = image_bgr.shape[:2]
     scale = min(1.0, 640.0 / max(width, height))
@@ -1176,6 +1146,7 @@ def _image_signals(image_bgr: np.ndarray, target_color: Mapping[str, float]) -> 
     phash = str(imagehash.phash(pil_image))
     subject = subject_region(image_bgr, _face_detector())
     image_face_risk = face_content_risk("", None, subject)
+    aesthetic_metrics = frame_aesthetic_metrics(image_bgr)
     return {
         "available": True,
         "width": int(image_bgr.shape[1]),
@@ -1190,6 +1161,7 @@ def _image_signals(image_bgr: np.ndarray, target_color: Mapping[str, float]) -> 
         "perceptual_hash": phash,
         "subject_profile": subject,
         "face_content_risk": round(image_face_risk, 4),
+        "aesthetic_metrics": aesthetic_metrics,
     }
 
 
@@ -1476,12 +1448,21 @@ def _metadata_score(
     audio_profile: Mapping[str, Any] | None,
     target_ratio: float,
     min_resolution: tuple[int, int],
+    prefer_wide_aerial: bool = False,
+    visual_cohesion_profile: str = "none",
 ) -> tuple[float, dict[str, float]]:
     variant = candidate["variant"]
     tags = str(candidate.get("tags") or "")
     tag_tokens = _token_set([tags])
     style_profile = _style_payload(style_profile)
     audio_profile = _audio_payload(audio_profile)
+    visual_profile = _resolve_visual_profile(
+        theme,
+        style_profile,
+        audio_profile,
+        "" if visual_cohesion_profile in {"", "none", "auto"} else visual_cohesion_profile.replace("_", " "),
+    )
+    visual_metadata = metadata_profile_fit(tags, visual_profile)
     relevant = _token_set(
         [theme]
         + _theme_terms(theme)
@@ -1530,6 +1511,15 @@ def _metadata_score(
     environment_priority = min(1.0, len(tag_tokens & environment_terms) / 2.0)
     human_theme = _human_focused_theme(_theme_terms(theme))
     face_penalty = metadata_face_risk * (0.28 if human_theme else 0.72)
+    shot_type = _infer_shot_type(tags)
+    spatial_scale_priority = {
+        "aerial": 1.0,
+        "wide": 0.85,
+        "pov_tracking": 0.72,
+        "medium": 0.22,
+        "medium_portrait": 0.08,
+        "close_up": 0.0,
+    }.get(shot_type, 0.2)
     components = {
         "relevance": relevance,
         "resolution": resolution,
@@ -1541,6 +1531,10 @@ def _metadata_score(
         "face_content_risk": metadata_face_risk,
         "face_penalty": face_penalty,
         "environment_priority": environment_priority,
+        "spatial_scale_priority": spatial_scale_priority,
+        "dynamic_world_fit": float(visual_metadata["world_fit"]),
+        "dynamic_profile_relevance": float(visual_metadata["relevance"]),
+        "dynamic_profile_allowed": 1.0 if visual_metadata["allowed"] else 0.0,
     }
     score = (
         0.40 * relevance
@@ -1550,8 +1544,14 @@ def _metadata_score(
         + 0.06 * duration_score
         + 0.11 * motion_style
         + 0.06 * environment_priority
+        + 0.11 * float(visual_metadata["world_fit"])
+        + 0.06 * float(visual_metadata["relevance"])
         - 0.22 * face_penalty
     )
+    if prefer_wide_aerial:
+        score += 0.18 * spatial_scale_priority + 0.07 * motion
+    if not visual_metadata["allowed"]:
+        score -= 0.55
     return float(score), {key: round(value, 4) for key, value in components.items()}
 
 
@@ -1565,21 +1565,37 @@ def _score_candidates(
     target_ratio: float,
     min_resolution: tuple[int, int],
     desired_count: int,
+    prefer_wide_aerial: bool = False,
+    visual_cohesion_profile: str = "none",
 ) -> list[dict[str, Any]]:
     for candidate in candidates:
         score, components = _metadata_score(
-            candidate, theme, style_profile, audio_profile, target_ratio, min_resolution
+            candidate,
+            theme,
+            style_profile,
+            audio_profile,
+            target_ratio,
+            min_resolution,
+            prefer_wide_aerial,
+            visual_cohesion_profile,
         )
         candidate["metadata_score"] = round(score, 6)
         candidate["score_components"] = components
     candidates.sort(key=lambda item: item["metadata_score"], reverse=True)
-    target_color = _target_color(style_profile)
+    visual_profile = _resolve_visual_profile(
+        theme,
+        style_profile,
+        audio_profile,
+        "" if visual_cohesion_profile in {"", "none", "auto"} else visual_cohesion_profile.replace("_", " "),
+    )
+    target_color = dict(visual_profile.get("color_profile") or _target_color(style_profile))
     inspect_count = min(len(candidates), max(24, desired_count * 8))
     for index, candidate in enumerate(candidates):
         local_entry = candidate.get("local_reuse_entry")
         if isinstance(local_entry, Mapping):
             local_quality = local_entry.get("quality") if isinstance(local_entry.get("quality"), Mapping) else {}
             local_fingerprint = local_entry.get("fingerprint") if isinstance(local_entry.get("fingerprint"), Mapping) else {}
+            local_visual = local_quality.get("visual_analysis") if isinstance(local_quality.get("visual_analysis"), Mapping) else {}
             hashes = list(local_fingerprint.get("perceptual_hashes") or [])
             thumbnail = {
                 "available": True,
@@ -1590,6 +1606,15 @@ def _score_candidates(
                 "perceptual_hash": hashes[0] if hashes else None,
                 "subject_profile": local_quality.get("subject_profile", {}),
                 "face_content_risk": float(local_quality.get("face_content_risk", candidate.get("face_content_risk", 0.0))),
+                "aesthetic_metrics": {
+                    "spatial_depth": float(local_visual.get("spatial_depth_score", 0.45)),
+                    "composition_quality": float(local_visual.get("composition_quality_score", 0.45)),
+                    "visual_impact": float(local_visual.get("visual_impact_score", 0.45)),
+                    "lighting_quality": float(local_visual.get("lighting_quality_score", 0.45)),
+                    "atmosphere_quality": float(local_visual.get("atmosphere_quality_score", 0.45)),
+                    "color_quality": float(local_visual.get("intrinsic_color_quality_score", 0.45)),
+                    "ordinary_travelogue_risk": float(local_visual.get("ordinary_travelogue_risk", 0.5)),
+                },
             }
         elif index < inspect_count:
             thumbnail = _get_thumbnail_signals(session, candidate["raw"], candidate["variant"], cache_dir, target_color)
@@ -1597,6 +1622,17 @@ def _score_candidates(
             thumbnail = _image_signals(np.empty((0, 0, 3), dtype=np.uint8), target_color)
         candidate["thumbnail_signals"] = thumbnail
         quality = 0.42 * float(thumbnail["sharpness_score"]) + 0.38 * float(thumbnail["exposure_score"]) + 0.20 * (1.0 - float(thumbnail["text_watermark_risk"]))
+        thumbnail_aesthetic = thumbnail.get("aesthetic_metrics")
+        if not isinstance(thumbnail_aesthetic, Mapping):
+            thumbnail_aesthetic = frame_aesthetic_metrics(np.empty((0, 0, 3), dtype=np.uint8))
+        preliminary_aesthetic = (
+            0.24 * thumbnail_aesthetic["spatial_depth"]
+            + 0.20 * thumbnail_aesthetic["composition_quality"]
+            + 0.23 * thumbnail_aesthetic["visual_impact"]
+            + 0.18 * thumbnail_aesthetic["lighting_quality"]
+            + 0.15 * thumbnail_aesthetic["color_quality"]
+            - 0.12 * thumbnail_aesthetic["ordinary_travelogue_risk"]
+        )
         visual_face_risk = max(
             float(candidate["score_components"].get("face_content_risk", 0.0)),
             float(thumbnail.get("face_content_risk", 0.0)),
@@ -1606,6 +1642,7 @@ def _score_candidates(
                 "thumbnail_quality": round(quality, 4),
                 "color": round(float(thumbnail["color_score"]), 4),
                 "visual_face_risk": round(visual_face_risk, 4),
+                "preliminary_aesthetic": round(float(np.clip(preliminary_aesthetic, 0.0, 1.0)), 4),
             }
         )
         # Reweight metadata components after thumbnail inspection.
@@ -1624,6 +1661,8 @@ def _score_candidates(
             + 0.09 * candidate["score_components"]["motion_style"]
             + 0.13 * quality
             + 0.08 * float(thumbnail["color_score"])
+            + 0.12 * float(np.clip(preliminary_aesthetic, 0.0, 1.0))
+            + 0.08 * candidate["score_components"]["dynamic_world_fit"]
             - 0.28 * visual_face_risk
             - history_penalty
         )
@@ -1737,6 +1776,10 @@ def _collect_candidates(
     timeline_plan: Any = None,
     candidate_pool_multiplier: int = 6,
     max_search_pages: int = 3,
+    priority_queries: Sequence[str] = (),
+    wide_aerial_only: bool = False,
+    visual_cohesion_profile: str = "none",
+    excluded_pixabay_ids: Sequence[str | int] = (),
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     candidates_by_id: dict[str, dict[str, Any]] = {}
     search_rounds: list[dict[str, Any]] = []
@@ -1745,12 +1788,21 @@ def _collect_candidates(
     target_pool = (
         max(desired_count, len(slots) * max(1, int(candidate_pool_multiplier)))
         if slots
-        else max(18, desired_count * 4)
+        else max(24, desired_count * max(8, int(candidate_pool_multiplier)))
     )
     per_page = min(100, max(20, desired_count * 5))
     max_search_pages = max(1, min(20, int(max_search_pages)))
+    exact_queries = _unique_terms(
+        _clean_query([query]) for query in priority_queries if str(query).strip()
+    )
+    excluded_ids = {str(value).strip() for value in excluded_pixabay_ids if str(value).strip()}
+    executed_queries: set[str] = set()
+    visual_request = "" if visual_cohesion_profile in {"", "none", "auto"} else str(visual_cohesion_profile).replace("_", " ")
+    visual_profile = _resolve_visual_profile(theme, style_profile, audio_profile, visual_request)
 
-    local_candidates = _local_library_candidates(local_entries, theme, slots)
+    # Explicit location queries are an acquisition boundary. Do not seed this
+    # pool with loosely matching generic rows from the local material library.
+    local_candidates = [] if exact_queries else _local_library_candidates(local_entries, theme, slots)
     for candidate in local_candidates:
         candidates_by_id[str(candidate["pixabay_id"])] = candidate
     if local_candidates:
@@ -1771,21 +1823,44 @@ def _collect_candidates(
                 ),
             }
         )
-
-    for round_index in range(3):
         if len(candidates_by_id) >= target_pool:
+            return list(candidates_by_id.values()), search_rounds, errors
+
+    round_count = max_search_pages if exact_queries else 3
+    for round_index in range(round_count):
+        # Always execute the precise first round.  Expansion rounds are bounded
+        # and continue until the larger quality-oriented pool is satisfied.
+        if len(candidates_by_id) >= target_pool and round_index >= 2:
             break
-        queries = generate_visual_queries(theme, style_profile, audio_profile, round_index)
+        query_plan = (
+            [{"query": query, "intent": "explicit_user_query"} for query in exact_queries]
+            if exact_queries
+            else plan_visual_search_queries(visual_profile, round_index)
+        )
+        queries = [str(record.get("query") or "") for record in query_plan if record.get("query")]
+        pages = (round_index + 1,) if exact_queries else range(1, max_search_pages + 1)
         round_record: dict[str, Any] = {
             "round": round_index + 1,
-            "expansion_level": round_index,
-            "reason": "initial style and music queries" if round_index == 0 else "candidate pool below target; expanded synonyms, scenes, and visual concepts",
+            "expansion_level": -2 if exact_queries else round_index,
+            "reason": (
+                "explicit priority location queries"
+                if exact_queries
+                else (
+                    "initial style and music queries"
+                    if round_index == 0
+                    else "candidate pool below target; expanded synonyms, scenes, and visual concepts"
+                )
+            ),
             "queries": [],
+            "query_intents": {str(record.get("query")): record.get("intent") for record in query_plan},
             "pool_before": len(candidates_by_id),
             "target_pool": target_pool,
         }
         for query in queries:
-            for page in range(1, max_search_pages + 1):
+            query_key = re.sub(r"\s+", " ", query.strip().lower())
+            if not exact_queries and query_key in executed_queries:
+                continue
+            for page in pages:
                 query_record: dict[str, Any] = {
                     "query": query,
                     "query_length": len(query),
@@ -1802,13 +1877,38 @@ def _collect_candidates(
                     for raw in hits:
                         if not isinstance(raw, Mapping) or raw.get("id") is None:
                             continue
+                        if str(raw.get("id")) in excluded_ids:
+                            continue
+                        tags = str(raw.get("tags") or "")
+                        profile_fit = metadata_profile_fit(f"{tags} {query}", visual_profile)
+                        if not profile_fit["allowed"]:
+                            continue
+                        if wide_aerial_only:
+                            lowered_tags = tags.lower()
+                            if any(
+                                term in lowered_tags
+                                for term in (
+                                    "abstract", "animation", "animated", "cgi", "3d render",
+                                    "rendering", "ai generated", "generative ai", "synthetic",
+                                    "illustration", "cartoon", "wallpaper", "background",
+                                    "macro", "close up", "close-up", "detail shot",
+                                )
+                            ):
+                                continue
+                            if re.search(
+                                r"\b(?:man|woman|people|person|boy|girl|child|children|portrait|"
+                                r"animal|wildlife|goat|dog|cat|bird|flag|parliament)\b",
+                                lowered_tags,
+                            ):
+                                continue
+                            if _infer_shot_type(tags) not in {"aerial", "wide", "pov_tracking"}:
+                                continue
                         variant = _variant_for_hit(raw, min_resolution)
                         if variant is None:
                             continue
                         asset_id = str(raw["id"])
                         if asset_id not in candidates_by_id:
                             normalized_id: Any = int(raw["id"]) if str(raw["id"]).isdigit() else asset_id
-                            tags = str(raw.get("tags") or "")
                             candidates_by_id[asset_id] = {
                                 "id": normalized_id,
                                 "pixabay_id": normalized_id,
@@ -1827,6 +1927,7 @@ def _collect_candidates(
                                 "raw": dict(raw),
                                 "canonical_source_id": f"pixabay:{normalized_id}",
                                 "semantic_tags": _semantic_tags(tags),
+                                "visual_metadata_fit": profile_fit,
                             }
                             added += 1
                         else:
@@ -1854,9 +1955,11 @@ def _collect_candidates(
                     query_record.update({"status": "error", "error": safe, "cache_hit": False})
                     errors.append({"round": round_index + 1, "query": query, "page": page, "error": safe})
                 round_record["queries"].append(query_record)
-                if len(candidates_by_id) >= target_pool:
+                if not exact_queries and round_index >= 1 and len(candidates_by_id) >= target_pool:
                     break
-            if len(candidates_by_id) >= target_pool:
+            if not exact_queries:
+                executed_queries.add(query_key)
+            if not exact_queries and round_index >= 1 and len(candidates_by_id) >= target_pool:
                 break
         round_record["pool_after"] = len(candidates_by_id)
         round_record["new_unique_candidates"] = len(candidates_by_id) - round_record["pool_before"]
@@ -1865,9 +1968,19 @@ def _collect_candidates(
             "metadata candidate pool target reached"
             if len(candidates_by_id) >= target_pool
             else (
-                "candidate pool below target; expand synonyms, scenes, pages, and concepts"
-                if round_index < 2
-                else "maximum bounded expansion reached"
+                (
+                    "candidate pool below target; continue exact location query pages"
+                    if exact_queries and round_index < round_count - 1
+                    else (
+                        "maximum exact-query pages reached"
+                        if exact_queries
+                        else (
+                            "candidate pool below target; expand synonyms, scenes, pages, and concepts"
+                            if round_index < 2
+                            else "maximum bounded expansion reached"
+                        )
+                    )
+                )
             )
         )
 
@@ -2189,17 +2302,31 @@ def _video_quality(
     width = int(video_stream.get("width") or 0)
     height = int(video_stream.get("height") or 0)
     duration = float(video_stream.get("duration") or probe.get("format", {}).get("duration") or 0.0)
-    frames, fps, decoded_duration = _sample_video_frames(path, max_samples=96)
+    # Forty-eight distributed frames are enough for stable full-clip signals
+    # while keeping one-time v1.3 cache upgrades practical on long 4K sources.
+    frames, fps, decoded_duration = _sample_video_frames(path, max_samples=48)
     if duration <= 0:
         duration = decoded_duration
     if len(frames) < 2:
         raise PixabayPipelineError("Downloaded asset could not be decoded into enough frames")
-    target_color = _target_color(style_profile)
+    style_payload = _style_payload(style_profile)
+    embedded_visual_profile = style_payload.get("visual_style_profile")
+    visual_profile = dict(embedded_visual_profile) if isinstance(embedded_visual_profile, Mapping) else {}
+    target_color = dict(visual_profile.get("color_profile") or _target_color(style_profile))
     per_frame = [_image_signals(frame, target_color) for frame in frames]
     sharpness = float(np.mean([item["sharpness_score"] for item in per_frame]))
     exposure = float(np.mean([item["exposure_score"] for item in per_frame]))
     color = float(np.mean([item["color_score"] for item in per_frame]))
     motion, stability, motion_raw = _motion_and_stability(frames)
+    direction = str(motion_raw.get("motion_direction") or "unknown")
+    motion_type = {
+        "left": "lateral_left",
+        "right": "lateral_right",
+        "up": "rise",
+        "down": "dive",
+        "static": "static",
+        "mixed": "mixed",
+    }.get(direction, "unknown")
     usable_segments, segment_summary = _usable_segments_from_samples(frames, per_frame, duration)
     watermark = _watermark_risk(frames)
     subject_profile = aggregate_subject_regions(
@@ -2211,6 +2338,14 @@ def _video_quality(
     min_long, min_short = sorted(min_resolution, reverse=True)
     long_side, short_side = sorted((width, height), reverse=True)
     resolution_score = float(np.clip(min(long_side / max(1, min_long), short_side / max(1, min_short)), 0.0, 1.0))
+    visual_analysis = aggregate_video_aesthetics(
+        [item.get("aesthetic_metrics", {}) for item in per_frame],
+        sharpness=sharpness,
+        motion_score=motion,
+        stability_score=stability,
+        motion_type=motion_type,
+        resolution_score=resolution_score,
+    )
     overall = (
         0.23 * sharpness
         + 0.20 * exposure
@@ -2219,6 +2354,8 @@ def _video_quality(
         + 0.13 * resolution_score
         + 0.08 * (1.0 - watermark)
         + 0.08 * (0.55 + 0.45 * motion)
+        + 0.20 * float(visual_analysis["aesthetic_score"])
+        + 0.08 * float(visual_analysis["cinematic_score"])
         - (0.05 if human_focused else 0.18) * full_face_risk
         - 0.10 * float(segment_summary.get("black_frame_ratio", 0.0))
         - 0.08 * float(segment_summary.get("freeze_frame_ratio", 0.0))
@@ -2236,8 +2373,14 @@ def _video_quality(
         reasons.append("strongly unstable motion")
     if watermark > 0.86:
         reasons.append("persistent edge text/logo heuristic triggered")
-    if overall < 0.34:
+    if overall < 0.42:
         reasons.append("overall quality score below threshold")
+    aesthetic_floor = float((visual_profile.get("quality") or {}).get("aesthetic_floor", 0.40))
+    cinematic_floor = float((visual_profile.get("quality") or {}).get("cinematic_floor", 0.36))
+    if float(visual_analysis["aesthetic_score"]) < aesthetic_floor:
+        reasons.append(f"aesthetic score below dynamic floor {aesthetic_floor:.2f}")
+    if float(visual_analysis["cinematic_score"]) < cinematic_floor:
+        reasons.append(f"cinematic score below dynamic floor {cinematic_floor:.2f}")
     if full_face_risk >= 0.94 and not human_focused:
         reasons.append("prominent frontal-face content exceeds default policy")
     if float(segment_summary.get("black_frame_ratio", 0.0)) > 0.35:
@@ -2260,6 +2403,8 @@ def _video_quality(
         "mean_hsv": per_frame[len(per_frame) // 2].get("mean_hsv", {}),
         "motion_signals": motion_raw,
         "motion_direction": motion_raw.get("motion_direction", "unknown"),
+        "motion_type": motion_type,
+        "visual_analysis": visual_analysis,
         "usable_segments": usable_segments,
         "segment_analysis_status": "sampled_continuous_windows",
         **segment_summary,
@@ -2267,9 +2412,28 @@ def _video_quality(
         "subject_profile": subject_profile,
         "face_content_risk": round(full_face_risk, 4),
         "scene_category": _scene_category(tags, None),
-        "heuristic_notice": "Signal-derived estimates; text/logo detection is not OCR.",
+        "heuristic_notice": "Signal-derived aesthetic estimates; not a human guarantee and text/logo detection is not OCR.",
     }
     fingerprint = _video_fingerprint(path, frames, duration, width, height)
+    quality["analysis_cache"] = {
+        "schema_version": ASSET_ANALYSIS_SCHEMA_VERSION,
+        "engine_version": VISUAL_ENGINE_VERSION,
+        "file_sha256": fingerprint["sha256"],
+    }
+    quality["visual_features"] = asset_visual_features(
+        {
+            "tags": tags,
+            "shot_scale": _infer_shot_scale(tags),
+            "motion_direction": quality["motion_direction"],
+            "quality": quality,
+        }
+    )
+    quality["content_semantics"] = _semantic_tags(
+        tags,
+        quality.get("scene_category"),
+        _infer_shot_type(tags),
+        _infer_shot_scale(tags),
+    )
     media = {
         "width": width,
         "height": height,
@@ -2885,6 +3049,10 @@ def run_pixabay_pipeline(
     timeline_plan: Any = None,
     candidate_pool_multiplier: int = 6,
     max_search_pages: int = 3,
+    priority_queries: Sequence[str] = (),
+    wide_aerial_only: bool = False,
+    visual_cohesion_profile: str = "none",
+    excluded_pixabay_ids: Sequence[str | int] = (),
 ) -> dict[str, Any]:
     """Search, select, download, QA, deduplicate, and attribute Pixabay clips.
 
@@ -2900,6 +3068,7 @@ def run_pixabay_pipeline(
         raise ValueError("desired_count must be positive")
     candidate_pool_multiplier = int(candidate_pool_multiplier)
     max_search_pages = int(max_search_pages)
+    visual_cohesion_profile = str(visual_cohesion_profile or "auto").strip()
     if candidate_pool_multiplier < 1:
         raise ValueError("candidate_pool_multiplier must be at least 1")
     if max_search_pages < 1:
@@ -2907,6 +3076,14 @@ def run_pixabay_pipeline(
     timeline_slots = _timeline_slots(timeline_plan)
     style_profile = _style_payload(style_profile)
     audio_profile = _audio_payload(audio_profile)
+    visual_request = "" if visual_cohesion_profile.lower() in {"", "none", "auto"} else visual_cohesion_profile.replace("_", " ")
+    visual_style_profile = build_visual_style_profile(
+        theme,
+        style_profile,
+        audio_profile,
+        visual_request,
+    )
+    style_profile = {**style_profile, "visual_style_profile": visual_style_profile}
     if target_duration is None:
         target_duration = _first_numeric(
             audio_profile,
@@ -2981,6 +3158,10 @@ def run_pixabay_pipeline(
         timeline_slots,
         candidate_pool_multiplier,
         max_search_pages,
+        priority_queries,
+        wide_aerial_only,
+        visual_cohesion_profile,
+        excluded_pixabay_ids,
     )
     ranked = _score_candidates(
         session,
@@ -2992,6 +3173,8 @@ def run_pixabay_pipeline(
         target_ratio,
         min_resolution,
         desired_count,
+        wide_aerial_only,
+        visual_cohesion_profile,
     )
     candidate_log = [_public_candidate(candidate) for candidate in ranked]
     log_by_id = {str(item["pixabay_id"]): item for item in candidate_log}
@@ -3074,6 +3257,39 @@ def run_pixabay_pipeline(
                     known["file_hash"] = file_hash
                     known.setdefault("fingerprint", {})["sha256"] = file_hash
                     known["canonical_source_id"] = f"sha256:{file_hash}"
+                cached_quality = known.get("quality") if isinstance(known.get("quality"), Mapping) else {}
+                if not analysis_cache_valid(cached_quality, str(known.get("file_hash") or "")):
+                    refreshed_quality, refreshed_media = _video_quality(
+                        known_path,
+                        style_profile,
+                        min_resolution,
+                        tags=str(candidate.get("tags") or known.get("tags") or ""),
+                        human_focused=_human_focused_theme(_theme_terms(theme)),
+                    )
+                    known["quality"] = refreshed_quality
+                    known["media"] = refreshed_media
+                    known["fingerprint"] = refreshed_media.get("fingerprint", known.get("fingerprint", {}))
+                    known["file_hash"] = str(known["fingerprint"].get("sha256") or known.get("file_hash") or "")
+                    if not refreshed_quality.get("passed"):
+                        reasons = list(refreshed_quality.get("rejection_reasons") or ["v1.3 aesthetic reanalysis failed"])
+                        rejections.append(
+                            {
+                                "pixabay_id": candidate["pixabay_id"],
+                                "stage": "cached_asset_v13_reanalysis",
+                                "reasons": reasons,
+                                "quality": refreshed_quality,
+                            }
+                        )
+                        log_item.update(
+                            {
+                                "decision": "rejected",
+                                "rejection_stage": "cached_asset_v13_reanalysis",
+                                "reasons": reasons,
+                                "available": True,
+                                "download_status": "cached_rejected_for_current_profile",
+                            }
+                        )
+                        continue
                 known_canonical = str(known.get("canonical_source_id") or _canonical_source_id(known))
                 if known_canonical in selected_canonical_ids:
                     reason = "canonical source already selected in this montage"
@@ -3523,12 +3739,18 @@ def run_pixabay_pipeline(
             "min_resolution": {"width": min_resolution[0], "height": min_resolution[1]},
             "candidate_pool_multiplier": candidate_pool_multiplier,
             "max_search_pages": max_search_pages,
+            "priority_queries": list(priority_queries),
+            "wide_aerial_only": bool(wide_aerial_only),
+            "visual_cohesion_profile": visual_cohesion_profile,
+            "visual_style_profile_digest": visual_style_profile["profile_digest"],
+            "excluded_pixabay_ids": sorted({str(value) for value in excluded_pixabay_ids}),
         },
         "timeline_plan": {
             "provided": bool(timeline_slots),
             "slot_count": len(timeline_slots),
         },
         "candidate_pool_gate": candidate_pool_gate,
+        "visual_style_profile": visual_style_profile,
         "cache_layout": {
             "pixabay_root": str(cache_root),
             "search": str(cache_root / "search"),
@@ -3554,7 +3776,7 @@ def run_pixabay_pipeline(
             Counter(str(source.get("reuse_mode") or "unknown") for source in selected)
         ),
         "attribution_notice": "Pixabay source metadata retained for traceability; verify current Pixabay license terms when publishing.",
-        "heuristic_notice": "Content, shot scale, motion, text/watermark, and visual quality labels are signal-derived estimates.",
+        "heuristic_notice": "Content, shot scale, motion, aesthetic quality, and visual consistency labels are sampled signal-derived estimates.",
     }
     snapshot_token = secrets.token_hex(12)
     snapshot_path = (
@@ -3605,6 +3827,11 @@ def run_pixabay_pipeline(
         "search_errors": search_errors,
         "rejections": rejections,
         "candidate_count": len(ranked),
+        "priority_queries": list(priority_queries),
+        "wide_aerial_only": bool(wide_aerial_only),
+        "visual_cohesion_profile": visual_cohesion_profile,
+        "visual_style_profile": visual_style_profile,
+        "excluded_pixabay_ids": sorted({str(value) for value in excluded_pixabay_ids}),
         "dry_run": bool(dry_run),
     }
     return _strip_secrets(result, api_key)
@@ -3913,6 +4140,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeline-plan", help="optional pre-download timeline/slot plan JSON")
     parser.add_argument("--candidate-pool-multiplier", type=int, default=6)
     parser.add_argument("--max-search-pages", type=int, default=3)
+    parser.add_argument(
+        "--search-query",
+        dest="priority_queries",
+        action="append",
+        default=[],
+        help="Exact priority Pixabay query; repeat for multiple location-led searches.",
+    )
+    parser.add_argument(
+        "--wide-aerial-only",
+        action="store_true",
+        help="Exclude abstract/close-up metadata hits and strongly prefer aerial, FPV, and wide footage.",
+    )
+    parser.add_argument(
+        "--visual-style",
+        "--visual-cohesion-profile",
+        dest="visual_cohesion_profile",
+        default="auto",
+        help="Free-form task style request; auto derives it from theme, references, and BGM.",
+    )
+    parser.add_argument(
+        "--exclude-pixabay-id",
+        dest="excluded_pixabay_ids",
+        action="append",
+        default=[],
+        help="Exclude a visually rejected Pixabay asset ID; repeat after contact-sheet review.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="search and rank without downloading full videos")
     parser.add_argument("--result-json", help="optional path for the returned stage result")
     return parser
@@ -3941,6 +4194,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeline_plan=args.timeline_plan,
             candidate_pool_multiplier=args.candidate_pool_multiplier,
             max_search_pages=args.max_search_pages,
+            priority_queries=args.priority_queries,
+            wide_aerial_only=args.wide_aerial_only,
+            visual_cohesion_profile=args.visual_cohesion_profile,
+            excluded_pixabay_ids=args.excluded_pixabay_ids,
         )
         if args.result_json:
             _atomic_write_json(Path(args.result_json).expanduser().resolve(), result)
