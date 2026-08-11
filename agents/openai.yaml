@@ -1,0 +1,4 @@
+interface:
+  display_name: "BGM Montage"
+  short_description: "Learn reference style and cut Pixabay footage to music"
+  default_prompt: "Use $bgm-montage to analyze references and create a Pixabay montage driven by my BGM."

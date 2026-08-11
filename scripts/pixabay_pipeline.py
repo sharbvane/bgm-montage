@@ -1,0 +1,1892 @@
+#!/usr/bin/env python3
+"""Pixabay search, ranking, download, QA, deduplication, and attribution.
+
+The public entry point is :func:`run_pixabay_pipeline`.  The module deliberately
+keeps the Pixabay credential out of URLs written to disk, cache keys, manifests,
+and console output.  All visual labels and QA findings are signal-derived
+heuristics; callers should not present them as model-certified facts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import hashlib
+import http.client
+import json
+import logging
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
+from urllib.parse import urlparse
+
+import cv2
+import imagehash
+import numpy as np
+import requests
+from dotenv import load_dotenv
+from PIL import Image
+
+
+PIXABAY_VIDEO_API = "https://pixabay.com/api/videos/"
+CACHE_TTL_SECONDS = 24 * 60 * 60
+SCHEMA_VERSION = 1
+REQUEST_TIMEOUT = (10, 45)
+DOWNLOAD_TIMEOUT = (15, 180)
+USER_AGENT = "bgm-montage/1.0 (Pixabay video workflow)"
+
+
+class PixabayPipelineError(RuntimeError):
+    """An expected, credential-safe pipeline failure."""
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _safe_error(error: BaseException | str, secret: str | None = None) -> str:
+    """Remove credentials and authenticated query strings from an error."""
+
+    message = str(error)
+    if secret:
+        message = message.replace(secret, "[REDACTED]")
+    message = re.sub(r"(?i)([?&](?:key|api_key|token)=)[^&\s]+", r"\1[REDACTED]", message)
+    message = re.sub(r"(?i)(PIXABAY_API_KEY\s*[=:]\s*)\S+", r"\1[REDACTED]", message)
+    return message[:600]
+
+
+def _strip_secrets(value: Any, secret: str | None = None) -> Any:
+    """Recursively sanitize data before it is persisted."""
+
+    if isinstance(value, Mapping):
+        clean: dict[str, Any] = {}
+        for key, item in value.items():
+            if str(key).lower() in {"key", "api_key", "pixabay_api_key", "token"}:
+                continue
+            clean[str(key)] = _strip_secrets(item, secret)
+        return clean
+    if isinstance(value, list):
+        return [_strip_secrets(item, secret) for item in value]
+    if isinstance(value, tuple):
+        return [_strip_secrets(item, secret) for item in value]
+    if isinstance(value, str):
+        return _safe_error(value, secret)
+    return value
+
+
+def _atomic_write_json(path: Path, payload: Any, secret: str | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sanitized = _strip_secrets(payload, secret)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(sanitized, handle, ensure_ascii=False, indent=2, sort_keys=False)
+            handle.write("\n")
+        os.replace(temp_name, path)
+    finally:
+        try:
+            Path(temp_name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _read_json(path: Path, default: Any) -> Any:
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            return json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return default
+
+
+def _load_environment() -> None:
+    """Load only a project-root .env, never a credential file beside the skill."""
+
+    explicit_root = os.environ.get("BGM_MONTAGE_PROJECT_ROOT", "").strip()
+    cwd = Path.cwd().resolve()
+    skill_root = Path(__file__).resolve().parent.parent
+    candidates = [Path(explicit_root).expanduser().resolve() / ".env"] if explicit_root else []
+    candidates.extend(candidate / ".env" for candidate in (cwd, *list(cwd.parents)[:3]))
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.parent.resolve() == skill_root:
+            continue
+        if candidate.is_file():
+            load_dotenv(candidate, override=False)
+            break
+
+
+@contextlib.contextmanager
+def _suppress_sensitive_http_debug() -> Any:
+    """Prevent third-party HTTP debug modes from recording the API-key URL."""
+
+    loggers = [logging.getLogger("urllib3.connectionpool"), logging.getLogger("requests.packages.urllib3.connectionpool")]
+    previous_disabled = [logger.disabled for logger in loggers]
+    previous_http_debug = http.client.HTTPConnection.debuglevel
+    try:
+        for logger in loggers:
+            logger.disabled = True
+        http.client.HTTPConnection.debuglevel = 0
+        yield
+    finally:
+        http.client.HTTPConnection.debuglevel = previous_http_debug
+        for logger, disabled in zip(loggers, previous_disabled):
+            logger.disabled = disabled
+
+
+def _parse_aspect_ratio(value: str | float | Sequence[int | float]) -> tuple[float, str]:
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        width, height = float(value[0]), float(value[1])
+        label = f"{value[0]}:{value[1]}"
+    elif isinstance(value, (int, float)):
+        width, height = float(value), 1.0
+        label = f"{float(value):g}:1"
+    else:
+        text = str(value).strip().lower().replace("×", "x")
+        match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*[:x/]\s*(\d+(?:\.\d+)?)\s*", text)
+        if not match:
+            raise ValueError(f"Invalid aspect ratio: {value!r}; expected for example 16:9 or 9:16")
+        width, height = float(match.group(1)), float(match.group(2))
+        label = f"{match.group(1)}:{match.group(2)}"
+    if width <= 0 or height <= 0:
+        raise ValueError("Aspect ratio components must be positive")
+    return width / height, label
+
+
+def _parse_resolution(value: str | Sequence[int | float]) -> tuple[int, int]:
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        width, height = int(value[0]), int(value[1])
+    else:
+        match = re.fullmatch(r"\s*(\d+)\s*[x×,:]\s*(\d+)\s*", str(value))
+        if not match:
+            raise ValueError(f"Invalid resolution: {value!r}; expected WIDTHxHEIGHT")
+        width, height = int(match.group(1)), int(match.group(2))
+    if width <= 0 or height <= 0:
+        raise ValueError("Resolution components must be positive")
+    return width, height
+
+
+_CHINESE_TERM_MAP: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("海洋", ("ocean", "waves", "coast")),
+    ("大海", ("ocean", "sea", "coast")),
+    ("海边", ("coast", "beach", "ocean")),
+    ("沙滩", ("beach", "shore", "sand")),
+    ("城市", ("city", "urban", "street")),
+    ("建筑", ("architecture", "building", "city")),
+    ("自然", ("nature", "landscape", "outdoors")),
+    ("森林", ("forest", "trees", "nature")),
+    ("山", ("mountain", "landscape", "nature")),
+    ("天空", ("sky", "clouds", "atmosphere")),
+    ("日出", ("sunrise", "golden hour", "morning")),
+    ("日落", ("sunset", "golden hour", "dusk")),
+    ("科技", ("technology", "digital", "innovation")),
+    ("工业", ("industry", "factory", "machinery")),
+    ("工厂", ("factory", "manufacturing", "machinery")),
+    ("机械", ("machinery", "engineering", "industrial")),
+    ("制造", ("manufacturing", "production", "factory")),
+    ("焊接", ("welding", "sparks", "workshop")),
+    ("农业", ("agriculture", "farm", "fields")),
+    ("食物", ("food", "cooking", "ingredients")),
+    ("美食", ("food", "cuisine", "cooking")),
+    ("旅行", ("travel", "destination", "adventure")),
+    ("汽车", ("car", "driving", "automotive")),
+    ("运动", ("sports", "athlete", "action")),
+    ("人物", ("people", "portrait", "lifestyle")),
+    ("女性", ("woman", "portrait", "lifestyle")),
+    ("男性", ("man", "portrait", "lifestyle")),
+    ("家庭", ("family", "home", "lifestyle")),
+    ("儿童", ("children", "family", "play")),
+    ("动物", ("animals", "wildlife", "nature")),
+    ("宇宙", ("space", "galaxy", "stars")),
+    ("足球", ("football", "soccer", "sport")),
+    ("篮球", ("basketball", "sport", "athlete")),
+    ("安静", ("calm", "quiet", "peaceful")),
+    ("治愈", ("serene", "peaceful", "gentle")),
+    ("孤独", ("solitude", "lonely", "atmospheric")),
+    ("自由", ("freedom", "open", "adventure")),
+    ("激情", ("energetic", "dynamic", "powerful")),
+    ("浪漫", ("romantic", "dreamy", "warm")),
+    ("未来", ("futuristic", "technology", "neon")),
+)
+
+_WORD_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "ocean": ("sea", "seascape", "coast", "waves"),
+    "city": ("urban", "downtown", "metropolis", "street"),
+    "nature": ("outdoors", "landscape", "wilderness", "scenery"),
+    "industry": ("industrial", "manufacturing", "factory", "engineering"),
+    "factory": ("manufacturing", "production line", "workshop", "industrial"),
+    "technology": ("digital", "innovation", "futuristic", "electronics"),
+    "travel": ("journey", "destination", "adventure", "exploration"),
+    "calm": ("serene", "peaceful", "tranquil", "gentle"),
+    "energetic": ("dynamic", "powerful", "fast action", "intense"),
+    "people": ("lifestyle", "human", "portrait", "community"),
+    "food": ("cuisine", "cooking", "ingredients", "kitchen"),
+    "sports": ("athlete", "competition", "training", "action"),
+    "car": ("automotive", "vehicle", "driving", "road"),
+}
+
+_ENGLISH_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in",
+    "into", "is", "it", "of", "on", "or", "the", "to", "video", "with", "footage",
+    "style", "scene", "shot", "clips", "clip", "overall", "unknown", "none",
+    "true", "false",
+}
+
+
+def _english_words(value: Any) -> list[str]:
+    text = unicodedata.normalize("NFKC", str(value)).lower()
+    words = re.findall(r"[a-z][a-z0-9-]{1,24}", text)
+    return [word.replace("-", " ") for word in words if word not in _ENGLISH_STOPWORDS]
+
+
+def _theme_terms(theme: str) -> list[str]:
+    terms = _english_words(theme)
+    for chinese, english in _CHINESE_TERM_MAP:
+        if chinese in theme:
+            terms.extend(english)
+    return _unique_terms(terms) or ["cinematic", "visual", "atmosphere"]
+
+
+def _unique_terms(values: Iterable[str], limit: int | None = None) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = re.sub(r"\s+", " ", str(value).strip().lower())
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+        if limit is not None and len(result) >= limit:
+            break
+    return result
+
+
+def _collect_profile_words(profile: Mapping[str, Any] | None, key_fragments: Sequence[str]) -> list[str]:
+    if not isinstance(profile, Mapping):
+        return []
+    words: list[str] = []
+
+    def visit(value: Any, path: str, depth: int) -> None:
+        if depth > 7:
+            return
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                visit(item, f"{path}.{str(key).lower()}", depth + 1)
+        elif isinstance(value, (list, tuple)):
+            for item in value[:30]:
+                visit(item, path, depth + 1)
+        elif any(fragment in path for fragment in key_fragments):
+            words.extend(_english_words(value))
+
+    visit(profile, "", 0)
+    return _unique_terms(words)
+
+
+def _number_values(profile: Mapping[str, Any] | None, key_fragments: Sequence[str]) -> list[float]:
+    values: list[float] = []
+    if not isinstance(profile, Mapping):
+        return values
+
+    def visit(value: Any, path: str, depth: int) -> None:
+        if depth > 7:
+            return
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                visit(item, f"{path}.{str(key).lower()}", depth + 1)
+        elif isinstance(value, (list, tuple)):
+            for item in value[:50]:
+                visit(item, path, depth + 1)
+        elif any(fragment in path for fragment in key_fragments):
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return
+            if math.isfinite(numeric):
+                values.append(numeric)
+
+    visit(profile, "", 0)
+    return values
+
+
+def _style_payload(profile: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    """Accept either the style payload itself or analyze_references' wrapper."""
+
+    if not isinstance(profile, Mapping):
+        return {}
+    for key in ("style_profile", "style"):
+        nested = profile.get(key)
+        if isinstance(nested, Mapping):
+            return nested
+    return profile
+
+
+def _audio_payload(profile: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    """Accept either a BGM profile or a wrapper returned by the analyzer."""
+
+    if not isinstance(profile, Mapping):
+        return {}
+    for key in ("audio_profile", "bgm_profile", "profile"):
+        nested = profile.get(key)
+        if isinstance(nested, Mapping):
+            return nested
+    return profile
+
+
+def _audio_descriptors(audio_profile: Mapping[str, Any] | None) -> list[str]:
+    audio_profile = _audio_payload(audio_profile)
+    words = _collect_profile_words(
+        audio_profile,
+        (
+            "estimated_mood", "mood", "emotion", "energy", "timbre", "brightness_label",
+            "density_label", "edit_guidance", "stage_profile", "section", "texture", "character",
+        ),
+    )
+    energy_values = _number_values(audio_profile, ("mean_energy", "energy.mean", "energy_curve", "energy", "intensity", "rms"))
+    bpm_values = _number_values(audio_profile, ("tempo_bpm_estimate", "bpm", "tempo"))
+    if energy_values:
+        energy = float(np.median(energy_values))
+        if energy > 1.0:
+            energy = min(1.0, energy / 100.0)
+        words.extend(("energetic", "dynamic") if energy >= 0.62 else ("calm", "atmospheric"))
+    if bpm_values:
+        bpm = float(np.median([value for value in bpm_values if value > 0] or [0]))
+        if bpm >= 120:
+            words.extend(("fast motion", "dynamic"))
+        elif 0 < bpm <= 85:
+            words.extend(("slow motion", "serene"))
+    joined = " ".join(words)
+    if any(word in joined for word in ("bright", "major", "uplifting")):
+        words.extend(("bright", "uplifting"))
+    if any(word in joined for word in ("dark", "minor", "melancholy")):
+        words.extend(("moody", "dramatic"))
+    return _unique_terms(words, 8)
+
+
+def _clean_query(parts: Iterable[str]) -> str:
+    words: list[str] = []
+    for part in parts:
+        words.extend(_english_words(part))
+    query = " ".join(_unique_terms(words))
+    if not query:
+        query = "cinematic atmosphere"
+    while len(query) > 100 and " " in query:
+        query = query.rsplit(" ", 1)[0]
+    return query[:100].strip()
+
+
+def _scene_concepts(theme_terms: Sequence[str]) -> list[str]:
+    joined = " ".join(theme_terms)
+    rules: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+        (("ocean", "sea", "coast", "beach"), ("waves aerial", "shore detail", "coastal landscape", "water reflection")),
+        (("factory", "industry", "manufacturing", "machinery"), ("production line", "machine close up", "factory worker", "industrial sparks")),
+        (("city", "urban", "street"), ("city skyline", "street life", "urban aerial", "architecture detail")),
+        (("nature", "forest", "mountain", "landscape"), ("wide landscape", "nature detail", "aerial wilderness", "sunlight atmosphere")),
+        (("technology", "digital", "futuristic"), ("technology close up", "digital network", "futuristic city", "electronics detail")),
+        (("food", "cooking", "cuisine"), ("cooking close up", "ingredients detail", "kitchen action", "food table")),
+        (("sports", "athlete", "action"), ("athlete close up", "training action", "sports wide shot", "competition detail")),
+        (("travel", "journey", "adventure"), ("destination aerial", "traveler lifestyle", "road journey", "landscape detail")),
+        (("people", "portrait", "lifestyle", "family"), ("human portrait", "lifestyle detail", "people wide shot", "authentic moment")),
+    )
+    for needles, concepts in rules:
+        if any(needle in joined for needle in needles):
+            return list(concepts)
+    return ["wide establishing", "close up detail", "aerial view", "authentic atmosphere"]
+
+
+def generate_visual_queries(
+    theme: str,
+    style_profile: Mapping[str, Any] | None,
+    audio_profile: Mapping[str, Any] | None,
+    expansion_level: int = 0,
+) -> list[str]:
+    """Generate deterministic English Pixabay terms, each at most 100 chars."""
+
+    style_profile = _style_payload(style_profile)
+    theme_words = _theme_terms(theme)
+    positive = _collect_profile_words(style_profile, ("positive_terms",))[:10]
+    topics = _unique_terms(
+        [
+            *_collect_profile_words(style_profile, ("topic", "subject", "content", "object", "tag")),
+            *positive,
+        ]
+    )[:8]
+    moods = _collect_profile_words(style_profile, ("mood", "emotion", "atmosphere", "tone"))[:5]
+    palette = _collect_profile_words(style_profile, ("color", "colour", "palette", "grade", "lighting"))[:4]
+    motion = _collect_profile_words(
+        style_profile,
+        ("motion", "movement", "camera", "editing", "pace", "camera_terms", "rhythm_terms"),
+    )[:4]
+    scale = _collect_profile_words(style_profile, ("shot_scale_terms", "shot_scale"))[:3]
+    audio = _audio_descriptors(audio_profile)
+    base = _unique_terms([*theme_words[:5], *topics[:3]])
+    anchor = theme_words[0]
+    scene_terms = _scene_concepts(theme_words + topics)
+    queries: list[str] = []
+
+    if expansion_level == 0:
+        queries.extend(
+            (
+                _clean_query([*base[:6], *moods[:2], "cinematic"]),
+                _clean_query([anchor, scene_terms[0], *palette[:2]]),
+                _clean_query([anchor, scene_terms[1], *motion[:2], *scale[:1]]),
+                _clean_query([anchor, *audio[:2], scene_terms[2]]),
+            )
+        )
+    elif expansion_level == 1:
+        synonyms: list[str] = []
+        for term in theme_words[:4]:
+            synonyms.extend(_WORD_SYNONYMS.get(term, ()))
+        synonyms = _unique_terms(synonyms) or ["visual", "cinematic", "authentic"]
+        queries.extend(
+            (
+                _clean_query([*synonyms[:3], scene_terms[0]]),
+                _clean_query([*theme_words[:2], scene_terms[2], "wide shot"]),
+                _clean_query([*theme_words[:2], scene_terms[3], "close up"]),
+                _clean_query([*synonyms[1:4], *moods[:2]]),
+            )
+        )
+    else:
+        # The final expansion deliberately broadens visual concepts while keeping
+        # the theme anchor so sparse subjects still return usable alternatives.
+        queries.extend(
+            (
+                _clean_query([anchor, "aerial wide view"]),
+                _clean_query([anchor, "close detail texture"]),
+                _clean_query([anchor, "people authentic lifestyle"]),
+                _clean_query([anchor, "environment atmosphere motion"]),
+                _clean_query(theme_words[:2]),
+            )
+        )
+    return _unique_terms(query for query in queries if query)[:6]
+
+
+def _search_cache_path(cache_dir: Path, query: str, page: int, per_page: int) -> Path:
+    identity = json.dumps(
+        {"endpoint": PIXABAY_VIDEO_API, "query": query, "page": page, "per_page": per_page},
+        sort_keys=True,
+        ensure_ascii=True,
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return cache_dir / "pixabay" / "search" / f"{digest}.json"
+
+
+def _pixabay_search(
+    session: requests.Session,
+    api_key: str,
+    query: str,
+    cache_dir: Path,
+    per_page: int,
+    page: int = 1,
+) -> tuple[dict[str, Any], bool]:
+    cache_path = _search_cache_path(cache_dir, query, page, per_page)
+    now = time.time()
+    cached = _read_json(cache_path, {})
+    if isinstance(cached, Mapping):
+        cached_at = float(cached.get("cached_at_epoch", 0) or 0)
+        data = cached.get("response")
+        if now - cached_at <= CACHE_TTL_SECONDS and isinstance(data, Mapping):
+            return dict(data), True
+
+    params = {
+        "key": api_key,
+        "q": query,
+        "lang": "en",
+        "video_type": "all",
+        "safesearch": "true",
+        "order": "popular",
+        "page": page,
+        "per_page": max(3, min(200, int(per_page))),
+    }
+    try:
+        with _suppress_sensitive_http_debug():
+            response = session.get(PIXABAY_VIDEO_API, params=params, timeout=REQUEST_TIMEOUT)
+        status = response.status_code
+        if status != 200:
+            # Never interpolate response.url: it contains the credential.
+            body_hint = ""
+            try:
+                body = response.json()
+                if isinstance(body, Mapping):
+                    body_hint = str(body.get("message") or body.get("error") or "")
+            except (ValueError, TypeError):
+                pass
+            raise PixabayPipelineError(
+                f"Pixabay API returned HTTP {status}"
+                + (f": {_safe_error(body_hint, api_key)}" if body_hint else "")
+            )
+        payload = response.json()
+        if not isinstance(payload, Mapping):
+            raise PixabayPipelineError("Pixabay API returned an unexpected response shape")
+    except PixabayPipelineError:
+        raise
+    except requests.RequestException as exc:
+        raise PixabayPipelineError(f"Pixabay API request failed: {_safe_error(exc, api_key)}") from None
+    except ValueError as exc:
+        raise PixabayPipelineError(f"Pixabay API returned invalid JSON: {_safe_error(exc, api_key)}") from None
+
+    clean_payload = _strip_secrets(dict(payload), api_key)
+    _atomic_write_json(
+        cache_path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "cached_at": _utc_now(),
+            "cached_at_epoch": now,
+            "ttl_seconds": CACHE_TTL_SECONDS,
+            "query": query,
+            "page": page,
+            "per_page": per_page,
+            "response": clean_payload,
+        },
+        api_key,
+    )
+    return dict(clean_payload), False
+
+
+def _variant_for_hit(hit: Mapping[str, Any], min_resolution: tuple[int, int]) -> dict[str, Any] | None:
+    videos = hit.get("videos")
+    if not isinstance(videos, Mapping):
+        return None
+    variants: list[dict[str, Any]] = []
+    for name, raw in videos.items():
+        if not isinstance(raw, Mapping) or not raw.get("url"):
+            continue
+        try:
+            width = int(raw.get("width") or 0)
+            height = int(raw.get("height") or 0)
+            size = int(raw.get("size") or 0)
+        except (TypeError, ValueError):
+            continue
+        variants.append(
+            {
+                "name": str(name),
+                "url": str(raw["url"]),
+                "width": width,
+                "height": height,
+                "size": size,
+                "thumbnail": raw.get("thumbnail"),
+            }
+        )
+    if not variants:
+        return None
+    min_long, min_short = sorted(min_resolution, reverse=True)
+
+    def adequate(item: Mapping[str, Any]) -> bool:
+        long_side, short_side = sorted((int(item["width"]), int(item["height"])), reverse=True)
+        return long_side >= min_long and short_side >= min_short
+
+    hd = [item for item in variants if adequate(item)]
+    pool = hd or variants
+    # Pixabay's largest available variant is the final HD choice; it is not
+    # fetched until the candidate survives all pre-download ranking.
+    return max(pool, key=lambda item: (item["width"] * item["height"], item["size"]))
+
+
+def _thumbnail_url(hit: Mapping[str, Any], variant: Mapping[str, Any]) -> str | None:
+    if isinstance(variant.get("thumbnail"), str):
+        return str(variant["thumbnail"])
+    videos = hit.get("videos")
+    if isinstance(videos, Mapping):
+        for raw in videos.values():
+            if isinstance(raw, Mapping) and isinstance(raw.get("thumbnail"), str):
+                return str(raw["thumbnail"])
+    picture_id = hit.get("picture_id")
+    if picture_id and re.fullmatch(r"[A-Za-z0-9_-]+", str(picture_id)):
+        return f"https://i.vimeocdn.com/video/{picture_id}_640x360.jpg"
+    return None
+
+
+def _target_color(style_profile: Mapping[str, Any] | None) -> dict[str, float]:
+    style_profile = _style_payload(style_profile)
+    words = _collect_profile_words(style_profile, ("color", "colour", "palette", "grade", "tone", "lighting"))
+    joined = " ".join(words)
+    hue = 30.0
+    saturation = 0.48
+    value = 0.58
+    if any(word in joined for word in ("blue", "cyan", "cool", "teal")):
+        hue = 205.0
+    elif any(word in joined for word in ("green", "forest", "nature")):
+        hue = 115.0
+    elif any(word in joined for word in ("purple", "violet", "magenta")):
+        hue = 285.0
+    elif any(word in joined for word in ("red", "orange", "warm", "golden")):
+        hue = 28.0
+    if any(word in joined for word in ("monochrome", "muted", "desaturated")):
+        saturation = 0.23
+    elif any(word in joined for word in ("vibrant", "saturated", "colorful")):
+        saturation = 0.78
+    if any(word in joined for word in ("dark", "low key", "moody", "night")):
+        value = 0.34
+    elif any(word in joined for word in ("bright", "high key", "airy")):
+        value = 0.76
+    brightness_values = _number_values(style_profile, ("brightness",))
+    saturation_values = _number_values(style_profile, ("saturation",))
+    warmth_values = _number_values(style_profile, ("warmth_index", "warmth"))
+    if brightness_values:
+        observed = float(np.median(brightness_values))
+        value = float(np.clip(observed / 255.0 if observed > 1.0 else observed, 0.08, 0.95))
+    if saturation_values:
+        observed = float(np.median(saturation_values))
+        saturation = float(np.clip(observed / 255.0 if observed > 1.0 else observed, 0.05, 0.95))
+    if warmth_values:
+        warmth = float(np.median(warmth_values))
+        if warmth > 0.12:
+            hue = 28.0
+        elif warmth < -0.12:
+            hue = 205.0
+    return {"hue_degrees": hue, "saturation": saturation, "value": value}
+
+
+def _color_similarity(hue: float, saturation: float, value: float, target: Mapping[str, float]) -> float:
+    hue_distance = abs(hue - float(target["hue_degrees"])) % 360.0
+    hue_distance = min(hue_distance, 360.0 - hue_distance) / 180.0
+    sat_distance = abs(saturation - float(target["saturation"]))
+    val_distance = abs(value - float(target["value"]))
+    return float(np.clip(1.0 - (0.45 * hue_distance + 0.25 * sat_distance + 0.30 * val_distance), 0.0, 1.0))
+
+
+def _image_signals(image_bgr: np.ndarray, target_color: Mapping[str, float]) -> dict[str, Any]:
+    if image_bgr is None or image_bgr.size == 0:
+        return {
+            "available": False,
+            "sharpness_score": 0.5,
+            "exposure_score": 0.5,
+            "color_score": 0.5,
+            "text_watermark_risk": 0.5,
+            "perceptual_hash": None,
+        }
+    height, width = image_bgr.shape[:2]
+    scale = min(1.0, 640.0 / max(width, height))
+    if scale < 1.0:
+        image_bgr = cv2.resize(image_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    sharpness_raw = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    sharpness_score = float(np.clip(math.log1p(sharpness_raw) / math.log1p(900.0), 0.0, 1.0))
+    mean_luma = float(gray.mean())
+    clipped = float(np.mean((gray <= 5) | (gray >= 250)))
+    exposure_score = float(np.clip(1.0 - abs(mean_luma - 128.0) / 128.0 - clipped * 1.8, 0.0, 1.0))
+    hue = float(np.median(hsv[..., 0])) * 2.0
+    saturation = float(np.mean(hsv[..., 1])) / 255.0
+    value = float(np.mean(hsv[..., 2])) / 255.0
+    color_score = _color_similarity(hue, saturation, value, target_color)
+    edges = cv2.Canny(gray, 90, 180) > 0
+    h, w = edges.shape
+    border = np.zeros_like(edges, dtype=bool)
+    border[: max(1, h // 6), :] = True
+    border[-max(1, h // 6) :, :] = True
+    border[:, : max(1, w // 8)] = True
+    border[:, -max(1, w // 8) :] = True
+    border_density = float(edges[border].mean()) if np.any(border) else 0.0
+    center_density = float(edges[~border].mean()) if np.any(~border) else border_density
+    text_risk = float(np.clip((border_density - center_density * 0.75) * 5.0, 0.0, 1.0))
+    pil_image = Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
+    phash = str(imagehash.phash(pil_image))
+    return {
+        "available": True,
+        "width": int(image_bgr.shape[1]),
+        "height": int(image_bgr.shape[0]),
+        "sharpness_raw": round(sharpness_raw, 3),
+        "sharpness_score": round(sharpness_score, 4),
+        "mean_luma": round(mean_luma, 3),
+        "exposure_score": round(exposure_score, 4),
+        "mean_hsv": {"hue_degrees": round(hue, 2), "saturation": round(saturation, 4), "value": round(value, 4)},
+        "color_score": round(color_score, 4),
+        "text_watermark_risk": round(text_risk, 4),
+        "perceptual_hash": phash,
+    }
+
+
+def _get_thumbnail_signals(
+    session: requests.Session,
+    hit: Mapping[str, Any],
+    variant: Mapping[str, Any],
+    cache_dir: Path,
+    target_color: Mapping[str, float],
+) -> dict[str, Any]:
+    asset_id = str(hit.get("id") or hashlib.sha1(str(hit).encode("utf-8")).hexdigest()[:12])
+    thumb_path = cache_dir / "pixabay" / "thumbnails" / f"{asset_id}.jpg"
+    data: bytes | None = None
+    if thumb_path.is_file() and time.time() - thumb_path.stat().st_mtime <= CACHE_TTL_SECONDS:
+        try:
+            data = thumb_path.read_bytes()
+        except OSError:
+            data = None
+    if data is None:
+        url = _thumbnail_url(hit, variant)
+        if url:
+            try:
+                response = session.get(url, timeout=REQUEST_TIMEOUT)
+                if response.status_code == 200 and response.content and len(response.content) <= 10 * 1024 * 1024:
+                    data = response.content
+                    thumb_path.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        thumb_path.write_bytes(data)
+                    except OSError:
+                        pass
+            except requests.RequestException:
+                data = None
+    if not data:
+        return _image_signals(np.empty((0, 0, 3), dtype=np.uint8), target_color)
+    array = np.frombuffer(data, dtype=np.uint8)
+    image = cv2.imdecode(array, cv2.IMREAD_COLOR)
+    return _image_signals(image, target_color)
+
+
+def _infer_shot_type(tags: str) -> str:
+    text = tags.lower()
+    if any(term in text for term in ("aerial", "drone", "bird view", "overhead")):
+        return "aerial"
+    if any(term in text for term in ("macro", "close up", "close-up", "detail")):
+        return "close_up"
+    if any(term in text for term in ("wide", "landscape", "panorama", "skyline")):
+        return "wide"
+    if any(term in text for term in ("portrait", "face", "person", "people", "woman", "man")):
+        return "medium_portrait"
+    if any(term in text for term in ("pov", "point of view", "tracking")):
+        return "pov_tracking"
+    return "medium"
+
+
+def _infer_shot_scale(tags: str) -> str:
+    shot_type = _infer_shot_type(tags)
+    return {
+        "aerial": "extreme_wide",
+        "wide": "wide",
+        "close_up": "close_up",
+        "medium_portrait": "medium",
+        "pov_tracking": "medium",
+        "medium": "medium",
+    }[shot_type]
+
+
+def _motion_tag_score(tags: str) -> float:
+    text = tags.lower()
+    strong = ("fast", "action", "running", "driving", "waves", "timelapse", "time lapse", "dynamic", "tracking")
+    gentle = ("slow motion", "calm", "still", "quiet", "static")
+    score = 0.5 + 0.09 * sum(term in text for term in strong) - 0.08 * sum(term in text for term in gentle)
+    return float(np.clip(score, 0.05, 0.95))
+
+
+def _desired_motion(style_profile: Mapping[str, Any] | None, audio_profile: Mapping[str, Any] | None) -> float:
+    style_profile = _style_payload(style_profile)
+    audio_profile = _audio_payload(audio_profile)
+    words = " ".join(
+        _collect_profile_words(style_profile, ("motion", "movement", "pace", "editing"))
+        + _audio_descriptors(audio_profile)
+    )
+    desired = 0.5
+    if any(term in words for term in ("fast", "dynamic", "energetic", "intense", "rapid")):
+        desired = 0.78
+    if any(term in words for term in ("slow", "calm", "gentle", "serene", "static")):
+        desired = 0.28
+    return desired
+
+
+def _token_set(values: Iterable[str]) -> set[str]:
+    tokens: set[str] = set()
+    for value in values:
+        tokens.update(_english_words(value))
+    return tokens
+
+
+def _metadata_score(
+    candidate: Mapping[str, Any],
+    theme: str,
+    style_profile: Mapping[str, Any] | None,
+    audio_profile: Mapping[str, Any] | None,
+    target_ratio: float,
+    min_resolution: tuple[int, int],
+) -> tuple[float, dict[str, float]]:
+    variant = candidate["variant"]
+    tags = str(candidate.get("tags") or "")
+    tag_tokens = _token_set([tags])
+    style_profile = _style_payload(style_profile)
+    audio_profile = _audio_payload(audio_profile)
+    relevant = _token_set(
+        [theme]
+        + _theme_terms(theme)
+        + _collect_profile_words(
+            style_profile,
+            ("topic", "subject", "content", "tag", "mood", "positive_terms", "shot_scale_terms"),
+        )[:20]
+        + list(candidate.get("matched_queries", []))
+    )
+    if relevant:
+        coverage = len(tag_tokens & relevant) / max(1, min(7, len(relevant)))
+        query_hits = sum(bool(tag_tokens & _token_set([query])) for query in candidate.get("matched_queries", []))
+        relevance = float(np.clip(0.15 + coverage * 0.72 + min(0.13, query_hits * 0.04), 0.0, 1.0))
+    else:
+        relevance = 0.4
+    avoid_tokens = _token_set(
+        _collect_profile_words(style_profile, ("avoid_terms", "negative_terms"))
+    )
+    avoid_matches = len(tag_tokens & avoid_tokens)
+    avoid_penalty = float(min(0.6, avoid_matches * 0.15))
+    relevance = float(np.clip(relevance * (1.0 - avoid_penalty), 0.0, 1.0))
+    width = int(variant.get("width") or 0)
+    height = int(variant.get("height") or 0)
+    long_side, short_side = sorted((width, height), reverse=True)
+    min_long, min_short = sorted(min_resolution, reverse=True)
+    resolution = float(np.clip(min(long_side / max(1, min_long), short_side / max(1, min_short)), 0.0, 1.0))
+    ratio = width / max(1, height)
+    aspect = float(math.exp(-0.85 * abs(math.log(max(0.01, ratio) / max(0.01, target_ratio)))))
+    likes = max(0, int(candidate.get("likes") or 0))
+    views = max(0, int(candidate.get("views") or 0))
+    downloads = max(0, int(candidate.get("downloads") or 0))
+    popularity = float(
+        np.clip(0.45 * math.log1p(downloads) / math.log(100_001) + 0.35 * math.log1p(views) / math.log(1_000_001) + 0.20 * min(1.0, likes / 1000.0), 0.0, 1.0)
+    )
+    duration = float(candidate.get("duration") or 0)
+    duration_score = float(np.clip(duration / 6.0, 0.0, 1.0) * np.clip((90.0 - duration) / 45.0, 0.3, 1.0))
+    motion = _motion_tag_score(tags)
+    desired = _desired_motion(style_profile, audio_profile)
+    motion_style = float(np.clip(1.0 - abs(motion - desired), 0.0, 1.0))
+    components = {
+        "relevance": relevance,
+        "resolution": resolution,
+        "aspect": aspect,
+        "popularity": popularity,
+        "duration": duration_score,
+        "motion_style": motion_style,
+        "avoid_penalty": avoid_penalty,
+    }
+    score = (
+        0.40 * relevance
+        + 0.18 * resolution
+        + 0.15 * aspect
+        + 0.10 * popularity
+        + 0.06 * duration_score
+        + 0.11 * motion_style
+    )
+    return float(score), {key: round(value, 4) for key, value in components.items()}
+
+
+def _score_candidates(
+    session: requests.Session,
+    candidates: list[dict[str, Any]],
+    theme: str,
+    style_profile: Mapping[str, Any] | None,
+    audio_profile: Mapping[str, Any] | None,
+    cache_dir: Path,
+    target_ratio: float,
+    min_resolution: tuple[int, int],
+    desired_count: int,
+) -> list[dict[str, Any]]:
+    for candidate in candidates:
+        score, components = _metadata_score(
+            candidate, theme, style_profile, audio_profile, target_ratio, min_resolution
+        )
+        candidate["metadata_score"] = round(score, 6)
+        candidate["score_components"] = components
+    candidates.sort(key=lambda item: item["metadata_score"], reverse=True)
+    target_color = _target_color(style_profile)
+    inspect_count = min(len(candidates), max(24, desired_count * 8))
+    for index, candidate in enumerate(candidates):
+        if index < inspect_count:
+            thumbnail = _get_thumbnail_signals(session, candidate["raw"], candidate["variant"], cache_dir, target_color)
+        else:
+            thumbnail = _image_signals(np.empty((0, 0, 3), dtype=np.uint8), target_color)
+        candidate["thumbnail_signals"] = thumbnail
+        quality = 0.42 * float(thumbnail["sharpness_score"]) + 0.38 * float(thumbnail["exposure_score"]) + 0.20 * (1.0 - float(thumbnail["text_watermark_risk"]))
+        candidate["score_components"].update(
+            {
+                "thumbnail_quality": round(quality, 4),
+                "color": round(float(thumbnail["color_score"]), 4),
+            }
+        )
+        # Reweight metadata components after thumbnail inspection.
+        pre_score = (
+            0.32 * candidate["score_components"]["relevance"]
+            + 0.15 * candidate["score_components"]["resolution"]
+            + 0.12 * candidate["score_components"]["aspect"]
+            + 0.07 * candidate["score_components"]["popularity"]
+            + 0.04 * candidate["score_components"]["duration"]
+            + 0.09 * candidate["score_components"]["motion_style"]
+            + 0.13 * quality
+            + 0.08 * float(thumbnail["color_score"])
+        )
+        candidate["pre_score"] = round(float(pre_score), 6)
+        candidate["shot_type"] = _infer_shot_type(str(candidate.get("tags") or ""))
+        candidate["shot_scale"] = _infer_shot_scale(str(candidate.get("tags") or ""))
+        candidate["motion_score_estimate"] = round(_motion_tag_score(str(candidate.get("tags") or "")), 4)
+    return _diversified_order(candidates)
+
+
+def _diversified_order(candidates: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    remaining = list(candidates)
+    ordered: list[dict[str, Any]] = []
+    shot_counts: Counter[str] = Counter()
+    author_counts: Counter[str] = Counter()
+    query_counts: Counter[str] = Counter()
+    seen_hashes: list[str] = []
+    while remaining:
+        best_index = 0
+        best_adjusted = -99.0
+        for index, item in enumerate(remaining):
+            adjusted = float(item.get("pre_score", 0))
+            adjusted -= 0.055 * shot_counts[str(item.get("shot_type"))]
+            adjusted -= 0.025 * author_counts[str(item.get("user") or "")]
+            matched = list(item.get("matched_queries") or [])
+            if matched:
+                adjusted -= 0.012 * min(query_counts[query] for query in matched)
+            phash = item.get("thumbnail_signals", {}).get("perceptual_hash")
+            if phash and any(_hash_distance(phash, previous) <= 5 for previous in seen_hashes):
+                adjusted -= 0.18
+            if adjusted > best_adjusted:
+                best_index, best_adjusted = index, adjusted
+        chosen = remaining.pop(best_index)
+        chosen["diversity_adjusted_score"] = round(best_adjusted, 6)
+        ordered.append(chosen)
+        shot_counts[str(chosen.get("shot_type"))] += 1
+        author_counts[str(chosen.get("user") or "")] += 1
+        for query in chosen.get("matched_queries") or []:
+            query_counts[query] += 1
+        phash = chosen.get("thumbnail_signals", {}).get("perceptual_hash")
+        if phash:
+            seen_hashes.append(str(phash))
+    return ordered
+
+
+def _hash_distance(left: str, right: str) -> int:
+    try:
+        return int(imagehash.hex_to_hash(str(left)) - imagehash.hex_to_hash(str(right)))
+    except (ValueError, TypeError):
+        return 999
+
+
+def _collect_candidates(
+    session: requests.Session,
+    api_key: str,
+    theme: str,
+    style_profile: Mapping[str, Any] | None,
+    audio_profile: Mapping[str, Any] | None,
+    cache_dir: Path,
+    desired_count: int,
+    min_resolution: tuple[int, int],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    candidates_by_id: dict[str, dict[str, Any]] = {}
+    search_rounds: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    target_pool = max(18, desired_count * 4)
+    per_page = min(100, max(20, desired_count * 5))
+
+    for round_index in range(3):
+        queries = generate_visual_queries(theme, style_profile, audio_profile, round_index)
+        round_record: dict[str, Any] = {
+            "round": round_index + 1,
+            "expansion_level": round_index,
+            "reason": "initial style and music queries" if round_index == 0 else "candidate pool below target; expanded synonyms, scenes, and visual concepts",
+            "queries": [],
+            "pool_before": len(candidates_by_id),
+        }
+        for query in queries:
+            query_record: dict[str, Any] = {"query": query, "query_length": len(query)}
+            try:
+                payload, cache_hit = _pixabay_search(session, api_key, query, cache_dir, per_page)
+                hits = payload.get("hits") if isinstance(payload, Mapping) else []
+                if not isinstance(hits, list):
+                    hits = []
+                added = 0
+                for raw in hits:
+                    if not isinstance(raw, Mapping) or raw.get("id") is None:
+                        continue
+                    variant = _variant_for_hit(raw, min_resolution)
+                    if variant is None:
+                        continue
+                    asset_id = str(raw["id"])
+                    if asset_id not in candidates_by_id:
+                        candidates_by_id[asset_id] = {
+                            "id": int(raw["id"]) if str(raw["id"]).isdigit() else asset_id,
+                            "pixabay_id": int(raw["id"]) if str(raw["id"]).isdigit() else asset_id,
+                            "page_url": str(raw.get("pageURL") or raw.get("page_url") or ""),
+                            "tags": str(raw.get("tags") or ""),
+                            "duration": float(raw.get("duration") or 0),
+                            "user": str(raw.get("user") or ""),
+                            "user_id": raw.get("user_id"),
+                            "views": int(raw.get("views") or 0),
+                            "downloads": int(raw.get("downloads") or 0),
+                            "likes": int(raw.get("likes") or 0),
+                            "comments": int(raw.get("comments") or 0),
+                            "variant": variant,
+                            "matched_queries": [query],
+                            "search_rounds": [round_index + 1],
+                            "raw": dict(raw),
+                        }
+                        added += 1
+                    else:
+                        existing = candidates_by_id[asset_id]
+                        if query not in existing["matched_queries"]:
+                            existing["matched_queries"].append(query)
+                        if round_index + 1 not in existing["search_rounds"]:
+                            existing["search_rounds"].append(round_index + 1)
+                query_record.update(
+                    {
+                        "status": "ok",
+                        "cache_hit": cache_hit,
+                        "api_total_hits": int(payload.get("totalHits") or payload.get("total") or len(hits)),
+                        "returned_hits": len(hits),
+                        "new_unique_candidates": added,
+                    }
+                )
+            except PixabayPipelineError as exc:
+                safe = _safe_error(exc, api_key)
+                query_record.update({"status": "error", "error": safe, "cache_hit": False})
+                errors.append({"round": round_index + 1, "query": query, "error": safe})
+            round_record["queries"].append(query_record)
+        round_record["pool_after"] = len(candidates_by_id)
+        round_record["new_unique_candidates"] = len(candidates_by_id) - round_record["pool_before"]
+        search_rounds.append(round_record)
+        if len(candidates_by_id) >= target_pool:
+            round_record["stop_reason"] = "candidate pool target reached"
+            break
+        round_record["stop_reason"] = "continue with broader terms" if round_index < 2 else "maximum expansion reached"
+
+    if not candidates_by_id and errors:
+        raise PixabayPipelineError(f"All Pixabay searches failed; first error: {errors[0]['error']}")
+    return list(candidates_by_id.values()), search_rounds, errors
+
+
+def _find_media_executable(name: str) -> str:
+    """Find FFmpeg tools on PATH or in the standard Windows winget location."""
+
+    explicit = os.environ.get(f"{name.upper()}_BIN", "").strip()
+    if explicit and Path(explicit).is_file():
+        return explicit
+    found = shutil.which(name)
+    if found:
+        return found
+    local_app_data = Path(os.environ.get("LOCALAPPDATA", ""))
+    if local_app_data.is_dir():
+        package_root = local_app_data / "Microsoft" / "WinGet" / "Packages"
+        matches = sorted(
+            package_root.glob(f"Gyan.FFmpeg_*/*/bin/{name}.exe"),
+            key=lambda item: item.stat().st_mtime if item.exists() else 0,
+            reverse=True,
+        )
+        if matches:
+            return str(matches[0])
+    raise PixabayPipelineError(
+        f"{name} was not found; add it to PATH or set {name.upper()}_BIN"
+    )
+
+
+def _ffprobe(path: Path) -> dict[str, Any]:
+    command = [
+        _find_media_executable("ffprobe"), "-v", "error", "-show_entries",
+        "stream=index,codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,duration:format=duration,size,bit_rate",
+        "-of", "json", str(path),
+    ]
+    try:
+        process = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=45, check=False)
+    except FileNotFoundError:
+        raise PixabayPipelineError("ffprobe executable disappeared before media inspection") from None
+    except subprocess.TimeoutExpired:
+        raise PixabayPipelineError("ffprobe timed out while checking a downloaded video") from None
+    if process.returncode != 0:
+        raise PixabayPipelineError(f"ffprobe rejected downloaded video: {_safe_error(process.stderr)}")
+    try:
+        payload = json.loads(process.stdout)
+    except ValueError:
+        raise PixabayPipelineError("ffprobe returned invalid JSON") from None
+    if not isinstance(payload, Mapping):
+        raise PixabayPipelineError("ffprobe returned an unexpected response")
+    return dict(payload)
+
+
+def _sample_video_frames(path: Path, max_samples: int = 24) -> tuple[list[np.ndarray], float, float]:
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        return [], 0.0, 0.0
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+    duration = frame_count / fps if frame_count > 0 and fps > 0 else 0.0
+    samples = max(3, min(max_samples, frame_count if frame_count > 0 else max_samples))
+    positions = np.linspace(0, max(0, frame_count - 1), samples).astype(int) if frame_count > 0 else np.arange(samples) * max(1, int(fps or 25))
+    frames: list[np.ndarray] = []
+    for position in positions:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, int(position))
+        ok, frame = capture.read()
+        if ok and frame is not None and frame.size:
+            max_side = max(frame.shape[:2])
+            if max_side > 640:
+                scale = 640.0 / max_side
+                frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            frames.append(frame)
+    capture.release()
+    return frames, fps, duration
+
+
+def _motion_and_stability(frames: Sequence[np.ndarray]) -> tuple[float, float, dict[str, float]]:
+    if len(frames) < 2:
+        return 0.0, 0.5, {"mean_flow": 0.0, "flow_jitter": 0.0}
+    flows: list[float] = []
+    translations: list[tuple[float, float]] = []
+    previous = cv2.cvtColor(cv2.resize(frames[0], (320, 180)), cv2.COLOR_BGR2GRAY)
+    for frame in frames[1:]:
+        current = cv2.cvtColor(cv2.resize(frame, (320, 180)), cv2.COLOR_BGR2GRAY)
+        flow = cv2.calcOpticalFlowFarneback(previous, current, None, 0.5, 3, 15, 2, 5, 1.1, 0)
+        magnitude = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
+        flows.append(float(np.median(magnitude)))
+        translations.append((float(np.median(flow[..., 0])), float(np.median(flow[..., 1]))))
+        previous = current
+    mean_flow = float(np.mean(flows)) if flows else 0.0
+    motion_score = float(np.clip(math.log1p(mean_flow) / math.log(8.0), 0.0, 1.0))
+    if len(translations) >= 3:
+        array = np.asarray(translations, dtype=np.float32)
+        acceleration = np.diff(array, axis=0)
+        jitter = float(np.mean(np.linalg.norm(acceleration, axis=1)))
+    else:
+        jitter = 0.0
+    stability_score = float(np.clip(math.exp(-jitter / 2.8), 0.0, 1.0))
+    return motion_score, stability_score, {"mean_flow": round(mean_flow, 4), "flow_jitter": round(jitter, 4)}
+
+
+def _watermark_risk(frames: Sequence[np.ndarray]) -> float:
+    if not frames:
+        return 0.5
+    edge_maps: list[np.ndarray] = []
+    for frame in frames[:16]:
+        gray = cv2.cvtColor(cv2.resize(frame, (320, 180)), cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 100, 200) > 0
+        edge_maps.append(edges)
+    persistence = np.mean(np.stack(edge_maps, axis=0), axis=0)
+    h, w = persistence.shape
+    border = np.zeros((h, w), dtype=bool)
+    border[: h // 4, :] = True
+    border[-h // 4 :, :] = True
+    border[:, : w // 5] = True
+    border[:, -w // 5 :] = True
+    persistent_border = float(np.mean(persistence[border] >= 0.72))
+    persistent_center = float(np.mean(persistence[~border] >= 0.72)) if np.any(~border) else 0.0
+    # Repeated high-contrast shapes near an edge are a useful but intentionally
+    # conservative text/logo heuristic; it does not perform OCR.
+    return float(np.clip((persistent_border - persistent_center * 0.55) * 14.0, 0.0, 1.0))
+
+
+def _video_fingerprint(path: Path, frames: Sequence[np.ndarray], duration: float, width: int, height: int) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    phashes: list[str] = []
+    if frames:
+        indices = sorted(set((0, len(frames) // 4, len(frames) // 2, (3 * len(frames)) // 4, len(frames) - 1)))
+        for index in indices:
+            rgb = cv2.cvtColor(frames[index], cv2.COLOR_BGR2RGB)
+            phashes.append(str(imagehash.phash(Image.fromarray(rgb))))
+    return {
+        "sha256": digest.hexdigest(),
+        "perceptual_hashes": phashes,
+        "duration_seconds": round(float(duration), 4),
+        "width": int(width),
+        "height": int(height),
+        "size_bytes": int(path.stat().st_size),
+    }
+
+
+def _fingerprint_duplicate(fingerprint: Mapping[str, Any], entries: Sequence[Mapping[str, Any]]) -> tuple[bool, str | None, float | None]:
+    sha256 = str(fingerprint.get("sha256") or "")
+    hashes = [str(value) for value in fingerprint.get("perceptual_hashes") or []]
+    duration = float(fingerprint.get("duration_seconds") or 0.0)
+    for entry in entries:
+        previous = entry.get("fingerprint") if isinstance(entry.get("fingerprint"), Mapping) else entry
+        if sha256 and sha256 == str(previous.get("sha256") or ""):
+            return True, str(entry.get("pixabay_id") or entry.get("local_path") or "exact_sha256"), 0.0
+        previous_hashes = [str(value) for value in previous.get("perceptual_hashes") or []]
+        previous_duration = float(previous.get("duration_seconds") or 0.0)
+        if not hashes or not previous_hashes or duration <= 0 or previous_duration <= 0:
+            continue
+        duration_delta = abs(duration - previous_duration) / max(duration, previous_duration)
+        if duration_delta > 0.12:
+            continue
+        count = min(len(hashes), len(previous_hashes))
+        distances = [_hash_distance(hashes[index], previous_hashes[index]) for index in range(count)]
+        median_distance = float(np.median(distances)) if distances else 999.0
+        if median_distance <= 7.0:
+            return True, str(entry.get("pixabay_id") or entry.get("local_path") or "perceptual"), median_distance
+    return False, None, None
+
+
+def _video_quality(
+    path: Path,
+    style_profile: Mapping[str, Any] | None,
+    min_resolution: tuple[int, int],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    probe = _ffprobe(path)
+    video_stream = next(
+        (stream for stream in probe.get("streams", []) if isinstance(stream, Mapping) and stream.get("codec_type") == "video"),
+        None,
+    )
+    if not isinstance(video_stream, Mapping):
+        raise PixabayPipelineError("Downloaded asset has no video stream")
+    width = int(video_stream.get("width") or 0)
+    height = int(video_stream.get("height") or 0)
+    duration = float(video_stream.get("duration") or probe.get("format", {}).get("duration") or 0.0)
+    frames, fps, decoded_duration = _sample_video_frames(path)
+    if duration <= 0:
+        duration = decoded_duration
+    if len(frames) < 2:
+        raise PixabayPipelineError("Downloaded asset could not be decoded into enough frames")
+    target_color = _target_color(style_profile)
+    per_frame = [_image_signals(frame, target_color) for frame in frames]
+    sharpness = float(np.mean([item["sharpness_score"] for item in per_frame]))
+    exposure = float(np.mean([item["exposure_score"] for item in per_frame]))
+    color = float(np.mean([item["color_score"] for item in per_frame]))
+    motion, stability, motion_raw = _motion_and_stability(frames)
+    watermark = _watermark_risk(frames)
+    min_long, min_short = sorted(min_resolution, reverse=True)
+    long_side, short_side = sorted((width, height), reverse=True)
+    resolution_score = float(np.clip(min(long_side / max(1, min_long), short_side / max(1, min_short)), 0.0, 1.0))
+    overall = (
+        0.23 * sharpness
+        + 0.20 * exposure
+        + 0.15 * stability
+        + 0.13 * color
+        + 0.13 * resolution_score
+        + 0.08 * (1.0 - watermark)
+        + 0.08 * (0.55 + 0.45 * motion)
+    )
+    reasons: list[str] = []
+    if long_side < min_long or short_side < min_short:
+        reasons.append(f"resolution below {min_resolution[0]}x{min_resolution[1]}")
+    if duration < 0.8:
+        reasons.append("duration below 0.8 seconds")
+    if sharpness < 0.22:
+        reasons.append("low sharpness")
+    if exposure < 0.22:
+        reasons.append("severe under/over exposure")
+    if stability < 0.12:
+        reasons.append("strongly unstable motion")
+    if watermark > 0.86:
+        reasons.append("persistent edge text/logo heuristic triggered")
+    if overall < 0.34:
+        reasons.append("overall quality score below threshold")
+    quality = {
+        "passed": not reasons,
+        "rejection_reasons": reasons,
+        "overall_score": round(float(overall), 4),
+        "resolution_score": round(resolution_score, 4),
+        "sharpness_score": round(sharpness, 4),
+        "exposure_score": round(exposure, 4),
+        "stability_score": round(stability, 4),
+        "text_watermark_risk": round(watermark, 4),
+        "motion_score": round(motion, 4),
+        "color_score": round(color, 4),
+        "mean_hsv": per_frame[len(per_frame) // 2].get("mean_hsv", {}),
+        "motion_signals": motion_raw,
+        "sampled_frames": len(frames),
+        "heuristic_notice": "Signal-derived estimates; text/logo detection is not OCR.",
+    }
+    fingerprint = _video_fingerprint(path, frames, duration, width, height)
+    media = {
+        "width": width,
+        "height": height,
+        "duration_seconds": round(duration, 4),
+        "fps": round(fps, 4),
+        "codec": str(video_stream.get("codec_name") or ""),
+        "size_bytes": int(path.stat().st_size),
+        "fingerprint": fingerprint,
+    }
+    return quality, media
+
+
+def _download_video(session: requests.Session, url: str, destination: Path, secret: str) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with session.get(url, timeout=DOWNLOAD_TIMEOUT, stream=True) as response:
+            if response.status_code != 200:
+                raise PixabayPipelineError(f"Video download returned HTTP {response.status_code}")
+            with destination.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        handle.write(chunk)
+        if not destination.is_file() or destination.stat().st_size < 64 * 1024:
+            raise PixabayPipelineError("Downloaded video is unexpectedly small")
+    except PixabayPipelineError:
+        destination.unlink(missing_ok=True)
+        raise
+    except (requests.RequestException, OSError) as exc:
+        destination.unlink(missing_ok=True)
+        raise PixabayPipelineError(f"Video download failed: {_safe_error(exc, secret)}") from None
+
+
+_TAG_CHINESE: tuple[tuple[str, str], ...] = (
+    ("aerial", "航拍"), ("drone", "航拍"), ("ocean", "海洋"), ("sea", "大海"),
+    ("wave", "海浪"), ("beach", "沙滩"), ("coast", "海岸"), ("sunset", "日落"),
+    ("sunrise", "日出"), ("mountain", "山峦"), ("forest", "森林"), ("river", "河流"),
+    ("waterfall", "瀑布"), ("city", "城市"), ("street", "街道"), ("building", "建筑"),
+    ("factory", "工厂"), ("industry", "工业"), ("machine", "机械"), ("welding", "焊接"),
+    ("worker", "工人"), ("technology", "科技"), ("digital", "数字科技"), ("car", "汽车"),
+    ("road", "道路"), ("train", "列车"), ("airplane", "飞机"), ("woman", "女性"),
+    ("man", "男性"), ("people", "人群"), ("family", "家庭"), ("child", "儿童"),
+    ("food", "美食"), ("cooking", "烹饪"), ("coffee", "咖啡"), ("sport", "运动"),
+    ("football", "足球"), ("basketball", "篮球"), ("animal", "动物"), ("wildlife", "野生动物"),
+    ("flower", "花朵"), ("rain", "雨景"), ("snow", "雪景"), ("night", "夜景"),
+    ("cloud", "云层"), ("sky", "天空"), ("close up", "特写"), ("macro", "微距"),
+    ("slow motion", "慢动作"), ("landscape", "风景"), ("nature", "自然"),
+)
+
+
+def _safe_chinese_slug(value: str, fallback: str = "主题") -> str:
+    value = unicodedata.normalize("NFKC", str(value)).strip()
+    value = re.sub(r"[<>:\"/\\|?*\x00-\x1f]", "_", value)
+    value = re.sub(r"\s+", "_", value)
+    value = re.sub(r"_+", "_", value).strip(" ._")
+    if not value:
+        value = fallback
+    reserved = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+    if value.upper() in reserved:
+        value = f"{fallback}_{value}"
+    return value[:48].rstrip(" ._") or fallback
+
+
+def material_theme_directory(material_root: str | os.PathLike[str], theme: str) -> Path:
+    """Resolve the exact directory that will receive downloaded theme assets."""
+
+    return Path(material_root).expanduser().resolve() / _safe_chinese_slug(theme, "未命名主题")
+
+
+def _chinese_description(tags: str, theme: str) -> str:
+    text = tags.lower()
+    labels: list[str] = []
+    for english, chinese in _TAG_CHINESE:
+        if english in text and chinese not in labels:
+            labels.append(chinese)
+        if len(labels) >= 3:
+            break
+    if not labels:
+        chinese_theme = "".join(re.findall(r"[\u3400-\u9fff]+", theme))
+        if chinese_theme:
+            labels.append(chinese_theme[:12])
+        else:
+            labels.append("主题画面")
+    return _safe_chinese_slug("_".join(labels), "主题画面")
+
+
+def _extension_from_url(url: str) -> str:
+    suffix = Path(urlparse(url).path).suffix.lower()
+    return suffix if suffix in {".mp4", ".mov", ".webm", ".m4v"} else ".mp4"
+
+
+def _load_fingerprint_library(path: Path) -> dict[str, Any]:
+    payload = _read_json(path, {})
+    if not isinstance(payload, Mapping):
+        payload = {}
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        entries = []
+    # Drop only entries whose recorded local path no longer exists.  Legacy
+    # entries without a path remain useful for exact fingerprint comparison.
+    cleaned = [
+        entry for entry in entries if isinstance(entry, Mapping) and (not entry.get("local_path") or Path(str(entry["local_path"])).is_file())
+    ]
+    return {"schema_version": SCHEMA_VERSION, "updated_at": _utc_now(), "entries": cleaned}
+
+
+def _public_candidate(candidate: Mapping[str, Any], decision: str = "ranked") -> dict[str, Any]:
+    variant = candidate.get("variant") if isinstance(candidate.get("variant"), Mapping) else {}
+    return {
+        "pixabay_id": candidate.get("pixabay_id") or candidate.get("id"),
+        "author": candidate.get("user") or "",
+        "page_url": candidate.get("page_url") or "",
+        "tags": candidate.get("tags") or "",
+        "duration_seconds": candidate.get("duration") or 0,
+        "search_queries": list(candidate.get("matched_queries") or []),
+        "search_rounds": list(candidate.get("search_rounds") or []),
+        "resolution": {"width": variant.get("width", 0), "height": variant.get("height", 0)},
+        "variant": variant.get("name"),
+        "pre_score": candidate.get("pre_score", 0),
+        "diversity_adjusted_score": candidate.get("diversity_adjusted_score", 0),
+        "score_components": candidate.get("score_components", {}),
+        "thumbnail_signals": candidate.get("thumbnail_signals", {}),
+        "shot_type": candidate.get("shot_type") or "medium",
+        "shot_scale": candidate.get("shot_scale") or "medium",
+        "motion_score_estimate": candidate.get("motion_score_estimate", 0.5),
+        "decision": decision,
+    }
+
+
+def _existing_usage(manifest_path: Path) -> dict[str, list[dict[str, Any]]]:
+    manifest = _read_json(manifest_path, {})
+    result: dict[str, list[dict[str, Any]]] = {}
+    if isinstance(manifest, Mapping):
+        for source in manifest.get("sources", []) or []:
+            if not isinstance(source, Mapping):
+                continue
+            intervals = source.get("usage_intervals") or source.get("actual_usage_intervals") or []
+            if not isinstance(intervals, list):
+                intervals = []
+            for identity in (source.get("pixabay_id"), source.get("id"), source.get("local_path")):
+                if identity not in (None, ""):
+                    result[str(identity)] = [dict(item) for item in intervals if isinstance(item, Mapping)]
+    return result
+
+
+def run_pixabay_pipeline(
+    theme: str,
+    style_profile: Mapping[str, Any] | None,
+    audio_profile: Mapping[str, Any] | None,
+    material_root: str | os.PathLike[str],
+    cache_dir: str | os.PathLike[str],
+    desired_count: int,
+    aspect_ratio: str,
+    min_resolution: tuple[int, int] = (1280, 720),
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Search, select, download, QA, deduplicate, and attribute Pixabay clips.
+
+    Only candidates that survive API metadata and thumbnail scoring are
+    downloaded.  Failed post-download QA causes the next ranked candidate to be
+    tried automatically.  Runtime artifacts never contain the API credential.
+    """
+
+    if not str(theme).strip():
+        raise ValueError("theme must not be empty")
+    desired_count = int(desired_count)
+    if desired_count <= 0:
+        raise ValueError("desired_count must be positive")
+    style_profile = _style_payload(style_profile)
+    audio_profile = _audio_payload(audio_profile)
+    min_resolution = _parse_resolution(min_resolution)
+    target_ratio, ratio_label = _parse_aspect_ratio(aspect_ratio)
+    _load_environment()
+    api_key = os.environ.get("PIXABAY_API_KEY", "").strip()
+    if not api_key:
+        raise PixabayPipelineError("PIXABAY_API_KEY is not set; put it in the project-root .env or environment")
+
+    cache_root = Path(cache_dir).expanduser().resolve()
+    theme_dir = material_theme_directory(material_root, theme)
+    theme_dir.mkdir(parents=True, exist_ok=True)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    manifest_path = theme_dir / "sources.json"
+    prior_usage = _existing_usage(manifest_path)
+    fingerprint_path = cache_root / "video_fingerprints.json"
+    fingerprint_library = _load_fingerprint_library(fingerprint_path)
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
+    candidates, search_rounds, search_errors = _collect_candidates(
+        session,
+        api_key,
+        theme,
+        style_profile,
+        audio_profile,
+        cache_root,
+        desired_count,
+        min_resolution,
+    )
+    ranked = _score_candidates(
+        session,
+        candidates,
+        theme,
+        style_profile,
+        audio_profile,
+        cache_root,
+        target_ratio,
+        min_resolution,
+        desired_count,
+    )
+    candidate_log = [_public_candidate(candidate) for candidate in ranked]
+    log_by_id = {str(item["pixabay_id"]): item for item in candidate_log}
+
+    selected: list[dict[str, Any]] = []
+    rejections: list[dict[str, Any]] = []
+    existing_entries = list(fingerprint_library["entries"])
+    known_by_id = {str(entry.get("pixabay_id")): entry for entry in existing_entries if entry.get("pixabay_id") is not None}
+
+    if dry_run:
+        for item in candidate_log[:desired_count]:
+            item["decision"] = "planned_dry_run"
+        status = "dry_run"
+    else:
+        for candidate in ranked:
+            if len(selected) >= desired_count:
+                break
+            asset_id = str(candidate["pixabay_id"])
+            log_item = log_by_id[asset_id]
+            known = known_by_id.get(asset_id)
+            if known and Path(str(known.get("local_path") or "")).is_file():
+                known_path = Path(str(known["local_path"])).resolve()
+                if known_path.parent == theme_dir.resolve():
+                    quality = dict(known.get("quality") or {})
+                    media = dict(known.get("media") or {})
+                    usage = prior_usage.get(asset_id, prior_usage.get(str(known_path), []))
+                    source = {
+                        "id": candidate["pixabay_id"],
+                        "pixabay_id": candidate["pixabay_id"],
+                        "author": candidate.get("user") or known.get("author") or "",
+                        "page_url": candidate.get("page_url") or known.get("page_url") or "",
+                        "search_query": (candidate.get("matched_queries") or [""])[0],
+                        "search_queries": list(candidate.get("matched_queries") or []),
+                        "local_path": str(known_path),
+                        "duration_seconds": media.get("duration_seconds", candidate.get("duration", 0)),
+                        "duration": media.get("duration_seconds", candidate.get("duration", 0)),
+                        "width": media.get("width", candidate["variant"].get("width", 0)),
+                        "height": media.get("height", candidate["variant"].get("height", 0)),
+                        "shot_type": candidate.get("shot_type"),
+                        "shot_scale": candidate.get("shot_scale"),
+                        "motion_score": quality.get("motion_score", candidate.get("motion_score_estimate", 0.5)),
+                        "pre_score": candidate.get("pre_score"),
+                        "quality": quality,
+                        "fingerprint": known.get("fingerprint") or media.get("fingerprint"),
+                        "usage_intervals": usage,
+                        "actual_usage_intervals": usage,
+                        "reused_existing_file": True,
+                    }
+                    selected.append(source)
+                    log_item["decision"] = "selected_existing"
+                    continue
+                reason = "duplicate Pixabay ID already present in global material library"
+                rejection = {"pixabay_id": candidate["pixabay_id"], "stage": "global_dedup", "reasons": [reason]}
+                rejections.append(rejection)
+                log_item.update({"decision": "rejected", "rejection_stage": "global_dedup", "reasons": [reason]})
+                continue
+
+            extension = _extension_from_url(str(candidate["variant"]["url"]))
+            temp_path = theme_dir / f".pixabay_{asset_id}_{os.getpid()}.part{extension}"
+            try:
+                _download_video(session, str(candidate["variant"]["url"]), temp_path, api_key)
+                quality, media = _video_quality(temp_path, style_profile, min_resolution)
+                if not quality["passed"]:
+                    rejection = {
+                        "pixabay_id": candidate["pixabay_id"],
+                        "stage": "post_download_qa",
+                        "reasons": list(quality["rejection_reasons"]),
+                        "quality": quality,
+                    }
+                    rejections.append(rejection)
+                    log_item.update({"decision": "rejected", "rejection_stage": "post_download_qa", "reasons": rejection["reasons"], "quality": quality})
+                    temp_path.unlink(missing_ok=True)
+                    continue
+                duplicate, duplicate_of, distance = _fingerprint_duplicate(media["fingerprint"], existing_entries)
+                if duplicate:
+                    reason = f"video fingerprint duplicates existing material {duplicate_of}"
+                    rejection = {
+                        "pixabay_id": candidate["pixabay_id"],
+                        "stage": "post_download_dedup",
+                        "reasons": [reason],
+                        "perceptual_distance": distance,
+                    }
+                    rejections.append(rejection)
+                    log_item.update({"decision": "rejected", "rejection_stage": "post_download_dedup", "reasons": [reason]})
+                    temp_path.unlink(missing_ok=True)
+                    continue
+                description = _chinese_description(str(candidate.get("tags") or ""), theme)
+                final_name = _safe_chinese_slug(
+                    f"{len(selected) + 1:02d}_{description}_{asset_id}",
+                    f"素材_{asset_id}",
+                ) + extension
+                final_path = theme_dir / final_name
+                if final_path.exists():
+                    final_path = theme_dir / (_safe_chinese_slug(f"{len(selected) + 1:02d}_{description}_{asset_id}_{int(time.time())}") + extension)
+                os.replace(temp_path, final_path)
+                usage = prior_usage.get(asset_id, prior_usage.get(str(final_path), []))
+                source = {
+                    "id": candidate["pixabay_id"],
+                    "pixabay_id": candidate["pixabay_id"],
+                    "author": candidate.get("user") or "",
+                    "page_url": candidate.get("page_url") or "",
+                    "search_query": (candidate.get("matched_queries") or [""])[0],
+                    "search_queries": list(candidate.get("matched_queries") or []),
+                    "local_path": str(final_path.resolve()),
+                    "duration_seconds": media["duration_seconds"],
+                    "duration": media["duration_seconds"],
+                    "width": media["width"],
+                    "height": media["height"],
+                    "fps": media["fps"],
+                    "shot_type": candidate.get("shot_type"),
+                    "shot_scale": candidate.get("shot_scale"),
+                    "motion_score": quality["motion_score"],
+                    "pre_score": candidate.get("pre_score"),
+                    "score_components": candidate.get("score_components"),
+                    "quality": quality,
+                    "fingerprint": media["fingerprint"],
+                    "usage_intervals": usage,
+                    "actual_usage_intervals": usage,
+                    "reused_existing_file": False,
+                }
+                selected.append(source)
+                library_entry = {
+                    "pixabay_id": candidate["pixabay_id"],
+                    "author": source["author"],
+                    "page_url": source["page_url"],
+                    "local_path": source["local_path"],
+                    "added_at": _utc_now(),
+                    "fingerprint": media["fingerprint"],
+                    "quality": quality,
+                    "media": media,
+                }
+                existing_entries.append(library_entry)
+                fingerprint_library["entries"] = existing_entries
+                fingerprint_library["updated_at"] = _utc_now()
+                _atomic_write_json(fingerprint_path, fingerprint_library, api_key)
+                log_item.update({"decision": "selected", "local_path": source["local_path"], "quality": quality})
+            except PixabayPipelineError as exc:
+                temp_path.unlink(missing_ok=True)
+                safe = _safe_error(exc, api_key)
+                rejection = {"pixabay_id": candidate["pixabay_id"], "stage": "download_or_decode", "reasons": [safe]}
+                rejections.append(rejection)
+                log_item.update({"decision": "rejected", "rejection_stage": "download_or_decode", "reasons": [safe]})
+        status = "ok" if len(selected) >= desired_count else "partial"
+
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": _utc_now(),
+        "status": status,
+        "dry_run": bool(dry_run),
+        "theme": theme,
+        "theme_directory": str(theme_dir.resolve()),
+        "requested": {
+            "desired_count": desired_count,
+            "aspect_ratio": ratio_label,
+            "min_resolution": {"width": min_resolution[0], "height": min_resolution[1]},
+        },
+        "search_cache_ttl_seconds": CACHE_TTL_SECONDS,
+        "search_rounds": search_rounds,
+        "search_errors": search_errors,
+        "candidate_count": len(ranked),
+        "candidate_log": candidate_log,
+        "rejections": rejections,
+        "sources": selected,
+        "selected_count": len(selected),
+        "attribution_notice": "Pixabay source metadata retained for traceability; verify current Pixabay license terms when publishing.",
+        "heuristic_notice": "Content, shot scale, motion, text/watermark, and visual quality labels are signal-derived estimates.",
+    }
+    _atomic_write_json(manifest_path, manifest, api_key)
+    result = {
+        "status": status,
+        "theme": theme,
+        "theme_dir": str(theme_dir.resolve()),
+        "sources_manifest": str(manifest_path.resolve()),
+        "fingerprint_library": str(fingerprint_path.resolve()),
+        "desired_count": desired_count,
+        "selected_count": len(selected),
+        "selected": selected,
+        "search_rounds": search_rounds,
+        "search_errors": search_errors,
+        "rejections": rejections,
+        "candidate_count": len(ranked),
+        "dry_run": bool(dry_run),
+    }
+    return _strip_secrets(result, api_key)
+
+
+def _iter_shots(value: Any) -> Iterable[Mapping[str, Any]]:
+    """Yield edit-plan shot mappings without mistaking interval dicts for shots."""
+
+    if isinstance(value, Mapping):
+        identity_keys = {"pixabay_id", "asset_id", "source_id", "local_path", "source_path", "file"}
+        interval_keys = {"output_start", "output_end", "timeline_start", "timeline_end", "source_start", "source_end", "start", "end"}
+        keys = set(value)
+        if keys & identity_keys and keys & interval_keys:
+            yield value
+            return
+        for key in ("shots", "clips", "segments", "edit_plan", "timeline", "items", "usage"):
+            if key in value:
+                yield from _iter_shots(value[key])
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_shots(item)
+
+
+def _normalized_interval(shot: Mapping[str, Any]) -> dict[str, Any] | None:
+    def first(*keys: str) -> Any:
+        for key in keys:
+            if shot.get(key) is not None:
+                return shot.get(key)
+        return None
+
+    output_start = first("output_start", "timeline_start", "start", "output_in")
+    output_end = first("output_end", "timeline_end", "end", "output_out")
+    source_start = first("source_start", "source_in", "in_point", "clip_start")
+    source_end = first("source_end", "source_out", "out_point", "clip_end")
+    try:
+        normalized = {
+            "output_start": round(float(output_start), 6),
+            "output_end": round(float(output_end), 6),
+            "source_start": round(float(source_start if source_start is not None else 0.0), 6),
+            "source_end": round(float(source_end), 6) if source_end is not None else None,
+        }
+    except (TypeError, ValueError):
+        return None
+    if normalized["output_end"] <= normalized["output_start"]:
+        return None
+    if normalized["source_end"] is None:
+        normalized["source_end"] = round(
+            normalized["source_start"] + normalized["output_end"] - normalized["output_start"], 6
+        )
+    for key in ("speed", "section", "reason", "transition"):
+        if shot.get(key) is not None:
+            normalized[key] = shot[key]
+    return normalized
+
+
+def update_usage_intervals(
+    manifest_path: str | os.PathLike[str],
+    edit_plan_or_shots: str | os.PathLike[str] | Mapping[str, Any] | Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Fill actual output/source intervals by ``pixabay_id`` or local path.
+
+    ``edit_plan_or_shots`` may be an edit-plan JSON path, a nested edit-plan
+    mapping, or a list of shots.  Recognized interval names include
+    ``output_start/output_end`` and ``timeline_start/timeline_end`` plus
+    ``source_start/source_end``.
+    """
+
+    path = Path(manifest_path).expanduser().resolve()
+    manifest = _read_json(path, None)
+    if not isinstance(manifest, Mapping):
+        raise PixabayPipelineError(f"Sources manifest is missing or invalid: {path}")
+    if isinstance(edit_plan_or_shots, (str, os.PathLike)):
+        plan_path = Path(edit_plan_or_shots).expanduser().resolve()
+        plan: Any = _read_json(plan_path, None)
+        if plan is None:
+            raise PixabayPipelineError(f"Edit plan is missing or invalid: {plan_path}")
+    else:
+        plan = edit_plan_or_shots
+
+    by_id: dict[str, list[dict[str, Any]]] = {}
+    by_path: dict[str, list[dict[str, Any]]] = {}
+    parsed_shots = 0
+    for shot in _iter_shots(plan):
+        interval = _normalized_interval(shot)
+        if interval is None:
+            continue
+        parsed_shots += 1
+        identity = shot.get("pixabay_id", shot.get("asset_id", shot.get("source_id")))
+        local = shot.get("local_path", shot.get("source_path", shot.get("file")))
+        if identity not in (None, ""):
+            by_id.setdefault(str(identity), []).append(interval)
+        if local not in (None, ""):
+            try:
+                normalized_path = os.path.normcase(str(Path(str(local)).expanduser().resolve()))
+            except OSError:
+                normalized_path = os.path.normcase(str(local))
+            by_path.setdefault(normalized_path, []).append(interval)
+
+    updated_sources = 0
+    manifest_copy = dict(manifest)
+    sources = [dict(source) for source in manifest.get("sources", []) if isinstance(source, Mapping)]
+    for source in sources:
+        intervals = by_id.get(str(source.get("pixabay_id", source.get("id"))))
+        if intervals is None and source.get("local_path"):
+            try:
+                source_key = os.path.normcase(str(Path(str(source["local_path"])).expanduser().resolve()))
+            except OSError:
+                source_key = os.path.normcase(str(source["local_path"]))
+            intervals = by_path.get(source_key)
+        matched = intervals is not None
+        current_intervals = list(intervals or [])
+        current_intervals.sort(key=lambda item: (item["output_start"], item["output_end"]))
+        source["usage_intervals"] = current_intervals
+        source["actual_usage_intervals"] = current_intervals
+        if matched:
+            updated_sources += 1
+    manifest_copy["sources"] = sources
+    manifest_copy["usage_updated_at"] = _utc_now()
+    manifest_copy["usage_update_summary"] = {
+        "parsed_shots": parsed_shots,
+        "updated_sources": updated_sources,
+        "unmatched_sources": max(0, len(sources) - updated_sources),
+    }
+    _atomic_write_json(path, manifest_copy)
+    return {
+        "manifest_path": str(path),
+        "parsed_shots": parsed_shots,
+        "updated_sources": updated_sources,
+        "unmatched_sources": max(0, len(sources) - updated_sources),
+    }
+
+
+def _load_profile_argument(path: str | None) -> dict[str, Any]:
+    if not path:
+        return {}
+    payload = _read_json(Path(path).expanduser().resolve(), None)
+    if not isinstance(payload, Mapping):
+        raise PixabayPipelineError(f"Profile is missing or invalid JSON: {path}")
+    return dict(payload)
+
+
+def _default_project_root() -> Path:
+    return Path(
+        os.environ.get("BGM_MONTAGE_PROJECT_ROOT", Path(__file__).resolve().parents[2])
+    ).expanduser().resolve()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Search, quality-rank, download, deduplicate, and attribute Pixabay video material."
+    )
+    subparsers = parser.add_subparsers(dest="command")
+    update = subparsers.add_parser("update-usage", help="write edit-plan usage intervals into sources.json")
+    update.add_argument("--manifest", required=True, help="path to sources.json")
+    update.add_argument("--edit-plan", required=True, help="path to edit_plan.json or compatible shots JSON")
+
+    parser.add_argument("--theme", help="topic/theme used for English visual search queries")
+    parser.add_argument("--style-profile", help="path to reference style_profile.json")
+    parser.add_argument("--audio-profile", help="path to BGM profile JSON")
+    parser.add_argument("--material-root", default=str(_default_project_root() / "视频素材"))
+    parser.add_argument("--cache-dir", default=str(_default_project_root() / ".bgm-montage-cache"))
+    parser.add_argument("--desired-count", type=int, default=6)
+    parser.add_argument("--aspect-ratio", default="16:9")
+    parser.add_argument("--min-resolution", default="1280x720")
+    parser.add_argument("--dry-run", action="store_true", help="search and rank without downloading full videos")
+    parser.add_argument("--result-json", help="optional path for the returned stage result")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "update-usage":
+            summary = update_usage_intervals(args.manifest, args.edit_plan)
+            print(json.dumps(summary, ensure_ascii=False, indent=2))
+            return 0
+        if not args.theme:
+            parser.error("--theme is required unless using the update-usage subcommand")
+        result = run_pixabay_pipeline(
+            theme=args.theme,
+            style_profile=_load_profile_argument(args.style_profile),
+            audio_profile=_load_profile_argument(args.audio_profile),
+            material_root=args.material_root,
+            cache_dir=args.cache_dir,
+            desired_count=args.desired_count,
+            aspect_ratio=args.aspect_ratio,
+            min_resolution=_parse_resolution(args.min_resolution),
+            dry_run=args.dry_run,
+        )
+        if args.result_json:
+            _atomic_write_json(Path(args.result_json).expanduser().resolve(), result)
+        console = {
+            "status": result["status"],
+            "selected_count": result["selected_count"],
+            "desired_count": result["desired_count"],
+            "sources_manifest": result["sources_manifest"],
+            "candidate_count": result["candidate_count"],
+            "rejection_count": len(result["rejections"]),
+        }
+        print(json.dumps(console, ensure_ascii=False, indent=2))
+        return 0 if result["status"] in {"ok", "dry_run"} else 2
+    except (PixabayPipelineError, ValueError) as exc:
+        # Error sanitization is repeated at the outermost boundary so neither
+        # requests nor a caller-provided exception can echo the credential.
+        print(f"error: {_safe_error(exc, os.environ.get('PIXABAY_API_KEY'))}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

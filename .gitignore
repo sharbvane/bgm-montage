@@ -1,0 +1,43 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+cookies.txt
+cookies*.txt
+
+# Python and Node environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+
+# Runtime outputs, caches, and media
+.bgm-montage-cache/
+test-output/
+output/
+outputs/
+renders/
+materials/
+downloads/
+validation_frames/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.mp3
+*.wav
+*.flac
+*.m4a
+
+# Logs and editor files
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
