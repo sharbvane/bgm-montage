@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import sys
 import traceback
@@ -19,8 +20,12 @@ from dotenv import load_dotenv
 
 from analyze_bgm import analyze_bgm
 from analyze_references import analyze_references
+from analyze_editing_grammar import analyze_editing_grammar
+from montage import InsufficientMaterialError as TimelineInsufficientMaterialError
 from montage import MontageError, build_timeline, parse_ratio, render_timeline, write_plan
+from pixabay_pipeline import InsufficientMaterialError as PixabayInsufficientMaterialError
 from pixabay_pipeline import material_theme_directory, run_pixabay_pipeline, update_usage_intervals
+from runtime_paths import RuntimePaths, discover_project_root
 from validate_output import validate_output
 
 
@@ -29,21 +34,7 @@ SKILL_DIR = SCRIPT_DIR.parent
 
 
 def _discover_project_root() -> Path:
-    explicit = os.getenv("BGM_MONTAGE_PROJECT_ROOT")
-    if explicit:
-        return Path(explicit).expanduser().resolve()
-    cwd = Path.cwd().resolve()
-    candidates = [cwd, *list(cwd.parents)[:3], SKILL_DIR.parent]
-    seen: set[Path] = set()
-    for candidate in candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        if (candidate / "参考视频").is_dir() and (
-            (candidate / "视频素材").exists() or (candidate / ".env").is_file()
-        ):
-            return candidate
-    return cwd
+    return discover_project_root()
 
 
 PROJECT_ROOT = _discover_project_root()
@@ -194,7 +185,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--duration must be greater than zero")
 
     slug = _safe_slug(args.project_name or args.theme)
-    run_dir = output_root / slug
+    run_id = _safe_slug(
+        getattr(args, "run_id", None)
+        or f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(2)}",
+        "run",
+    )
+    run_dir = output_root / slug / run_id
+    if run_dir.exists():
+        raise FileExistsError(
+            f"Run directory already exists; choose another --run-id. Existing output was not overwritten: {run_dir}"
+        )
     _assert_writable_tree_separate("output run directory", run_dir, reference_dir)
     _assert_writable_tree_separate(
         "material theme directory", material_theme_directory(material_dir, args.theme), reference_dir
@@ -205,7 +205,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     run_dir.mkdir(parents=True, exist_ok=True)
     cache_root.mkdir(parents=True, exist_ok=True)
     report: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "skill_version": "1.1",
+        "run_id": run_id,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "theme": args.theme,
         "requested_duration_seconds": args.duration,
@@ -217,8 +219,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }
 
     style_path = run_dir / "style_profile.json"
-    print(f"[1/5] Analyzing reference style ({reference_dir})", flush=True)
-    reference_result = analyze_references(reference_dir, cache_root / "references", style_path)
+    print(f"[1/6] Analyzing reference style and shot semantics ({reference_dir})", flush=True)
+    reference_result = analyze_references(
+        reference_dir,
+        cache_root / "references",
+        style_path,
+        semantic_required=not getattr(args, "allow_semantic_fallback", False),
+    )
     style_profile = _style_payload(reference_result)
     if not style_path.is_file():
         _write_json(style_path, reference_result)
@@ -231,8 +238,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }
     report["artifacts"]["style_profile"] = str(style_path)
 
+    editing_grammar_path = run_dir / "editing_grammar.json"
+    print("[2/6] Learning reference audio-to-cut editing grammar", flush=True)
+    editing_grammar = analyze_editing_grammar(
+        reference_dir,
+        reference_result,
+        cache_root / "references",
+        editing_grammar_path,
+    )
+    report["stages"]["editing_grammar"] = {
+        "status": editing_grammar.get("status"),
+        "reliability": editing_grammar.get("reliability"),
+        "analyzed": editing_grammar.get("run_report", {}).get("analyzed"),
+        "reused": editing_grammar.get("run_report", {}).get("reused"),
+    }
+    report["artifacts"]["editing_grammar"] = str(editing_grammar_path)
+
     bgm_profile_path = run_dir / "bgm_profile.json"
-    print(f"[2/5] Analyzing BGM structure ({bgm_path.name})", flush=True)
+    print(f"[3/6] Analyzing BGM structure ({bgm_path.name})", flush=True)
     bgm_result = analyze_bgm(bgm_path, cache_root / "bgm", bgm_profile_path, args.duration)
     audio_profile = _audio_payload(bgm_result)
     if not bgm_profile_path.is_file():
@@ -247,18 +270,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     report["artifacts"]["bgm_profile"] = str(bgm_profile_path)
 
     desired_assets = args.assets or max(4, min(30, math.ceil(target_duration / 1.7) + 3))
-    print(f"[3/5] Searching, ranking, and downloading {desired_assets} Pixabay candidates", flush=True)
-    media_result = run_pixabay_pipeline(
-        args.theme,
-        style_profile,
-        audio_profile,
-        material_dir,
-        cache_root / "pixabay",
-        desired_assets,
-        args.ratio,
-        min_resolution=(args.min_width, args.min_height),
-        dry_run=False,
-    )
+    print(f"[4/6] Searching, ranking, and downloading {desired_assets} Pixabay candidates", flush=True)
+    try:
+        media_result = run_pixabay_pipeline(
+            args.theme,
+            style_profile,
+            audio_profile,
+            material_dir,
+            cache_root / "pixabay",
+            desired_assets,
+            args.ratio,
+            min_resolution=(args.min_width, args.min_height),
+            dry_run=False,
+            target_duration=target_duration,
+        )
+    except PixabayInsufficientMaterialError as exc:
+        report["stages"]["pixabay"] = {"status": "insufficient_material", "error": _strip_secret(str(exc))}
+        manifest = material_theme_directory(material_dir, args.theme) / "sources.json"
+        if manifest.is_file():
+            report["artifacts"]["sources"] = str(manifest)
+        report["finished_at"] = datetime.now(timezone.utc).isoformat()
+        report["passed"] = False
+        failed_report = run_dir / "run_report.json"
+        report["artifacts"]["run_report"] = str(failed_report)
+        _write_json(failed_report, report)
+        raise
     selected = media_result.get("selected") or media_result.get("selected_assets") or []
     if not selected:
         raise RuntimeError("Pixabay search completed without any selected local videos")
@@ -272,8 +308,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     material_sources_path = _material_sources_path(media_result)
     sources_path = _copy_or_create_sources(media_result, run_dir / "sources.json")
     edit_plan_path = run_dir / "edit_plan.json"
-    print("[4/5] Building beat-aware timeline and rendering", flush=True)
-    plan = build_timeline(audio_profile, media_result, target_duration, style_profile, seed=f"{args.theme}|{bgm_path.name}")
+    print("[5/6] Building grammar-driven timeline and rendering", flush=True)
+    try:
+        plan = build_timeline(
+            audio_profile,
+            media_result,
+            target_duration,
+            style_profile,
+            seed=f"{args.theme}|{bgm_path.name}",
+            editing_grammar=editing_grammar,
+            ratio=args.ratio,
+        )
+    except TimelineInsufficientMaterialError as exc:
+        report["stages"]["timeline"] = {"status": "insufficient_material", "error": _strip_secret(str(exc))}
+        report["finished_at"] = datetime.now(timezone.utc).isoformat()
+        report["passed"] = False
+        failed_report = run_dir / "run_report.json"
+        report["artifacts"]["run_report"] = str(failed_report)
+        _write_json(failed_report, report)
+        raise
     write_plan(plan, edit_plan_path)
     output_path = run_dir / f"{slug}_montage.mp4"
     render_timeline(plan, bgm_path, output_path, args.ratio, style_profile)
@@ -285,7 +338,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     report["stages"]["render"] = {"status": "ok", "shots": len(plan.get("shots", []))}
     report["artifacts"].update({"edit_plan": str(edit_plan_path), "sources": str(sources_path), "video": str(output_path)})
 
-    print("[5/5] Running full-decode and media quality validation", flush=True)
+    print("[6/6] Running full-decode and media quality validation", flush=True)
     validation_path = run_dir / "validation.json"
     validation = validate_output(
         output_path,
@@ -293,6 +346,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         expected_ratio=args.ratio,
         report_path=validation_path,
         frames_dir=run_dir / "validation_frames",
+        edit_plan=plan,
     )
     report["stages"]["validation"] = {"status": "ok" if validation["passed"] else "failed", "checks": validation["checks"]}
     report["artifacts"]["validation"] = str(validation_path)
@@ -314,12 +368,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ratio", required=True, help="9:16, 16:9, 1:1, 4:5, or WIDTHxHEIGHT")
     parser.add_argument("--output-dir", required=True, help="Directory that receives the run subdirectory")
     parser.add_argument("--project-name", help="Optional safe output subdirectory/file name")
+    parser.add_argument(
+        "--run-id",
+        help="Optional unique run directory name; defaults to UTC timestamp plus random suffix and never overwrites.",
+    )
     parser.add_argument("--reference-dir", default=str(PROJECT_ROOT / "参考视频"))
     parser.add_argument("--material-dir", default=str(PROJECT_ROOT / "视频素材"))
     parser.add_argument("--cache-dir", default=str(PROJECT_ROOT / ".bgm-montage-cache"))
     parser.add_argument("--assets", type=int, help="Override final asset count (default derives from duration)")
     parser.add_argument("--min-width", type=int, default=1280)
     parser.add_argument("--min-height", type=int, default=720)
+    parser.add_argument(
+        "--allow-semantic-fallback",
+        action="store_true",
+        help="Allow explicit structural-only reference analysis if the pretrained CLIP model is unavailable.",
+    )
     return parser
 
 

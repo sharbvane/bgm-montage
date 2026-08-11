@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """Read-only reference-video analysis for the bgm-montage skill.
 
-The analyzer deliberately does not claim semantic understanding.  It uses
-ffprobe metadata and explainable OpenCV heuristics to describe visual
-structure, colour, pacing, text-like edge regions, framing and motion.  The
-result is suitable as an input to search-term generation and montage scoring,
-provided the caller also supplies the actual project topic.
+The v1.1 analyzer combines explainable OpenCV measurements with a real,
+pretrained CLIP zero-shot vision model.  Semantic output is always labelled
+with its backend and limitations; when the model cannot be loaded the result
+is explicitly degraded instead of pretending that heuristics are semantics.
 
 Public API:
-    analyze_references(reference_dir, cache_dir, output_path=None)
+    analyze_references(reference_dir, cache_dir, output_path=None, ...)
 
 The source directory is only opened for stat/read operations.  Cache and
 profile files are always written below ``cache_dir`` or to ``output_path``.
@@ -33,11 +32,22 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from runtime_paths import RuntimePaths, discover_project_root
+from visual_semantics import (
+    ClipSemanticAnalyzer,
+    SemanticBackendStatus,
+    aggregate_semantics,
+    aggregate_subject_regions,
+    infer_scene_category,
+    load_semantic_analyzer,
+    subject_region,
+)
 
-ANALYZER_VERSION = "1.0.3"
-MIGRATABLE_ANALYZER_VERSIONS = {"1.0.1", "1.0.2"}
-CACHE_SCHEMA_VERSION = 1
-PROFILE_SCHEMA_VERSION = "1.0"
+
+ANALYZER_VERSION = "1.1.0"
+MIGRATABLE_ANALYZER_VERSIONS: set[str] = set()
+CACHE_SCHEMA_VERSION = 2
+PROFILE_SCHEMA_VERSION = "1.1"
 VIDEO_EXTENSIONS = {
     ".mp4",
     ".mov",
@@ -58,6 +68,7 @@ VIDEO_EXTENSIONS = {
 TARGET_SAMPLE_FPS = 2.0
 MIN_SAMPLES = 16
 MAX_SAMPLES = 96
+MAX_SEMANTIC_SAMPLES = 18
 ANALYSIS_WIDTH = 384
 FINGERPRINT_BLOCK_BYTES = 256 * 1024
 
@@ -901,7 +912,112 @@ def _refresh_topic_and_search_hints(analysis: dict[str, Any]) -> dict[str, Any]:
     return analysis
 
 
-def _analyze_one(path: Path, relative_path: str, metadata: Mapping[str, Any], cv2: Any, np: Any) -> dict[str, Any]:
+def _semantic_positive_terms(semantic: Mapping[str, Any]) -> list[str]:
+    """Return compact English phrases suitable for Pixabay query expansion."""
+
+    terms: list[str] = []
+    categories = semantic.get("categories", {}) if isinstance(semantic, Mapping) else {}
+    if isinstance(categories, Mapping):
+        for category in ("subject", "scene", "action", "composition", "emotion"):
+            payload = categories.get(category, {})
+            if not isinstance(payload, Mapping):
+                continue
+            label = str(payload.get("label", "")).strip().lower()
+            confidence = _finite_float(payload.get("confidence"))
+            if label and confidence >= 0.08 and label not in terms:
+                terms.append(label)
+    for keyword in semantic.get("search_keywords", []) if isinstance(semantic, Mapping) else []:
+        value = str(keyword).strip().lower()
+        if value and value not in terms:
+            terms.append(value)
+    return terms[:16]
+
+
+def _build_shot_semantics(
+    frames: Sequence[Mapping[str, Any]],
+    decoded_times: Sequence[float],
+    transitions: Sequence[Mapping[str, Any]],
+    effective_duration: float,
+    semantic_records: Sequence[Mapping[str, Any]],
+    subject_regions: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Aggregate sampled frame evidence into detected-shot records."""
+
+    cut_indices = {
+        index + 1
+        for index, transition in enumerate(transitions)
+        if bool(transition.get("is_cut"))
+    }
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    for index in range(1, len(frames)):
+        if index in cut_indices:
+            ranges.append((start, index))
+            start = index
+    ranges.append((start, len(frames)))
+
+    shots: list[dict[str, Any]] = []
+    for shot_index, (first, after_last) in enumerate(ranges):
+        if after_last <= first:
+            continue
+        next_time = (
+            float(decoded_times[after_last])
+            if after_last < len(decoded_times)
+            else float(effective_duration)
+        )
+        start_time = 0.0 if shot_index == 0 else float(decoded_times[first])
+        end_time = max(start_time + 0.08, next_time)
+        local_frames = frames[first:after_last]
+        local_semantics = semantic_records[first:after_last]
+        local_regions = subject_regions[first:after_last]
+        local_transitions = transitions[max(0, first) : max(0, after_last - 1)]
+        semantic = aggregate_semantics(local_semantics)
+        subject = aggregate_subject_regions(local_regions)
+        scale_distribution = _distribution(str(item.get("scale_label", "unresolved")) for item in local_frames)
+        motion_distribution = _distribution(
+            str(item.get("motion_label", "unresolved"))
+            for item in local_transitions
+            if not bool(item.get("is_cut"))
+        )
+        categories = semantic.get("categories", {}) if isinstance(semantic, Mapping) else {}
+
+        def semantic_label(name: str, fallback: str) -> str:
+            value = categories.get(name, {}) if isinstance(categories, Mapping) else {}
+            return str(value.get("label", fallback)) if isinstance(value, Mapping) else fallback
+
+        shots.append(
+            {
+                "index": shot_index,
+                "start_seconds": _round(start_time, 3),
+                "end_seconds": _round(min(effective_duration, end_time), 3),
+                "duration_seconds": _round(max(0.08, min(effective_duration, end_time) - start_time), 3),
+                "sample_count": len(local_frames),
+                "subject": semantic_label("subject", "unresolved"),
+                "scene": semantic_label("scene", "unresolved"),
+                "apparent_action": semantic_label("action", "unresolved"),
+                "shot_scale": _dominant(scale_distribution, "unresolved"),
+                "composition": semantic_label("composition", "unresolved"),
+                "camera_motion": _dominant(motion_distribution, "static_like"),
+                "visual_mood": semantic_label("emotion", "unresolved"),
+                "scene_category": infer_scene_category("", semantic),
+                "search_keywords": _semantic_positive_terms(semantic),
+                "semantic": semantic,
+                "subject_region": subject,
+            }
+        )
+    return shots
+
+
+def _analyze_one(
+    path: Path,
+    relative_path: str,
+    metadata: Mapping[str, Any],
+    cv2: Any,
+    np: Any,
+    semantic_analyzer: ClipSemanticAnalyzer | None = None,
+    semantic_status: SemanticBackendStatus | None = None,
+    semantic_required: bool = False,
+) -> dict[str, Any]:
     capture = cv2.VideoCapture(os.fspath(path))
     if not capture.isOpened():
         capture.release()
@@ -942,6 +1058,61 @@ def _analyze_one(path: Path, relative_path: str, metadata: Mapping[str, Any], cv
         capture.release()
     if len(frames) < 3:
         raise ReferenceAnalysisError(f"only {len(frames)} sample frame(s) decoded")
+
+    semantic_records: list[dict[str, Any]] = []
+    semantic_runtime_error: str | None = None
+    if semantic_analyzer is not None:
+        try:
+            if len(frames) <= MAX_SEMANTIC_SAMPLES:
+                semantic_indices = list(range(len(frames)))
+            else:
+                semantic_indices = sorted(
+                    {
+                        round(index * (len(frames) - 1) / (MAX_SEMANTIC_SAMPLES - 1))
+                        for index in range(MAX_SEMANTIC_SAMPLES)
+                    }
+                )
+            sampled_semantics = semantic_analyzer.classify_frames(
+                [frames[index]["frame"] for index in semantic_indices]
+            )
+            semantic_records = [
+                sampled_semantics[
+                    min(
+                        range(len(semantic_indices)),
+                        key=lambda candidate: abs(semantic_indices[candidate] - frame_index),
+                    )
+                ]
+                for frame_index in range(len(frames))
+            ]
+        except Exception as exc:
+            semantic_runtime_error = f"{type(exc).__name__}: {exc}"
+            semantic_records = []
+            if semantic_required:
+                raise ReferenceAnalysisError(
+                    f"pretrained semantic inference failed: {semantic_runtime_error}"
+                ) from exc
+    subject_regions = [subject_region(frame["frame"], face_cascade) for frame in frames]
+    semantic_summary = aggregate_semantics(semantic_records)
+    if semantic_analyzer is None or semantic_runtime_error:
+        semantic_summary.update(
+            {
+                "available": False,
+                "backend": (semantic_status.backend if semantic_status else "unavailable"),
+                "model_id": (semantic_status.model_id if semantic_status else None),
+                "error": semantic_runtime_error
+                or (semantic_status.error if semantic_status else "semantic backend not configured"),
+            }
+        )
+    else:
+        semantic_summary.update(
+            {
+                "model_id": semantic_status.model_id if semantic_status else semantic_analyzer.model_id,
+                "backend": semantic_status.backend if semantic_status else semantic_summary.get("backend"),
+                "sampled_frame_count": len(sampled_semantics),
+                "propagated_to_structural_samples": len(semantic_records),
+            }
+        )
+    subject_summary = aggregate_subject_regions(subject_regions)
 
     brightness = _mean(frame["brightness"] for frame in frames)
     saturation = _mean(frame["saturation"] for frame in frames)
@@ -1008,6 +1179,16 @@ def _analyze_one(path: Path, relative_path: str, metadata: Mapping[str, Any], cv
         hue,
         edge_density,
     )
+    if semantic_summary.get("available"):
+        topic_label = infer_scene_category("", semantic_summary)
+        topic_confidence = max(
+            _finite_float(
+                semantic_summary.get("categories", {}).get("scene", {}).get("confidence")
+            ),
+            _finite_float(
+                semantic_summary.get("categories", {}).get("subject", {}).get("confidence")
+            ),
+        )
 
     shot_type_labels: list[str] = []
     for frame in frames:
@@ -1039,6 +1220,10 @@ def _analyze_one(path: Path, relative_path: str, metadata: Mapping[str, Any], cv
         rhythm_label,
         topic_label,
     )
+    semantic_terms = _semantic_positive_terms(semantic_summary)
+    existing_terms = list(search_hints.get("positive_terms", []))
+    search_hints["positive_terms"] = list(dict.fromkeys(semantic_terms + existing_terms))[:24]
+    search_hints["semantic_terms"] = semantic_terms
     median_interval = _median(
         [decoded_times[index] - decoded_times[index - 1] for index in range(1, len(decoded_times))]
     )
@@ -1049,6 +1234,19 @@ def _analyze_one(path: Path, relative_path: str, metadata: Mapping[str, Any], cv
         warnings.append("Sampling interval is coarse; very fast cuts may be under-counted.")
     if face_cascade is None:
         warnings.append("OpenCV face cascade unavailable; shot scale uses edge structure only.")
+    if not semantic_summary.get("available"):
+        warnings.append(
+            "Pretrained visual semantics were unavailable; semantic fields are explicitly degraded."
+        )
+
+    shots = _build_shot_semantics(
+        frames,
+        decoded_times,
+        transitions,
+        effective_duration,
+        semantic_records,
+        subject_regions,
+    )
 
     return {
         "schema_version": PROFILE_SCHEMA_VERSION,
@@ -1066,14 +1264,25 @@ def _analyze_one(path: Path, relative_path: str, metadata: Mapping[str, Any], cv
         "topic": {
             "classification": topic_label,
             "confidence": _round(topic_confidence),
-            "method": "non_semantic_color_structure_and_framing_heuristic",
+            "method": (
+                "pretrained_clip_zero_shot"
+                if semantic_summary.get("available")
+                else "non_semantic_color_structure_and_framing_heuristic"
+            ),
             "signals": {
                 "frames_with_frontal_face_ratio": _round(face_frame_ratio),
                 "text_like_frame_ratio": _round(text_presence),
                 "dominant_structural_scale": _dominant(scale_distribution),
             },
-            "limitation": "Broad scene-family estimate only; supply the real project theme/product separately.",
+            "limitation": (
+                "Finite zero-shot taxonomy; supply the real project theme/product separately."
+                if semantic_summary.get("available")
+                else "Broad scene-family estimate only; supply the real project theme/product separately."
+            ),
         },
+        "semantic_analysis": semantic_summary,
+        "subject_profile": subject_summary,
+        "shots": shots,
         "visual_mood": {
             "classification": mood_label,
             "method": "brightness_saturation_contrast_temperature_motion_pacing_heuristic",
@@ -1158,8 +1367,76 @@ def _video_summary(analysis: Mapping[str, Any]) -> dict[str, Any]:
         "subtitle_layout": analysis.get("subtitle_layout"),
         "overall_style": analysis.get("overall_style"),
         "search_hints": analysis.get("search_hints"),
+        "semantic_analysis": analysis.get("semantic_analysis"),
+        "subject_profile": analysis.get("subject_profile"),
+        "shots": analysis.get("shots", []),
         "sampling": analysis.get("sampling"),
         "warnings": analysis.get("warnings", []),
+    }
+
+
+def _aggregate_corpus_semantics(analyses: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    available = [
+        analysis.get("semantic_analysis", {})
+        for analysis in analyses
+        if analysis.get("semantic_analysis", {}).get("available")
+    ]
+    if not available:
+        errors = [
+            str(analysis.get("semantic_analysis", {}).get("error", ""))
+            for analysis in analyses
+            if analysis.get("semantic_analysis", {}).get("error")
+        ]
+        return {
+            "available": False,
+            "coverage_ratio": 0.0,
+            "categories": {},
+            "search_keywords": [],
+            "errors": list(dict.fromkeys(errors))[:3],
+        }
+    category_votes: dict[str, defaultdict[str, list[float]]] = {}
+    keywords: list[str] = []
+    for item in available:
+        categories = item.get("categories", {})
+        if not isinstance(categories, Mapping):
+            continue
+        for category, payload in categories.items():
+            if not isinstance(payload, Mapping):
+                continue
+            label = str(payload.get("label", "")).strip()
+            if not label:
+                continue
+            category_votes.setdefault(str(category), defaultdict(list))[label].append(
+                _finite_float(payload.get("confidence"))
+            )
+        for keyword in item.get("search_keywords", []):
+            value = str(keyword).strip().lower()
+            if value and value not in keywords:
+                keywords.append(value)
+    aggregated: dict[str, Any] = {}
+    for category, labels in category_votes.items():
+        ranked = sorted(
+            (
+                (label, _mean(values), len(values))
+                for label, values in labels.items()
+            ),
+            key=lambda row: (row[2], row[1], row[0]),
+            reverse=True,
+        )
+        aggregated[category] = {
+            "label": ranked[0][0],
+            "confidence": _round(ranked[0][1]),
+            "distribution": {
+                label: _round(votes / len(available))
+                for label, _, votes in ranked
+            },
+        }
+    return {
+        "available": True,
+        "backend": "aggregate_pretrained_clip_zero_shot",
+        "coverage_ratio": _round(len(available) / max(1, len(analyses))),
+        "categories": aggregated,
+        "search_keywords": keywords[:20],
     }
 
 
@@ -1180,6 +1457,13 @@ def _aggregate(analyses: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "editing_rhythm": {"classification": "unresolved"},
             "subtitle_layout": {"dominant_region": "none_detected"},
             "overall_style": {"label": "unresolved", "descriptors": []},
+            "semantic_profile": {
+                "available": False,
+                "coverage_ratio": 0.0,
+                "categories": {},
+                "search_keywords": [],
+            },
+            "subject_profile": {},
             "search_hints": {
                 "language": "en",
                 "positive_terms": [],
@@ -1193,6 +1477,20 @@ def _aggregate(analyses: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 
     topic_distribution = _distribution(
         str(analysis.get("topic", {}).get("classification", "unresolved")) for analysis in analyses
+    )
+    corpus_semantics = _aggregate_corpus_semantics(analyses)
+    subject_profile = aggregate_subject_regions(
+        [
+            analysis.get("subject_profile", {})
+            for analysis in analyses
+            if isinstance(analysis.get("subject_profile"), Mapping)
+        ]
+    )
+    subject_profile["face_frame_ratio"] = _round(
+        _mean(
+            analysis.get("subject_profile", {}).get("face_frame_ratio", 0.0)
+            for analysis in analyses
+        )
     )
     mood_distribution = _distribution(
         str(analysis.get("visual_mood", {}).get("classification", "unresolved"))
@@ -1262,6 +1560,11 @@ def _aggregate(analyses: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         rhythm_label,
         topic_label,
     )
+    semantic_terms = _semantic_positive_terms(corpus_semantics)
+    hints["positive_terms"] = list(
+        dict.fromkeys(semantic_terms + list(hints.get("positive_terms", [])))
+    )[:24]
+    hints["semantic_terms"] = semantic_terms
 
     descriptors = [
         mood_label.replace("_", " "),
@@ -1333,6 +1636,8 @@ def _aggregate(analyses: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "descriptors": descriptors,
             "orientation_distribution": orientation_distribution,
         },
+        "semantic_profile": corpus_semantics,
+        "subject_profile": subject_profile,
         "search_hints": hints,
     }
 
@@ -1341,6 +1646,10 @@ def analyze_references(
     reference_dir: str | os.PathLike[str],
     cache_dir: str | os.PathLike[str],
     output_path: str | os.PathLike[str] | None = None,
+    *,
+    semantic_required: bool = False,
+    enable_semantics: bool = True,
+    semantic_cache_dir: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Analyze reference videos and return/write an aggregate style profile.
 
@@ -1349,6 +1658,11 @@ def analyze_references(
         cache_dir: Writable directory for ``reference_analysis_cache.json`` and,
             by default, ``style_profile.json``.
         output_path: Optional explicit style-profile JSON path.
+        semantic_required: Fail instead of degrading when the pretrained model
+            cannot be loaded.
+        enable_semantics: Disable model loading explicitly (primarily for
+            diagnostics and the documented fallback mode).
+        semantic_cache_dir: Optional Hugging Face model-cache directory.
 
     Unchanged successful entries are reused when analyzer version, size,
     nanosecond mtime and the sampled/full SHA-256 fingerprint all match.
@@ -1375,14 +1689,41 @@ def analyze_references(
     cache_root.mkdir(parents=True, exist_ok=True)
 
     cv2, np, ffprobe_executable = _require_dependencies()
+    if semantic_required and not enable_semantics:
+        raise ReferenceAnalysisError(
+            "semantic_required and enable_semantics=False are mutually exclusive"
+        )
+    if semantic_cache_dir is None:
+        project = discover_project_root(reference_root.parent)
+        semantic_cache_dir = RuntimePaths.build(project_root=project).cache_root / "models"
+    if enable_semantics:
+        semantic_analyzer, semantic_status = load_semantic_analyzer(
+            cache_dir=semantic_cache_dir,
+            required=semantic_required,
+        )
+    else:
+        semantic_analyzer = None
+        semantic_status = SemanticBackendStatus(
+            available=False,
+            model_id="disabled",
+            backend="disabled",
+            error="disabled by caller",
+        )
     videos = _discover_videos(reference_root)
     old_cache, cache_warning = _load_json(cache_path)
     old_analyzer_version = old_cache.get("analyzer_version")
+    old_semantic_backend = old_cache.get("semantic_backend", {})
+    semantic_cache_compatible = (
+        isinstance(old_semantic_backend, Mapping)
+        and bool(old_semantic_backend.get("available")) == bool(semantic_status.available)
+        and str(old_semantic_backend.get("model_id", "")) == str(semantic_status.model_id)
+    )
     migration_mode = old_analyzer_version in MIGRATABLE_ANALYZER_VERSIONS
     cache_compatible = (
         old_cache.get("cache_schema_version") == CACHE_SCHEMA_VERSION
         and (old_analyzer_version == ANALYZER_VERSION or migration_mode)
         and old_cache.get("reference_directory") == os.fspath(reference_root)
+        and semantic_cache_compatible
     )
     old_entries = old_cache.get("entries", {}) if cache_compatible else {}
     if not isinstance(old_entries, dict):
@@ -1424,6 +1765,10 @@ def analyze_references(
             and old_entry.get("status") == "ok"
             and old_entry.get("fingerprint") == fingerprint
             and isinstance(old_entry.get("analysis"), dict)
+            and (
+                not semantic_required
+                or bool(old_entry.get("analysis", {}).get("semantic_analysis", {}).get("available"))
+            )
         ):
             analysis = copy.deepcopy(old_entry["analysis"])
             entry = copy.deepcopy(old_entry)
@@ -1442,7 +1787,16 @@ def analyze_references(
         report["changed"].append(relative_path)
         try:
             metadata = _ffprobe(path, ffprobe_executable)
-            analysis = _analyze_one(path, relative_path, metadata, cv2, np)
+            analysis = _analyze_one(
+                path,
+                relative_path,
+                metadata,
+                cv2,
+                np,
+                semantic_analyzer,
+                semantic_status,
+                semantic_required,
+            )
             entry = {
                 "status": "ok",
                 "fingerprint": fingerprint,
@@ -1471,6 +1825,11 @@ def analyze_references(
     cache_payload = {
         "cache_schema_version": CACHE_SCHEMA_VERSION,
         "analyzer_version": ANALYZER_VERSION,
+        "semantic_backend": {
+            "available": semantic_status.available,
+            "model_id": semantic_status.model_id,
+            "backend": semantic_status.backend,
+        },
         "reference_directory": os.fspath(reference_root),
         "updated_at": _utc_now(),
         "entries": entries,
@@ -1478,13 +1837,23 @@ def analyze_references(
     _atomic_json_write(cache_path, cache_payload)
 
     style = _aggregate(analyses)
+    semantic_used = any(
+        bool(item.get("semantic_analysis", {}).get("available"))
+        for item in analyses
+    )
     profile: dict[str, Any] = {
         "schema_version": PROFILE_SCHEMA_VERSION,
         "generated_at": _utc_now(),
         "analyzer": {
             "name": "bgm-montage reference analyzer",
             "version": ANALYZER_VERSION,
-            "semantic_model_used": False,
+            "semantic_model_used": semantic_used,
+            "semantic_backend": {
+                "available": semantic_status.available,
+                "model_id": semantic_status.model_id,
+                "backend": semantic_status.backend,
+                "error": semantic_status.error if not semantic_status.available else None,
+            },
             "methods": [
                 "ffprobe metadata",
                 "uniform OpenCV frame sampling",
@@ -1493,6 +1862,10 @@ def analyze_references(
                 "sparse optical-flow motion heuristic",
                 "histogram cut detection",
                 "text-like edge-region heuristic without OCR",
+                "pretrained CLIP zero-shot visual semantics"
+                if semantic_used
+                else "explicit semantic fallback (no model output)",
+                "spectral-residual saliency and face-aware subject geometry",
             ],
         },
         "reference_directory": os.fspath(reference_root),
@@ -1523,7 +1896,8 @@ def analyze_references(
         # data is not serialized.  Full per-video summaries are in the cache too.
         "videos": [_video_summary(item) for item in analyses],
         "limitations": [
-            "Topic labels are conservative visual-structure heuristics, not semantic content recognition.",
+            "CLIP action and emotion labels are appearance-based estimates from sampled frames, not temporal action recognition.",
+            "When the semantic backend is unavailable, semantic fields are explicitly marked degraded and only structural heuristics remain.",
             "Sampled analysis can miss cuts or overlays shorter than the sampling interval.",
             "Optical-flow camera labels can include subject motion.",
             "Text-like regions may include signs, logos, UI and product labels.",
@@ -1534,10 +1908,9 @@ def analyze_references(
 
 
 def _default_paths() -> tuple[Path, Path]:
-    skill_root = Path(__file__).resolve().parents[1]
-    project_root = Path(os.environ.get("BGM_MONTAGE_PROJECT_ROOT", skill_root.parent)).expanduser().resolve()
-    reference_dir = Path(os.environ.get("BGM_MONTAGE_REFERENCE_DIR", project_root / "参考视频"))
-    cache_dir = Path(os.environ.get("BGM_MONTAGE_CACHE_DIR", project_root / ".bgm-montage-cache" / "references"))
+    paths = RuntimePaths.build(project_root=discover_project_root())
+    reference_dir = Path(os.environ.get("BGM_MONTAGE_REFERENCE_DIR", paths.project_root / "参考视频"))
+    cache_dir = Path(os.environ.get("BGM_MONTAGE_CACHE_DIR", paths.reference_cache))
     return reference_dir, cache_dir
 
 
@@ -1561,13 +1934,35 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional style_profile.json path (default: CACHE_DIR/style_profile.json)",
     )
+    parser.add_argument(
+        "--semantic-required",
+        action="store_true",
+        help="Fail if the pretrained CLIP backend cannot be loaded.",
+    )
+    parser.add_argument(
+        "--no-semantics",
+        action="store_true",
+        help="Explicitly run the documented structural-only fallback.",
+    )
+    parser.add_argument(
+        "--semantic-cache-dir",
+        default=None,
+        help="Optional Hugging Face model cache directory.",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
-        profile = analyze_references(args.reference_dir, args.cache_dir, args.output)
+        profile = analyze_references(
+            args.reference_dir,
+            args.cache_dir,
+            args.output,
+            semantic_required=args.semantic_required,
+            enable_semantics=not args.no_semantics,
+            semantic_cache_dir=args.semantic_cache_dir,
+        )
     except (ReferenceAnalysisError, FileNotFoundError, NotADirectoryError) as exc:
         print(f"reference analysis failed: {exc}", file=sys.stderr)
         return 2

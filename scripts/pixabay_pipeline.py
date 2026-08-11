@@ -37,17 +37,132 @@ import requests
 from dotenv import load_dotenv
 from PIL import Image
 
+from runtime_paths import RuntimePaths, migrate_legacy_nested_pixabay_cache, pixabay_cache_root
+from visual_semantics import (
+    aggregate_subject_regions,
+    face_content_risk,
+    infer_scene_category,
+    load_face_detector,
+    subject_region,
+)
+
 
 PIXABAY_VIDEO_API = "https://pixabay.com/api/videos/"
 CACHE_TTL_SECONDS = 24 * 60 * 60
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REQUEST_TIMEOUT = (10, 45)
 DOWNLOAD_TIMEOUT = (15, 180)
-USER_AGENT = "bgm-montage/1.0 (Pixabay video workflow)"
+USER_AGENT = "bgm-montage/1.1 (Pixabay video workflow)"
+
+_FACE_DETECTOR: Any | None = None
+
+
+def _face_detector() -> Any | None:
+    global _FACE_DETECTOR
+    if _FACE_DETECTOR is None:
+        _FACE_DETECTOR = load_face_detector()
+    return _FACE_DETECTOR
 
 
 class PixabayPipelineError(RuntimeError):
     """An expected, credential-safe pipeline failure."""
+
+
+class InsufficientMaterialError(PixabayPipelineError):
+    """Raised only after all bounded query expansions and QA are exhausted."""
+
+
+def _first_numeric(value: Any, names: set[str]) -> float | None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if str(key).lower() in names and isinstance(item, (int, float)):
+                number = float(item)
+                if math.isfinite(number) and number > 0:
+                    return number
+        for item in value.values():
+            found = _first_numeric(item, names)
+            if found is not None:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found = _first_numeric(item, names)
+            if found is not None:
+                return found
+    return None
+
+
+def evaluate_selected_sufficiency(
+    selected: Sequence[Mapping[str, Any]],
+    desired_count: int,
+    target_duration: float | None,
+) -> dict[str, Any]:
+    """Evaluate hard, machine-readable selection gates before rendering."""
+
+    duration = float(target_duration or 0.0)
+    if duration > 0:
+        min_unique = max(4, min(int(desired_count), math.ceil(duration / 3.5)))
+    else:
+        # Backward-compatible standalone calls without a target duration can
+        # only enforce the caller's requested count.  The unified entry always
+        # supplies duration and therefore gets the full four-asset floor.
+        min_unique = max(1, min(int(desired_count), 4))
+    identities = {
+        str(item.get("fingerprint", {}).get("sha256") or item.get("pixabay_id") or item.get("local_path"))
+        for item in selected
+    }
+    def quality_of(item: Mapping[str, Any]) -> Mapping[str, Any]:
+        value = item.get("quality")
+        return value if isinstance(value, Mapping) else {}
+
+    scenes = {
+        str(
+            item.get("scene_category")
+            or quality_of(item).get("scene_category")
+            or infer_scene_category(str(item.get("tags") or ""), None)
+        )
+        for item in selected
+    }
+    face_risks = [
+        float(
+            item.get("face_content_risk")
+            or quality_of(item).get("face_content_risk")
+            or face_content_risk(str(item.get("tags") or ""), None, None)
+        )
+        for item in selected
+    ]
+    low_face_count = sum(risk < 0.65 for risk in face_risks)
+    min_scenes = min(3, min_unique)
+    required_low_face = max(1, math.ceil(min_unique * 0.65))
+    theoretical_coverage = sum(
+        min(float(item.get("duration_seconds") or item.get("duration") or 0.0), duration * 0.30)
+        for item in selected
+    ) if duration > 0 else 0.0
+    failures: list[str] = []
+    if len(identities) < min_unique:
+        failures.append(f"independent assets {len(identities)} < {min_unique}")
+    if len(scenes) < min_scenes:
+        failures.append(f"scene categories {len(scenes)} < {min_scenes}")
+    if low_face_count < required_low_face:
+        failures.append(f"low-face-risk assets {low_face_count} < {required_low_face}")
+    if duration > 0 and theoretical_coverage < duration * 0.95:
+        failures.append(
+            f"theoretical screen coverage {theoretical_coverage:.2f}s < {duration * 0.95:.2f}s"
+        )
+    return {
+        "passed": not failures,
+        "failures": failures,
+        "independent_asset_count": len(identities),
+        "required_independent_assets": min_unique,
+        "scene_categories": sorted(scenes),
+        "required_scene_categories": min_scenes,
+        "low_face_risk_assets": low_face_count,
+        "required_low_face_risk_assets": required_low_face,
+        "theoretical_screen_coverage_seconds": round(theoretical_coverage, 4),
+        "target_duration_seconds": round(duration, 4) if duration > 0 else None,
+        "max_reuse_per_asset": 2,
+        "max_asset_screen_share": 0.30,
+        "max_prominent_face_screen_share": 0.15,
+    }
 
 
 def _utc_now() -> str:
@@ -391,7 +506,7 @@ def _scene_concepts(theme_terms: Sequence[str]) -> list[str]:
     joined = " ".join(theme_terms)
     rules: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
         (("ocean", "sea", "coast", "beach"), ("waves aerial", "shore detail", "coastal landscape", "water reflection")),
-        (("factory", "industry", "manufacturing", "machinery"), ("production line", "machine close up", "factory worker", "industrial sparks")),
+        (("factory", "industry", "manufacturing", "machinery"), ("production line", "machine close up", "factory interior", "industrial sparks")),
         (("city", "urban", "street"), ("city skyline", "street life", "urban aerial", "architecture detail")),
         (("nature", "forest", "mountain", "landscape"), ("wide landscape", "nature detail", "aerial wilderness", "sunlight atmosphere")),
         (("technology", "digital", "futuristic"), ("technology close up", "digital network", "futuristic city", "electronics detail")),
@@ -404,6 +519,11 @@ def _scene_concepts(theme_terms: Sequence[str]) -> list[str]:
         if any(needle in joined for needle in needles):
             return list(concepts)
     return ["wide establishing", "close up detail", "aerial view", "authentic atmosphere"]
+
+
+def _human_focused_theme(theme_terms: Sequence[str]) -> bool:
+    tokens = set(_english_words(" ".join(theme_terms)))
+    return bool(tokens & {"people", "person", "portrait", "family", "fashion", "wedding", "interview", "human"})
 
 
 def generate_visual_queries(
@@ -465,7 +585,11 @@ def generate_visual_queries(
             (
                 _clean_query([anchor, "aerial wide view"]),
                 _clean_query([anchor, "close detail texture"]),
-                _clean_query([anchor, "people authentic lifestyle"]),
+                _clean_query(
+                    [anchor, "people authentic lifestyle"]
+                    if _human_focused_theme(theme_words)
+                    else [anchor, "empty environment architecture landscape"]
+                ),
                 _clean_query([anchor, "environment atmosphere motion"]),
                 _clean_query(theme_words[:2]),
             )
@@ -480,7 +604,12 @@ def _search_cache_path(cache_dir: Path, query: str, page: int, per_page: int) ->
         ensure_ascii=True,
     )
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-    return cache_dir / "pixabay" / "search" / f"{digest}.json"
+    # ``cache_dir`` is the Pixabay-stage namespace root.  v1.0 appended the
+    # namespace here as well as in the unified caller, producing
+    # ``pixabay/pixabay/search`` and making the standalone and unified entry
+    # points miss each other's cache.  Normalize once at the public boundary
+    # and keep all helpers relative to that namespace.
+    return cache_dir / "search" / f"{digest}.json"
 
 
 def _pixabay_search(
@@ -666,6 +795,8 @@ def _image_signals(image_bgr: np.ndarray, target_color: Mapping[str, float]) -> 
             "color_score": 0.5,
             "text_watermark_risk": 0.5,
             "perceptual_hash": None,
+            "subject_profile": {},
+            "face_content_risk": 0.5,
         }
     height, width = image_bgr.shape[:2]
     scale = min(1.0, 640.0 / max(width, height))
@@ -694,6 +825,8 @@ def _image_signals(image_bgr: np.ndarray, target_color: Mapping[str, float]) -> 
     text_risk = float(np.clip((border_density - center_density * 0.75) * 5.0, 0.0, 1.0))
     pil_image = Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
     phash = str(imagehash.phash(pil_image))
+    subject = subject_region(image_bgr, _face_detector())
+    image_face_risk = face_content_risk("", None, subject)
     return {
         "available": True,
         "width": int(image_bgr.shape[1]),
@@ -706,6 +839,8 @@ def _image_signals(image_bgr: np.ndarray, target_color: Mapping[str, float]) -> 
         "color_score": round(color_score, 4),
         "text_watermark_risk": round(text_risk, 4),
         "perceptual_hash": phash,
+        "subject_profile": subject,
+        "face_content_risk": round(image_face_risk, 4),
     }
 
 
@@ -717,7 +852,7 @@ def _get_thumbnail_signals(
     target_color: Mapping[str, float],
 ) -> dict[str, Any]:
     asset_id = str(hit.get("id") or hashlib.sha1(str(hit).encode("utf-8")).hexdigest()[:12])
-    thumb_path = cache_dir / "pixabay" / "thumbnails" / f"{asset_id}.jpg"
+    thumb_path = cache_dir / "thumbnails" / f"{asset_id}.jpg"
     data: bytes | None = None
     if thumb_path.is_file() and time.time() - thumb_path.stat().st_mtime <= CACHE_TTL_SECONDS:
         try:
@@ -753,7 +888,8 @@ def _infer_shot_type(tags: str) -> str:
         return "close_up"
     if any(term in text for term in ("wide", "landscape", "panorama", "skyline")):
         return "wide"
-    if any(term in text for term in ("portrait", "face", "person", "people", "woman", "man")):
+    person_pattern = re.compile(r"\b(?:portrait|face|person|people|woman|women|man|men)\b")
+    if person_pattern.search(text):
         return "medium_portrait"
     if any(term in text for term in ("pov", "point of view", "tracking")):
         return "pov_tracking"
@@ -854,6 +990,15 @@ def _metadata_score(
     motion = _motion_tag_score(tags)
     desired = _desired_motion(style_profile, audio_profile)
     motion_style = float(np.clip(1.0 - abs(motion - desired), 0.0, 1.0))
+    metadata_face_risk = face_content_risk(tags, None, None)
+    environment_terms = {
+        "environment", "landscape", "nature", "architecture", "building", "road",
+        "traffic", "aerial", "drone", "forest", "mountain", "ocean", "factory",
+        "machine", "sky", "street", "city", "transport",
+    }
+    environment_priority = min(1.0, len(tag_tokens & environment_terms) / 2.0)
+    human_theme = _human_focused_theme(_theme_terms(theme))
+    face_penalty = metadata_face_risk * (0.28 if human_theme else 0.72)
     components = {
         "relevance": relevance,
         "resolution": resolution,
@@ -862,6 +1007,9 @@ def _metadata_score(
         "duration": duration_score,
         "motion_style": motion_style,
         "avoid_penalty": avoid_penalty,
+        "face_content_risk": metadata_face_risk,
+        "face_penalty": face_penalty,
+        "environment_priority": environment_priority,
     }
     score = (
         0.40 * relevance
@@ -870,6 +1018,8 @@ def _metadata_score(
         + 0.10 * popularity
         + 0.06 * duration_score
         + 0.11 * motion_style
+        + 0.06 * environment_priority
+        - 0.22 * face_penalty
     )
     return float(score), {key: round(value, 4) for key, value in components.items()}
 
@@ -901,10 +1051,15 @@ def _score_candidates(
             thumbnail = _image_signals(np.empty((0, 0, 3), dtype=np.uint8), target_color)
         candidate["thumbnail_signals"] = thumbnail
         quality = 0.42 * float(thumbnail["sharpness_score"]) + 0.38 * float(thumbnail["exposure_score"]) + 0.20 * (1.0 - float(thumbnail["text_watermark_risk"]))
+        visual_face_risk = max(
+            float(candidate["score_components"].get("face_content_risk", 0.0)),
+            float(thumbnail.get("face_content_risk", 0.0)),
+        )
         candidate["score_components"].update(
             {
                 "thumbnail_quality": round(quality, 4),
                 "color": round(float(thumbnail["color_score"]), 4),
+                "visual_face_risk": round(visual_face_risk, 4),
             }
         )
         # Reweight metadata components after thumbnail inspection.
@@ -917,11 +1072,14 @@ def _score_candidates(
             + 0.09 * candidate["score_components"]["motion_style"]
             + 0.13 * quality
             + 0.08 * float(thumbnail["color_score"])
+            - 0.28 * visual_face_risk
         )
         candidate["pre_score"] = round(float(pre_score), 6)
         candidate["shot_type"] = _infer_shot_type(str(candidate.get("tags") or ""))
         candidate["shot_scale"] = _infer_shot_scale(str(candidate.get("tags") or ""))
         candidate["motion_score_estimate"] = round(_motion_tag_score(str(candidate.get("tags") or "")), 4)
+        candidate["face_content_risk"] = round(visual_face_risk, 4)
+        candidate["scene_category"] = infer_scene_category(str(candidate.get("tags") or ""), None)
     return _diversified_order(candidates)
 
 
@@ -1049,10 +1207,14 @@ def _collect_candidates(
         round_record["pool_after"] = len(candidates_by_id)
         round_record["new_unique_candidates"] = len(candidates_by_id) - round_record["pool_before"]
         search_rounds.append(round_record)
-        if len(candidates_by_id) >= target_pool:
-            round_record["stop_reason"] = "candidate pool target reached"
-            break
-        round_record["stop_reason"] = "continue with broader terms" if round_index < 2 else "maximum expansion reached"
+        # Run every bounded expansion level.  Metadata count alone is not a
+        # sufficiency signal: full-video QA, fingerprints, scene diversity and
+        # the face policy can remove many candidates later.
+        round_record["stop_reason"] = (
+            "continue proactively; post-download sufficiency is not known yet"
+            if round_index < 2
+            else "maximum bounded expansion reached"
+        )
 
     if not candidates_by_id and errors:
         raise PixabayPipelineError(f"All Pixabay searches failed; first error: {errors[0]['error']}")
@@ -1224,6 +1386,8 @@ def _video_quality(
     path: Path,
     style_profile: Mapping[str, Any] | None,
     min_resolution: tuple[int, int],
+    tags: str = "",
+    human_focused: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     probe = _ffprobe(path)
     video_stream = next(
@@ -1247,6 +1411,12 @@ def _video_quality(
     color = float(np.mean([item["color_score"] for item in per_frame]))
     motion, stability, motion_raw = _motion_and_stability(frames)
     watermark = _watermark_risk(frames)
+    subject_profile = aggregate_subject_regions(
+        [item.get("subject_profile", {}) for item in per_frame]
+    )
+    # aggregate_subject_regions expects raw per-frame face_count fields, which
+    # are present in each subject profile returned by _image_signals.
+    full_face_risk = face_content_risk(tags, None, subject_profile)
     min_long, min_short = sorted(min_resolution, reverse=True)
     long_side, short_side = sorted((width, height), reverse=True)
     resolution_score = float(np.clip(min(long_side / max(1, min_long), short_side / max(1, min_short)), 0.0, 1.0))
@@ -1258,6 +1428,7 @@ def _video_quality(
         + 0.13 * resolution_score
         + 0.08 * (1.0 - watermark)
         + 0.08 * (0.55 + 0.45 * motion)
+        - (0.05 if human_focused else 0.18) * full_face_risk
     )
     reasons: list[str] = []
     if long_side < min_long or short_side < min_short:
@@ -1274,6 +1445,8 @@ def _video_quality(
         reasons.append("persistent edge text/logo heuristic triggered")
     if overall < 0.34:
         reasons.append("overall quality score below threshold")
+    if full_face_risk >= 0.94 and not human_focused:
+        reasons.append("prominent frontal-face content exceeds default policy")
     quality = {
         "passed": not reasons,
         "rejection_reasons": reasons,
@@ -1288,6 +1461,9 @@ def _video_quality(
         "mean_hsv": per_frame[len(per_frame) // 2].get("mean_hsv", {}),
         "motion_signals": motion_raw,
         "sampled_frames": len(frames),
+        "subject_profile": subject_profile,
+        "face_content_risk": round(full_face_risk, 4),
+        "scene_category": infer_scene_category(tags, None),
         "heuristic_notice": "Signal-derived estimates; text/logo detection is not OCR.",
     }
     fingerprint = _video_fingerprint(path, frames, duration, width, height)
@@ -1396,6 +1572,142 @@ def _load_fingerprint_library(path: Path) -> dict[str, Any]:
     return {"schema_version": SCHEMA_VERSION, "updated_at": _utc_now(), "entries": cleaned}
 
 
+def _library_entry_key(entry: Mapping[str, Any]) -> str:
+    """Return a stable identity without treating two Pixabay IDs as one item."""
+
+    pixabay_id = entry.get("pixabay_id")
+    if pixabay_id not in (None, ""):
+        return f"pixabay:{pixabay_id}"
+    fingerprint = entry.get("fingerprint") if isinstance(entry.get("fingerprint"), Mapping) else entry
+    sha256 = str(fingerprint.get("sha256") or "")
+    if sha256:
+        return f"sha256:{sha256}"
+    return f"path:{Path(str(entry.get('local_path') or '')).expanduser()}"
+
+
+def _merge_library_entries(
+    sources: Sequence[tuple[str, Sequence[Mapping[str, Any]]]],
+) -> list[dict[str, Any]]:
+    """Merge v1.0/project/global catalogs, preferring a usable local file."""
+
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for origin, entries in sources:
+        for raw in entries:
+            if not isinstance(raw, Mapping):
+                continue
+            entry = dict(raw)
+            entry.setdefault("library_origin", origin)
+            key = _library_entry_key(entry)
+            previous = merged.get(key)
+            if previous is None:
+                merged[key] = entry
+                order.append(key)
+                continue
+            previous_path = Path(str(previous.get("local_path") or ""))
+            candidate_path = Path(str(entry.get("local_path") or ""))
+            previous_exists = bool(previous.get("local_path")) and previous_path.is_file()
+            candidate_exists = bool(entry.get("local_path")) and candidate_path.is_file()
+            if candidate_exists and not previous_exists:
+                replacement = entry
+                for field, value in previous.items():
+                    replacement.setdefault(field, value)
+                merged[key] = replacement
+            else:
+                for field, value in entry.items():
+                    if previous.get(field) in (None, "", [], {}):
+                        previous[field] = value
+    return [merged[key] for key in order]
+
+
+def _persist_material_libraries(
+    paths: Sequence[Path],
+    entries: Sequence[Mapping[str, Any]],
+    secret: str,
+) -> None:
+    """Atomically update every catalog while retaining entries from other runs."""
+
+    seen: set[Path] = set()
+    working = [dict(entry) for entry in entries if isinstance(entry, Mapping)]
+    for raw_path in paths:
+        path = raw_path.expanduser().resolve()
+        if path in seen:
+            continue
+        seen.add(path)
+        current = _load_fingerprint_library(path)
+        working = _merge_library_entries(
+            (
+                ("current_run", working),
+                (str(path), current.get("entries", [])),
+            )
+        )
+        _atomic_write_json(
+            path,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "updated_at": _utc_now(),
+                "entries": working,
+            },
+            secret,
+        )
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    try:
+        return left.samefile(right)
+    except OSError:
+        return False
+
+
+def _reuse_local_path(
+    known_path: Path,
+    theme_dir: Path,
+    candidate: Mapping[str, Any],
+    sequence: int,
+    theme: str,
+) -> tuple[Path, str]:
+    """Reuse a prior download via an NTFS/POSIX hard link or direct reference."""
+
+    known_path = known_path.expanduser().resolve()
+    theme_dir = theme_dir.expanduser().resolve()
+    if known_path.parent == theme_dir:
+        return known_path, "same_theme_reference"
+
+    asset_id = str(candidate.get("pixabay_id") or candidate.get("id") or "asset")
+    extension = known_path.suffix.lower() or ".mp4"
+    # Reuse a hard link made by a previous run even if ranking changed its
+    # sequence number; never create a second link for the same inode.
+    for existing in sorted(theme_dir.glob(f"*_{asset_id}{extension}")):
+        if existing.is_file() and _same_file(existing, known_path):
+            return existing.resolve(), "hardlink_existing"
+
+    description = _chinese_description(str(candidate.get("tags") or ""), theme)
+    target = theme_dir / (
+        _safe_chinese_slug(f"{sequence:02d}_{description}_{asset_id}", f"asset_{asset_id}")
+        + extension
+    )
+    if target.exists():
+        if _same_file(target, known_path):
+            return target.resolve(), "hardlink_existing"
+        # A deterministic collision must not overwrite unrelated user data.
+        target = theme_dir / (
+            _safe_chinese_slug(f"{sequence:02d}_{description}_reuse_{asset_id}", f"asset_reuse_{asset_id}")
+            + extension
+        )
+        if target.exists():
+            if _same_file(target, known_path):
+                return target.resolve(), "hardlink_existing"
+            return known_path, "shared_reference"
+    try:
+        os.link(known_path, target)
+        return target.resolve(), "hardlink"
+    except OSError:
+        # Cross-volume links and restricted filesystems are expected fallbacks.
+        # Referencing the already downloaded immutable stock clip is preferable
+        # to copying it or downloading it again.
+        return known_path, "shared_reference"
+
+
 def _public_candidate(candidate: Mapping[str, Any], decision: str = "ranked") -> dict[str, Any]:
     variant = candidate.get("variant") if isinstance(candidate.get("variant"), Mapping) else {}
     return {
@@ -1415,6 +1727,8 @@ def _public_candidate(candidate: Mapping[str, Any], decision: str = "ranked") ->
         "shot_type": candidate.get("shot_type") or "medium",
         "shot_scale": candidate.get("shot_scale") or "medium",
         "motion_score_estimate": candidate.get("motion_score_estimate", 0.5),
+        "scene_category": candidate.get("scene_category") or infer_scene_category(str(candidate.get("tags") or ""), None),
+        "face_content_risk": candidate.get("face_content_risk", 0.0),
         "decision": decision,
     }
 
@@ -1445,6 +1759,7 @@ def run_pixabay_pipeline(
     aspect_ratio: str,
     min_resolution: tuple[int, int] = (1280, 720),
     dry_run: bool = False,
+    target_duration: float | None = None,
 ) -> dict[str, Any]:
     """Search, select, download, QA, deduplicate, and attribute Pixabay clips.
 
@@ -1460,6 +1775,11 @@ def run_pixabay_pipeline(
         raise ValueError("desired_count must be positive")
     style_profile = _style_payload(style_profile)
     audio_profile = _audio_payload(audio_profile)
+    if target_duration is None:
+        target_duration = _first_numeric(
+            audio_profile,
+            {"analyzed_duration_seconds", "duration_seconds", "duration"},
+        )
     min_resolution = _parse_resolution(min_resolution)
     target_ratio, ratio_label = _parse_aspect_ratio(aspect_ratio)
     _load_environment()
@@ -1467,14 +1787,51 @@ def run_pixabay_pipeline(
     if not api_key:
         raise PixabayPipelineError("PIXABAY_API_KEY is not set; put it in the project-root .env or environment")
 
-    cache_root = Path(cache_dir).expanduser().resolve()
+    # Public contract: ``cache_dir`` is the Pixabay-stage namespace.  Accepting
+    # the old project-cache root remains backward compatible via
+    # ``pixabay_cache_root`` but every downstream helper sees exactly one
+    # ``.../pixabay`` directory.
+    cache_root = pixabay_cache_root(cache_dir)
+    runtime_paths = RuntimePaths.build(cache_root=cache_root.parent)
     theme_dir = material_theme_directory(material_root, theme)
     theme_dir.mkdir(parents=True, exist_ok=True)
     cache_root.mkdir(parents=True, exist_ok=True)
+    nested_migration = migrate_legacy_nested_pixabay_cache(cache_root)
     manifest_path = theme_dir / "sources.json"
     prior_usage = _existing_usage(manifest_path)
     fingerprint_path = cache_root / "video_fingerprints.json"
-    fingerprint_library = _load_fingerprint_library(fingerprint_path)
+    legacy_root_fingerprint = cache_root.parent / "video_fingerprints.json"
+    project_material_index = cache_root / "material_index.json"
+    global_material_index = runtime_paths.global_material_index
+    catalog_specs: list[tuple[str, Path]] = [
+        ("pixabay_stage", fingerprint_path),
+        ("project_material_index", project_material_index),
+        ("global_material_index", global_material_index),
+    ]
+    if legacy_root_fingerprint != fingerprint_path:
+        catalog_specs.insert(1, ("legacy_project_cache_root", legacy_root_fingerprint))
+    catalog_sources: list[tuple[str, Sequence[Mapping[str, Any]]]] = []
+    catalog_counts: dict[str, int] = {}
+    for origin, path in catalog_specs:
+        library = _load_fingerprint_library(path)
+        entries = library.get("entries", [])
+        catalog_sources.append((origin, entries))
+        catalog_counts[origin] = len(entries)
+    existing_entries = _merge_library_entries(catalog_sources)
+    fingerprint_library = {
+        "schema_version": SCHEMA_VERSION,
+        "updated_at": _utc_now(),
+        "entries": existing_entries,
+    }
+    library_paths = [fingerprint_path, project_material_index, global_material_index]
+    if existing_entries:
+        _persist_material_libraries(library_paths, existing_entries, api_key)
+    cache_migration = {
+        "legacy_nested_cache_copied": nested_migration,
+        "catalog_entries_loaded": catalog_counts,
+        "merged_existing_entries": len(existing_entries),
+        "legacy_sources_left_in_place": True,
+    }
 
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
@@ -1504,7 +1861,6 @@ def run_pixabay_pipeline(
 
     selected: list[dict[str, Any]] = []
     rejections: list[dict[str, Any]] = []
-    existing_entries = list(fingerprint_library["entries"])
     known_by_id = {str(entry.get("pixabay_id")): entry for entry in existing_entries if entry.get("pixabay_id") is not None}
 
     if dry_run:
@@ -1520,46 +1876,80 @@ def run_pixabay_pipeline(
             known = known_by_id.get(asset_id)
             if known and Path(str(known.get("local_path") or "")).is_file():
                 known_path = Path(str(known["local_path"])).resolve()
-                if known_path.parent == theme_dir.resolve():
-                    quality = dict(known.get("quality") or {})
-                    media = dict(known.get("media") or {})
-                    usage = prior_usage.get(asset_id, prior_usage.get(str(known_path), []))
-                    source = {
-                        "id": candidate["pixabay_id"],
-                        "pixabay_id": candidate["pixabay_id"],
-                        "author": candidate.get("user") or known.get("author") or "",
-                        "page_url": candidate.get("page_url") or known.get("page_url") or "",
-                        "search_query": (candidate.get("matched_queries") or [""])[0],
-                        "search_queries": list(candidate.get("matched_queries") or []),
-                        "local_path": str(known_path),
-                        "duration_seconds": media.get("duration_seconds", candidate.get("duration", 0)),
-                        "duration": media.get("duration_seconds", candidate.get("duration", 0)),
-                        "width": media.get("width", candidate["variant"].get("width", 0)),
-                        "height": media.get("height", candidate["variant"].get("height", 0)),
-                        "shot_type": candidate.get("shot_type"),
-                        "shot_scale": candidate.get("shot_scale"),
-                        "motion_score": quality.get("motion_score", candidate.get("motion_score_estimate", 0.5)),
-                        "pre_score": candidate.get("pre_score"),
-                        "quality": quality,
-                        "fingerprint": known.get("fingerprint") or media.get("fingerprint"),
-                        "usage_intervals": usage,
-                        "actual_usage_intervals": usage,
-                        "reused_existing_file": True,
+                reused_path, reuse_mode = _reuse_local_path(
+                    known_path,
+                    theme_dir,
+                    candidate,
+                    len(selected) + 1,
+                    theme,
+                )
+                quality = dict(known.get("quality") or {})
+                media = dict(known.get("media") or {})
+                usage = prior_usage.get(
+                    asset_id,
+                    prior_usage.get(str(reused_path), prior_usage.get(str(known_path), [])),
+                )
+                reuse_origin = {
+                    "local_path": str(known_path),
+                    "pixabay_id": known.get("pixabay_id", candidate["pixabay_id"]),
+                    "library_origin": known.get("library_origin", "material_library"),
+                    "added_at": known.get("added_at"),
+                }
+                source = {
+                    "id": candidate["pixabay_id"],
+                    "pixabay_id": candidate["pixabay_id"],
+                    "author": candidate.get("user") or known.get("author") or "",
+                    "page_url": candidate.get("page_url") or known.get("page_url") or "",
+                    "tags": candidate.get("tags") or known.get("tags") or "",
+                    "search_query": (candidate.get("matched_queries") or [""])[0],
+                    "search_queries": list(candidate.get("matched_queries") or []),
+                    "local_path": str(reused_path),
+                    "duration_seconds": media.get("duration_seconds", candidate.get("duration", 0)),
+                    "duration": media.get("duration_seconds", candidate.get("duration", 0)),
+                    "width": media.get("width", candidate["variant"].get("width", 0)),
+                    "height": media.get("height", candidate["variant"].get("height", 0)),
+                    "fps": media.get("fps"),
+                    "shot_type": candidate.get("shot_type"),
+                    "shot_scale": candidate.get("shot_scale"),
+                    "motion_score": quality.get("motion_score", candidate.get("motion_score_estimate", 0.5)),
+                    "scene_category": quality.get("scene_category", candidate.get("scene_category", "general")),
+                    "face_content_risk": quality.get("face_content_risk", candidate.get("face_content_risk", 0.0)),
+                    "subject_profile": quality.get(
+                        "subject_profile",
+                        candidate.get("thumbnail_signals", {}).get("subject_profile", {}),
+                    ),
+                    "pre_score": candidate.get("pre_score"),
+                    "score_components": candidate.get("score_components"),
+                    "quality": quality,
+                    "fingerprint": known.get("fingerprint") or media.get("fingerprint"),
+                    "usage_intervals": usage,
+                    "actual_usage_intervals": usage,
+                    "reused_existing_file": True,
+                    "reuse_mode": reuse_mode,
+                    "reuse_origin": reuse_origin,
+                }
+                selected.append(source)
+                log_item.update(
+                    {
+                        "decision": "selected_existing",
+                        "local_path": source["local_path"],
+                        "reuse_mode": reuse_mode,
+                        "reuse_origin": reuse_origin,
                     }
-                    selected.append(source)
-                    log_item["decision"] = "selected_existing"
-                    continue
-                reason = "duplicate Pixabay ID already present in global material library"
-                rejection = {"pixabay_id": candidate["pixabay_id"], "stage": "global_dedup", "reasons": [reason]}
-                rejections.append(rejection)
-                log_item.update({"decision": "rejected", "rejection_stage": "global_dedup", "reasons": [reason]})
+                )
                 continue
 
             extension = _extension_from_url(str(candidate["variant"]["url"]))
             temp_path = theme_dir / f".pixabay_{asset_id}_{os.getpid()}.part{extension}"
             try:
                 _download_video(session, str(candidate["variant"]["url"]), temp_path, api_key)
-                quality, media = _video_quality(temp_path, style_profile, min_resolution)
+                quality, media = _video_quality(
+                    temp_path,
+                    style_profile,
+                    min_resolution,
+                    tags=str(candidate.get("tags") or ""),
+                    human_focused=_human_focused_theme(_theme_terms(theme)),
+                )
                 if not quality["passed"]:
                     rejection = {
                         "pixabay_id": candidate["pixabay_id"],
@@ -1573,16 +1963,83 @@ def run_pixabay_pipeline(
                     continue
                 duplicate, duplicate_of, distance = _fingerprint_duplicate(media["fingerprint"], existing_entries)
                 if duplicate:
-                    reason = f"video fingerprint duplicates existing material {duplicate_of}"
-                    rejection = {
-                        "pixabay_id": candidate["pixabay_id"],
-                        "stage": "post_download_dedup",
-                        "reasons": [reason],
-                        "perceptual_distance": distance,
-                    }
-                    rejections.append(rejection)
-                    log_item.update({"decision": "rejected", "rejection_stage": "post_download_dedup", "reasons": [reason]})
+                    existing_duplicate = next(
+                        (
+                            entry
+                            for entry in existing_entries
+                            if str(entry.get("pixabay_id")) == str(duplicate_of)
+                            or str(entry.get("local_path")) == str(duplicate_of)
+                        ),
+                        None,
+                    )
+                    existing_path = (
+                        Path(str(existing_duplicate.get("local_path"))).resolve()
+                        if isinstance(existing_duplicate, Mapping) and existing_duplicate.get("local_path")
+                        else None
+                    )
                     temp_path.unlink(missing_ok=True)
+                    if existing_path is None or not existing_path.is_file():
+                        reason = f"video fingerprint duplicates unavailable catalog entry {duplicate_of}"
+                        rejection = {
+                            "pixabay_id": candidate["pixabay_id"],
+                            "stage": "post_download_dedup",
+                            "reasons": [reason],
+                            "perceptual_distance": distance,
+                        }
+                        rejections.append(rejection)
+                        log_item.update({"decision": "rejected", "rejection_stage": "post_download_dedup", "reasons": [reason]})
+                        continue
+                    reused_path, reuse_mode = _reuse_local_path(
+                        existing_path, theme_dir, candidate, len(selected) + 1, theme
+                    )
+                    usage = prior_usage.get(asset_id, prior_usage.get(str(reused_path), []))
+                    source = {
+                        "id": candidate["pixabay_id"],
+                        "pixabay_id": candidate["pixabay_id"],
+                        "author": candidate.get("user") or "",
+                        "page_url": candidate.get("page_url") or "",
+                        "tags": candidate.get("tags") or "",
+                        "search_query": (candidate.get("matched_queries") or [""])[0],
+                        "search_queries": list(candidate.get("matched_queries") or []),
+                        "local_path": str(reused_path),
+                        "duration_seconds": media["duration_seconds"],
+                        "duration": media["duration_seconds"],
+                        "width": media["width"],
+                        "height": media["height"],
+                        "fps": media["fps"],
+                        "shot_type": candidate.get("shot_type"),
+                        "shot_scale": candidate.get("shot_scale"),
+                        "motion_score": quality["motion_score"],
+                        "scene_category": quality.get("scene_category", candidate.get("scene_category", "general")),
+                        "face_content_risk": quality.get("face_content_risk", candidate.get("face_content_risk", 0.0)),
+                        "subject_profile": quality.get("subject_profile", {}),
+                        "pre_score": candidate.get("pre_score"),
+                        "score_components": candidate.get("score_components"),
+                        "quality": quality,
+                        "fingerprint": media["fingerprint"],
+                        "usage_intervals": usage,
+                        "actual_usage_intervals": usage,
+                        "reused_existing_file": True,
+                        "reuse_mode": f"perceptual_{reuse_mode}",
+                        "reuse_origin": {"local_path": str(existing_path), "duplicate_of": duplicate_of, "perceptual_distance": distance},
+                    }
+                    selected.append(source)
+                    alias_entry = {
+                        "pixabay_id": candidate["pixabay_id"],
+                        "author": source["author"],
+                        "page_url": source["page_url"],
+                        "tags": source["tags"],
+                        "local_path": source["local_path"],
+                        "added_at": _utc_now(),
+                        "library_origin": "perceptual_reuse",
+                        "fingerprint": media["fingerprint"],
+                        "quality": quality,
+                        "media": media,
+                    }
+                    existing_entries.append(alias_entry)
+                    known_by_id[asset_id] = alias_entry
+                    _persist_material_libraries(library_paths, existing_entries, api_key)
+                    log_item.update({"decision": "selected_perceptual_reuse", "local_path": source["local_path"], "reuse_mode": source["reuse_mode"]})
                     continue
                 description = _chinese_description(str(candidate.get("tags") or ""), theme)
                 final_name = _safe_chinese_slug(
@@ -1599,6 +2056,7 @@ def run_pixabay_pipeline(
                     "pixabay_id": candidate["pixabay_id"],
                     "author": candidate.get("user") or "",
                     "page_url": candidate.get("page_url") or "",
+                    "tags": candidate.get("tags") or "",
                     "search_query": (candidate.get("matched_queries") or [""])[0],
                     "search_queries": list(candidate.get("matched_queries") or []),
                     "local_path": str(final_path.resolve()),
@@ -1610,6 +2068,9 @@ def run_pixabay_pipeline(
                     "shot_type": candidate.get("shot_type"),
                     "shot_scale": candidate.get("shot_scale"),
                     "motion_score": quality["motion_score"],
+                    "scene_category": quality.get("scene_category", candidate.get("scene_category", "general")),
+                    "face_content_risk": quality.get("face_content_risk", candidate.get("face_content_risk", 0.0)),
+                    "subject_profile": quality.get("subject_profile", {}),
                     "pre_score": candidate.get("pre_score"),
                     "score_components": candidate.get("score_components"),
                     "quality": quality,
@@ -1617,14 +2078,18 @@ def run_pixabay_pipeline(
                     "usage_intervals": usage,
                     "actual_usage_intervals": usage,
                     "reused_existing_file": False,
+                    "reuse_mode": "downloaded",
+                    "reuse_origin": None,
                 }
                 selected.append(source)
                 library_entry = {
                     "pixabay_id": candidate["pixabay_id"],
                     "author": source["author"],
                     "page_url": source["page_url"],
+                    "tags": source["tags"],
                     "local_path": source["local_path"],
                     "added_at": _utc_now(),
+                    "library_origin": "current_download",
                     "fingerprint": media["fingerprint"],
                     "quality": quality,
                     "media": media,
@@ -1632,7 +2097,8 @@ def run_pixabay_pipeline(
                 existing_entries.append(library_entry)
                 fingerprint_library["entries"] = existing_entries
                 fingerprint_library["updated_at"] = _utc_now()
-                _atomic_write_json(fingerprint_path, fingerprint_library, api_key)
+                known_by_id[asset_id] = library_entry
+                _persist_material_libraries(library_paths, existing_entries, api_key)
                 log_item.update({"decision": "selected", "local_path": source["local_path"], "quality": quality})
             except PixabayPipelineError as exc:
                 temp_path.unlink(missing_ok=True)
@@ -1641,6 +2107,23 @@ def run_pixabay_pipeline(
                 rejections.append(rejection)
                 log_item.update({"decision": "rejected", "rejection_stage": "download_or_decode", "reasons": [safe]})
         status = "ok" if len(selected) >= desired_count else "partial"
+
+    sufficiency = (
+        {
+            "passed": True,
+            "failures": [],
+            "dry_run_not_evaluated": True,
+        }
+        if dry_run
+        else evaluate_selected_sufficiency(selected, desired_count, target_duration)
+    )
+    if not dry_run and (len(selected) < desired_count or not sufficiency["passed"]):
+        if len(selected) < desired_count:
+            sufficiency["failures"].insert(
+                0, f"selected assets {len(selected)} < requested {desired_count}"
+            )
+        sufficiency["passed"] = False
+        status = "insufficient_material"
 
     manifest = {
         "schema_version": SCHEMA_VERSION,
@@ -1654,6 +2137,17 @@ def run_pixabay_pipeline(
             "aspect_ratio": ratio_label,
             "min_resolution": {"width": min_resolution[0], "height": min_resolution[1]},
         },
+        "cache_layout": {
+            "pixabay_root": str(cache_root),
+            "search": str(cache_root / "search"),
+            "thumbnails": str(cache_root / "thumbnails"),
+            "fingerprints": str(fingerprint_path),
+        },
+        "cache_migration": cache_migration,
+        "material_libraries": {
+            "project": str(project_material_index),
+            "global": str(global_material_index),
+        },
         "search_cache_ttl_seconds": CACHE_TTL_SECONDS,
         "search_rounds": search_rounds,
         "search_errors": search_errors,
@@ -1662,18 +2156,32 @@ def run_pixabay_pipeline(
         "rejections": rejections,
         "sources": selected,
         "selected_count": len(selected),
+        "sufficiency": sufficiency,
+        "reuse_summary": dict(
+            Counter(str(source.get("reuse_mode") or "unknown") for source in selected)
+        ),
         "attribution_notice": "Pixabay source metadata retained for traceability; verify current Pixabay license terms when publishing.",
         "heuristic_notice": "Content, shot scale, motion, text/watermark, and visual quality labels are signal-derived estimates.",
     }
     _atomic_write_json(manifest_path, manifest, api_key)
+    if status == "insufficient_material":
+        raise InsufficientMaterialError(
+            "Pixabay material sufficiency gate failed after all search expansions: "
+            + "; ".join(str(item) for item in sufficiency.get("failures", []))
+            + f". Search and rejection records: {manifest_path}"
+        )
     result = {
         "status": status,
         "theme": theme,
         "theme_dir": str(theme_dir.resolve()),
         "sources_manifest": str(manifest_path.resolve()),
         "fingerprint_library": str(fingerprint_path.resolve()),
+        "global_material_library": str(global_material_index.resolve()),
+        "cache_root": str(cache_root.resolve()),
+        "cache_migration": cache_migration,
         "desired_count": desired_count,
         "selected_count": len(selected),
+        "sufficiency": sufficiency,
         "selected": selected,
         "search_rounds": search_rounds,
         "search_errors": search_errors,
@@ -1821,9 +2329,7 @@ def _load_profile_argument(path: str | None) -> dict[str, Any]:
 
 
 def _default_project_root() -> Path:
-    return Path(
-        os.environ.get("BGM_MONTAGE_PROJECT_ROOT", Path(__file__).resolve().parents[2])
-    ).expanduser().resolve()
+    return RuntimePaths.build().project_root
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1839,7 +2345,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--style-profile", help="path to reference style_profile.json")
     parser.add_argument("--audio-profile", help="path to BGM profile JSON")
     parser.add_argument("--material-root", default=str(_default_project_root() / "视频素材"))
-    parser.add_argument("--cache-dir", default=str(_default_project_root() / ".bgm-montage-cache"))
+    parser.add_argument(
+        "--cache-dir",
+        default=str(RuntimePaths.build().pixabay_cache),
+        help="Pixabay cache namespace (default: PROJECT/.bgm-montage-cache/pixabay)",
+    )
     parser.add_argument("--desired-count", type=int, default=6)
     parser.add_argument("--aspect-ratio", default="16:9")
     parser.add_argument("--min-resolution", default="1280x720")

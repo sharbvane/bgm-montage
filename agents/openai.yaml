@@ -1,4 +1,7 @@
 interface:
   display_name: "BGM Montage"
-  short_description: "Learn reference style and cut Pixabay footage to music"
-  default_prompt: "Use $bgm-montage to analyze references and create a Pixabay montage driven by my BGM."
+  short_description: "Learn reference style and render BGM-led stock montages"
+  default_prompt: "Use $bgm-montage to learn my read-only reference style, analyze the BGM, enforce material sufficiency and low-face-use policies, and render a traceable Pixabay montage without overwriting prior runs."
+
+policy:
+  allow_implicit_invocation: true

@@ -1,3 +1,4 @@
+# Recommended runtime: CPython 3.11. For a verified reproducible install, use requirements.lock.txt.
 numpy>=1.26,<3
 scipy>=1.12,<2
 librosa>=0.10.2,<0.12
@@ -8,3 +9,7 @@ python-dotenv>=1.0,<2
 Pillow>=10.3,<13
 ImageHash>=4.3,<5
 PyYAML>=6.0,<7
+torch>=2.7,<2.8
+torchvision>=0.22,<0.23
+transformers>=4.53,<4.54
+pytest>=8.4,<9

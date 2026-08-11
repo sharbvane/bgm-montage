@@ -122,6 +122,7 @@ def validate_output(
     expected_ratio: str | None = None,
     report_path: str | Path | None = None,
     frames_dir: str | Path | None = None,
+    edit_plan: str | Path | dict[str, Any] | None = None,
     ffmpeg: str = "ffmpeg",
     ffprobe: str = "ffprobe",
 ) -> dict[str, Any]:
@@ -196,6 +197,57 @@ def validate_output(
         expected_dimensions = {"width": spec.width, "height": spec.height}
         checks["resolution"] = width == spec.width and height == spec.height
 
+    plan_payload: dict[str, Any] | None = None
+    if isinstance(edit_plan, dict):
+        plan_payload = edit_plan
+    elif edit_plan is not None:
+        try:
+            plan_payload = json.loads(Path(edit_plan).expanduser().resolve().read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            plan_payload = None
+    plan_metrics: dict[str, Any] | None = None
+    if plan_payload is not None:
+        shots = [shot for shot in plan_payload.get("shots", []) if isinstance(shot, dict)]
+        policy = plan_payload.get("content_policy", {}) if isinstance(plan_payload.get("content_policy"), dict) else {}
+        counts: dict[str, int] = {}
+        screen_time: dict[str, float] = {}
+        prominent_face_seconds = 0.0
+        unsafe_crop = 0
+        for shot in shots:
+            identity = str(shot.get("asset_id") or shot.get("pixabay_id") or shot.get("local_path"))
+            shot_duration = float(shot.get("output_duration") or 0.0)
+            counts[identity] = counts.get(identity, 0) + 1
+            screen_time[identity] = screen_time.get(identity, 0.0) + shot_duration
+            if float(shot.get("face_content_risk") or 0.0) >= float(policy.get("prominent_face_threshold", 0.65)):
+                prominent_face_seconds += shot_duration
+            crop = shot.get("crop_plan", {}) if isinstance(shot.get("crop_plan"), dict) else {}
+            mode = str(crop.get("mode", ""))
+            retention = float(crop.get("retention", 0.0) or 0.0)
+            if mode not in {"subject_crop", "blur_fill", "fit"} or (mode == "subject_crop" and retention < 0.85):
+                unsafe_crop += 1
+        unique = len(counts)
+        max_reuse = max(counts.values(), default=0)
+        max_share = max(screen_time.values(), default=0.0) / max(duration, 1e-6)
+        face_share = prominent_face_seconds / max(duration, 1e-6)
+        checks["material_repetition"] = (
+            unique >= int(policy.get("min_unique_assets", 1))
+            and max_reuse <= int(policy.get("max_reuse_per_asset", max_reuse or 1))
+            and max_share <= float(policy.get("max_asset_screen_share", 1.0)) + 0.006
+        )
+        checks["prominent_face_budget"] = face_share <= float(
+            policy.get("max_prominent_face_screen_share", 1.0)
+        ) + 0.006
+        checks["subject_crop_safe"] = bool(shots) and unsafe_crop == 0
+        plan_metrics = {
+            "shot_count": len(shots),
+            "unique_asset_count": unique,
+            "repeat_shot_ratio": round(1.0 - unique / max(1, len(shots)), 4),
+            "max_reuse_count": max_reuse,
+            "max_asset_screen_share": round(max_share, 4),
+            "prominent_face_screen_share": round(face_share, 4),
+            "unsafe_crop_count": unsafe_crop,
+        }
+
     representative_frames: list[str] = []
     if frames_dir:
         frames = Path(frames_dir).expanduser().resolve()
@@ -246,6 +298,7 @@ def validate_output(
             },
         },
         "representative_frames": representative_frames,
+        "edit_plan_metrics": plan_metrics,
     }
     if report_path:
         output = Path(report_path).expanduser().resolve()
@@ -261,8 +314,16 @@ def main() -> int:
     parser.add_argument("--ratio")
     parser.add_argument("--report")
     parser.add_argument("--frames-dir")
+    parser.add_argument("--edit-plan")
     args = parser.parse_args()
-    result = validate_output(args.media, args.expected_duration, args.ratio, args.report, args.frames_dir)
+    result = validate_output(
+        args.media,
+        args.expected_duration,
+        args.ratio,
+        args.report,
+        args.frames_dir,
+        args.edit_plan,
+    )
     print(json.dumps({"passed": result["passed"], "path": result["path"], "checks": result["checks"]}, ensure_ascii=False))
     return 0 if result["passed"] else 2
 
