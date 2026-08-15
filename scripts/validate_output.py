@@ -219,6 +219,153 @@ def _scene_change_times(stderr: str) -> list[float]:
     return sorted({round(value, 6) for value in values})
 
 
+def _evenly_spaced(values: list[float], limit: int) -> list[float]:
+    """Keep deterministic temporal coverage when review-frame work is capped."""
+
+    ordered = sorted(set(values))
+    if limit <= 0:
+        return []
+    if len(ordered) <= limit:
+        return ordered
+    if limit == 1:
+        return [ordered[len(ordered) // 2]]
+    indices = sorted({round(index * (len(ordered) - 1) / (limit - 1)) for index in range(limit)})
+    return [ordered[index] for index in indices]
+
+
+def _write_visual_review(
+    output_dir: Path,
+    *,
+    media_sha256: str,
+    duration: float,
+    event_frames: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Write one machine-readable and one human-readable view of extracted evidence."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "visual_review.json"
+    markdown_path = output_dir / "visual_review.md"
+    entries: list[dict[str, Any]] = []
+    pairs: dict[str, dict[str, Any]] = {}
+    for index, frame in enumerate(event_frames, start=1):
+        frame_path = Path(str(frame["path"])).resolve()
+        try:
+            relative_path = Path(os.path.relpath(frame_path, output_dir)).as_posix()
+        except ValueError:
+            relative_path = str(frame_path)
+        details = [item for item in frame.get("review_items", []) if isinstance(item, dict)]
+        evidence_types = sorted(
+            {
+                f"planned_cut_{item.get('side')}"
+                if item.get("type") == "planned_cut" and item.get("side") in {"before", "after"}
+                else str(item.get("type") or "event")
+                for item in details
+            }
+        )
+        reasons = list(dict.fromkeys(str(item.get("reason") or "Review event frame") for item in details))
+        entry = {
+            "index": index,
+            "time_seconds": round(float(frame["time_seconds"]), 4),
+            "evidence_types": evidence_types,
+            "event_types": list(frame.get("event_types", [])),
+            "reasons": reasons,
+            "frame_path": str(frame_path),
+            "relative_frame_path": relative_path,
+            "details": details,
+        }
+        entries.append(entry)
+        for item in details:
+            pair_id = str(item.get("pair_id") or "")
+            side = str(item.get("side") or "")
+            if not pair_id or side not in {"before", "after"}:
+                continue
+            pair = pairs.setdefault(
+                pair_id,
+                {
+                    "pair_id": pair_id,
+                    "boundary_time_seconds": item.get("boundary_time_seconds"),
+                    "left_shot_index": item.get("left_shot_index"),
+                    "right_shot_index": item.get("right_shot_index"),
+                },
+            )
+            pair[side] = {
+                "time_seconds": entry["time_seconds"],
+                "frame_path": entry["frame_path"],
+                "relative_frame_path": entry["relative_frame_path"],
+            }
+
+    planned_cut_pairs = [pairs[key] for key in sorted(pairs)]
+    payload = {
+        "schema_version": "1.4.1",
+        "artifact_type": "visual_review",
+        "media_sha256": media_sha256,
+        "duration_seconds": round(duration, 4),
+        "artifacts": {"json": str(json_path), "markdown": str(markdown_path)},
+        "summary": {
+            "evidence_frame_count": len(entries),
+            "planned_cut_pair_count": len(planned_cut_pairs),
+            "complete_planned_cut_pair_count": sum(
+                "before" in pair and "after" in pair for pair in planned_cut_pairs
+            ),
+        },
+        "entries": entries,
+        "planned_cut_pairs": planned_cut_pairs,
+    }
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    lines = [
+        "# Visual Review Evidence",
+        "",
+        f"- Render SHA-256: `{media_sha256}`",
+        f"- Duration: {duration:.4f}s",
+        f"- Evidence frames: {len(entries)}",
+        f"- Complete planned-cut pairs: {payload['summary']['complete_planned_cut_pair_count']}",
+        "",
+        "## Evidence frames",
+        "",
+        "| # | Time | Type | Reason | Frame |",
+        "|---:|---:|---|---|---|",
+    ]
+    for entry in entries:
+        types = ", ".join(entry["evidence_types"]).replace("|", "\\|")
+        reasons = "; ".join(entry["reasons"]).replace("|", "\\|")
+        lines.append(
+            f"| {entry['index']} | {entry['time_seconds']:.4f}s | {types} | {reasons} | "
+            f"![frame {entry['index']}](<{entry['relative_frame_path']}>) |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Planned cut pairs",
+            "",
+            "| Cut | Boundary | Before | After |",
+            "|---|---:|---|---|",
+        ]
+    )
+    for pair in planned_cut_pairs:
+        before = pair.get("before")
+        after = pair.get("after")
+        before_link = (
+            f"{before['time_seconds']:.4f}s ![before](<{before['relative_frame_path']}>)"
+            if isinstance(before, dict)
+            else "missing"
+        )
+        after_link = (
+            f"{after['time_seconds']:.4f}s ![after](<{after['relative_frame_path']}>)"
+            if isinstance(after, dict)
+            else "missing"
+        )
+        lines.append(
+            f"| {pair['pair_id']} | {float(pair.get('boundary_time_seconds') or 0.0):.4f}s | "
+            f"{before_link} | {after_link} |"
+        )
+    markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return {
+        **payload["artifacts"],
+        **payload["summary"],
+    }
+
+
 def _source_interval_overlap_ratio(shots: list[dict[str, Any]]) -> float:
     by_source: dict[str, list[tuple[float, float]]] = {}
     maximum = 0.0
@@ -518,6 +665,7 @@ def validate_output(
         checks["edit_plan_readable"] = plan_payload is not None
     if audiomap is not None:
         checks["audiomap_readable"] = audiomap_payload is not None
+    shots: list[dict[str, Any]] = []
     plan_metrics: dict[str, Any] | None = None
     alignment_metrics: dict[str, Any] | None = None
     climax_metrics: dict[str, Any] | None = None
@@ -645,6 +793,7 @@ def validate_output(
 
     representative_frames: list[str] = []
     event_frames: list[dict[str, Any]] = []
+    visual_review: dict[str, Any] | None = None
     media_sha256 = _sha256(path)
     if frames_dir:
         frames = Path(frames_dir).expanduser().resolve()
@@ -659,42 +808,159 @@ def validate_output(
             if extraction.returncode == 0 and frame.is_file():
                 representative_frames.append(str(frame))
         checks["representative_frames"] = len(representative_frames) == 3
-        if audiomap_payload is not None:
-            events = _collect_event_times(audiomap_payload, duration)
-            requested: dict[float, set[str]] = {
-                0.0: {"opening"},
-                max(0.0, duration - max(0.04, 1.0 / max(frame_rate, 24.0))): {"ending"},
+        events = _collect_event_times(audiomap_payload, duration)
+        requested: dict[float, set[str]] = {}
+        review_items: dict[float, list[dict[str, Any]]] = {}
+        frame_interval = max(0.04, 1.0 / max(frame_rate, 24.0))
+        safe_last_frame = max(0.0, duration - frame_interval)
+
+        def shot_index_at(timestamp: float) -> int | None:
+            for fallback, shot in enumerate(shots):
+                start = float(shot.get("output_start") or 0.0)
+                end = float(shot.get("output_end") or start)
+                if start <= timestamp < end or (fallback == len(shots) - 1 and timestamp <= end):
+                    return int(shot.get("index", fallback))
+            return None
+
+        def request(timestamp: float, label: str, detail: dict[str, Any]) -> float:
+            value = round(min(safe_last_frame, max(0.0, timestamp)), 4)
+            requested.setdefault(value, set()).add(label)
+            review_items.setdefault(value, []).append(detail)
+            return value
+
+        request(
+            0.0,
+            "opening",
+            {"type": "opening", "reason": "Pinned opening frame", "shot_index": shot_index_at(0.0)},
+        )
+        request(
+            safe_last_frame,
+            "ending",
+            {
+                "type": "ending",
+                "reason": "Pinned final decodable frame",
+                "shot_index": shot_index_at(safe_last_frame),
+            },
+        )
+        for group in ("sections", "phrases", "drops", "surges", "climaxes", "hard_stops"):
+            for timestamp in events[group]:
+                request(
+                    timestamp,
+                    group,
+                    {
+                        "type": "music_event",
+                        "event": group,
+                        "reason": f"BGM {group.replace('_', ' ')} event",
+                        "shot_index": shot_index_at(timestamp),
+                    },
+                )
+
+        cut_indices = list(range(max(0, len(shots) - 1)))
+        if len(cut_indices) > 5:
+            cut_indices = [int(value) for value in _evenly_spaced([float(value) for value in cut_indices], 5)]
+        cut_times: list[float] = []
+        for index in cut_indices:
+            left, right = shots[index], shots[index + 1]
+            boundary = float(left.get("output_end") or right.get("output_start") or 0.0)
+            left_start = float(left.get("output_start") or 0.0)
+            right_end = float(right.get("output_end") or duration)
+            offset = max(0.08, 2.0 / max(frame_rate, 24.0))
+            before = max(left_start + frame_interval * 0.5, boundary - offset)
+            after = min(safe_last_frame, right_end - frame_interval * 0.5, boundary + offset)
+            if before >= boundary or after <= boundary:
+                continue
+            pair_id = f"cut_{index + 1:03d}"
+            common = {
+                "type": "planned_cut",
+                "pair_id": pair_id,
+                "boundary_time_seconds": round(boundary, 4),
+                "left_shot_index": left.get("index", index),
+                "right_shot_index": right.get("index", index + 1),
             }
-            safe_last_frame = max(0.0, duration - max(0.04, 1.0 / max(frame_rate, 24.0)))
-            for group in ("sections", "drops", "surges", "climaxes", "hard_stops"):
-                for timestamp in events[group]:
-                    requested.setdefault(round(min(safe_last_frame, max(0.0, timestamp)), 4), set()).add(group)
+            cut_times.append(
+                request(
+                    before,
+                    "planned_cut_before",
+                    {**common, "side": "before", "reason": "Frame immediately before planned cut"},
+                )
+            )
+            cut_times.append(
+                request(
+                    after,
+                    "planned_cut_after",
+                    {**common, "side": "after", "reason": "Frame immediately after planned cut"},
+                )
+            )
+
+        if duration > 0:
             randomizer = random.Random(int(media_sha256[:16], 16))
             for _ in range(2):
-                requested.setdefault(round(randomizer.uniform(0.05 * duration, 0.95 * duration), 4), set()).add("random")
-            ordered_times = sorted(requested)
-            if len(ordered_times) > 24:
-                mandatory = [
-                    value for value in ordered_times
-                    if requested[value] - {"sections", "random"}
-                ]
-                remaining = [value for value in ordered_times if value not in mandatory]
-                ordered_times = sorted((mandatory + remaining[: max(0, 24 - len(mandatory))])[:24])
-            for index, timestamp in enumerate(ordered_times, start=1):
-                event_name = "_".join(sorted(requested[timestamp]))
-                frame = frames / f"event_{index:02d}_{event_name}_{timestamp:.2f}s.jpg"
-                extraction = _run(
-                    [
-                        ffmpeg, "-hide_banner", "-loglevel", "error", "-ss", f"{timestamp:.4f}",
-                        "-i", str(path), "-frames:v", "1", "-q:v", "2", "-y", str(frame),
-                    ],
-                    timeout=60,
+                request(
+                    randomizer.uniform(0.05 * duration, 0.95 * duration),
+                    "random",
+                    {"type": "coverage_sample", "reason": "Deterministic distributed coverage sample"},
                 )
-                if extraction.returncode == 0 and frame.is_file():
-                    event_frames.append(
-                        {"time_seconds": timestamp, "event_types": sorted(requested[timestamp]), "path": str(frame)}
-                    )
-            checks["event_frames"] = len(event_frames) == len(ordered_times)
+
+        pinned = [value for value in requested if requested[value] & {"opening", "ending"}]
+        selected = sorted(set(pinned + cut_times))
+        for label in ("drops", "climaxes", "phrases", "sections", "surges", "hard_stops"):
+            if len(selected) >= 24:
+                break
+            candidates = [
+                value for value in requested
+                if value not in selected and label in requested[value]
+            ]
+            selected.extend(_evenly_spaced(candidates, 1))
+        for labels in (
+            {"drops", "surges", "climaxes", "hard_stops"},
+            {"sections", "phrases"},
+            {"random"},
+        ):
+            remaining = 24 - len(selected)
+            if remaining <= 0:
+                break
+            candidates = [
+                value for value in requested
+                if value not in selected and requested[value] & labels
+            ]
+            selected.extend(_evenly_spaced(candidates, remaining))
+        ordered_times = sorted(set(selected))
+        for index, timestamp in enumerate(ordered_times, start=1):
+            event_name = "_".join(sorted(requested[timestamp]))
+            frame = frames / f"event_{index:02d}_{event_name}_{timestamp:.2f}s.jpg"
+            extraction = _run(
+                [
+                    ffmpeg, "-hide_banner", "-loglevel", "error", "-ss", f"{timestamp:.4f}",
+                    "-i", str(path), "-frames:v", "1", "-q:v", "2", "-y", str(frame),
+                ],
+                timeout=60,
+            )
+            if extraction.returncode == 0 and frame.is_file():
+                event_frames.append(
+                    {
+                        "time_seconds": timestamp,
+                        "event_types": sorted(requested[timestamp]),
+                        "path": str(frame),
+                        "review_items": review_items[timestamp],
+                    }
+                )
+        checks["event_frames"] = len(event_frames) == len(ordered_times)
+        review_root = (
+            Path(report_path).expanduser().resolve().parent
+            if report_path
+            else frames.parent
+        )
+        visual_review = _write_visual_review(
+            review_root,
+            media_sha256=media_sha256,
+            duration=duration,
+            event_frames=event_frames,
+        )
+        checks["visual_review_artifacts"] = (
+            Path(str(visual_review["json"])).is_file()
+            and Path(str(visual_review["markdown"])).is_file()
+            and bool(event_frames)
+        )
 
     report = {
         "schema_version": "1.3",
@@ -741,6 +1007,7 @@ def validate_output(
         },
         "representative_frames": representative_frames,
         "event_frames": event_frames,
+        "visual_review": visual_review,
         "edit_plan_metrics": plan_metrics,
         "music_cut_alignment": alignment_metrics,
         "climax_visual_response": climax_metrics,

@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.4.1 — 2026-08-15
+
+- Connected the existing `visual_review` evidence to a required visual-Agent handoff after programmatic QA. The request requires image-tool inspection of every sampled frame and validates structured `pass` / `warning` / `fail`, timestamps, reasons, confidence, actions, attempt number, and render SHA-256.
+- Routed Agent `fail` into the existing bounded re-edit loop. `replace_shot` findings exclude the identified source on the next attempt; all failures reuse the established new-seed selection, reorder, render, and programmatic QA path. Warnings remain visible but non-blocking.
+- Added phrase-boundary evidence and pinned at least one available drop, climax, phrase, section, surge, and hard-stop frame within the existing 24-frame ceiling. The scene pass, BGM analyzer, timeline planner, and renderer are unchanged.
+- Allowed multiple repeatable curated source windows for the same YouTube ID, with independent cache names, candidate identities, manifest records, and global-index reuse.
+- Added no runtime dependency and retained the existing programmatic QA as an independent required layer.
+
+## v1.4 — 2026-08-15
+
+- Replaced reference-only uniform sampling with a bounded full-duration FFmpeg scene pass merged with temporal coverage. Structural analysis remains capped at 96 decoded frames, semantic inference at 18, and failures fall back to the exact v1.3.3 uniform schedule. Analyzer cache version `1.4.0` forces old sampled evidence to refresh.
+- Connected `editing_grammar.json` to the production pre-download planner: reliability-weighted event preferences/offsets and energy duration, visual scale/motion matrices, transition distribution, and ending timing now alter real slots and record per-slot influence plus an applied-fields digest. Within v1.4, empty grammar produces the same plan as omitted grammar.
+- Added `visual_review.json` and `visual_review.md`, reusing final-QA extraction for pinned opening/ending, BGM events, deterministic coverage, and up to five planned-cut before/after pairs. Successful-attempt frames and paths are promoted to the run root after the final MP4 move.
+- Added repeatable `--youtube-source-window VIDEO_ID=START-END` support across unified, YouTube-first, and single-stage entry points, including input validation, resume fingerprints, manifest traceability, section-aware cache identity/reuse, and explicit-over-automatic window precedence.
+- Kept the v1.3 edit schema, established FFmpeg renderer, QA gates, CLIP semantics, optional JianYing adapter, and dependency set; no Whisper, new renderer, or new runtime dependency was added.
+
 ## v1.3.3 — 2026-08-11
 
 - Default provider strategy is now true `youtube-first`: machine-wide local reuse, dynamic multi-round YouTube discovery, sampled-frame filtering, automatic Pixabay fallback, provider-neutral merge/deduplication, and a hard combined sufficiency gate.

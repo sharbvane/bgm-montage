@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bgm-montage v1.3.3 unified reference-style, BGM-driven montage entry."""
+"""bgm-montage v1.4.1 unified reference-style, BGM-driven montage entry."""
 
 from __future__ import annotations
 
@@ -41,6 +41,8 @@ from material_usage_policy import USAGE_MODES, apply_usage_policy, material_usag
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
+AGENT_REVIEW_STATUSES = {"pass", "warning", "fail"}
+AGENT_REVIEW_ACTIONS = {"accept", "replace_shot", "reorder", "rerender", "tighten_cut", "manual_review"}
 
 
 def _discover_project_root() -> Path:
@@ -201,6 +203,8 @@ def _invocation_payload(
         "youtube_results_per_query": int(_arg(args, "youtube_results_per_query", 8)),
         "youtube_max_download_candidates": int(_arg(args, "youtube_max_download_candidates", 36)),
         "excluded_youtube_ids": list(_arg(args, "excluded_youtube_ids", []) or []),
+        "youtube_source_windows": list(_arg(args, "youtube_source_windows", []) or []),
+        "agent_visual_review": str(_arg(args, "agent_visual_review", "off")),
         "visual_style": str(_arg(args, "visual_style", "auto")),
         "excluded_pixabay_ids": list(_arg(args, "excluded_pixabay_ids", []) or []),
         "max_reuse_per_asset": int(_arg(args, "max_reuse_per_asset", 1)),
@@ -247,6 +251,251 @@ def _copy_or_create_sources(media_result: dict[str, Any], destination: Path) -> 
             "rejections": media_result.get("rejections", []),
         },
     )
+
+
+def _build_agent_visual_review_request(
+    validation: dict[str, Any], attempt_dir: Path, attempt_number: int
+) -> dict[str, Any]:
+    visual_review = validation.get("visual_review")
+    evidence_path = Path(str((visual_review or {}).get("json") or "")).expanduser()
+    if not evidence_path.is_file():
+        raise RuntimeError("Agent Visual Review requires a readable visual_review.json evidence packet")
+    evidence = _read_json(evidence_path)
+    entries = [item for item in evidence.get("entries", []) if isinstance(item, dict)]
+    if not entries:
+        raise RuntimeError("Agent Visual Review evidence packet contains no frames")
+    result_path = attempt_dir / "agent_visual_review.json"
+    request_path = attempt_dir / "agent_visual_review_request.json"
+    request = {
+        "schema_version": "1.4.1",
+        "artifact_type": "agent_visual_review_request",
+        "attempt": attempt_number,
+        "media_sha256": str(validation.get("sha256") or evidence.get("media_sha256") or ""),
+        "visual_review_json": str(evidence_path.resolve()),
+        "result_json": str(result_path.resolve()),
+        "required_entry_indices": [int(item["index"]) for item in entries],
+        "required_scope": [
+            "opening_and_ending",
+            "drop_and_climax_response",
+            "phrase_and_section_boundaries",
+            "planned_cut_before_after_pairs",
+            "visual_continuity_and_artifacts",
+        ],
+        "instructions": [
+            "Use an image-viewing tool to open every review target; filenames and metadata alone are not evidence.",
+            "Judge the image at each music event and both sides of every planned cut.",
+            "Write the structured result to result_json, then resume the same run with --resume-run.",
+            "Use fail only for a clear problem that should trigger automatic re-editing; warning is non-blocking.",
+        ],
+        "review_targets": [
+            {
+                "entry_index": int(item["index"]),
+                "timestamp_seconds": float(item.get("time_seconds") or 0.0),
+                "frame_path": str(item.get("frame_path") or ""),
+                "event_types": list(item.get("event_types") or []),
+                "details": list(item.get("details") or []),
+            }
+            for item in entries
+        ],
+        "planned_cut_pairs": list(evidence.get("planned_cut_pairs") or []),
+        "response_template": {
+            "schema_version": "1.4.1",
+            "artifact_type": "agent_visual_review",
+            "attempt": attempt_number,
+            "media_sha256": str(validation.get("sha256") or evidence.get("media_sha256") or ""),
+            "reviewer": {"type": "visual_agent", "model": "MODEL_NAME", "reviewed_with_images": True},
+            "status": "pass|warning|fail",
+            "summary": "overall reason",
+            "confidence": 0.0,
+            "observations": [
+                {
+                    "entry_index": int(entries[0]["index"]),
+                    "timestamp_seconds": float(entries[0].get("time_seconds") or 0.0),
+                    "status": "pass|warning|fail",
+                    "reason": "visual judgment",
+                    "confidence": 0.0,
+                }
+            ],
+            "findings": [
+                {
+                    "status": "warning|fail",
+                    "timestamp_seconds": 0.0,
+                    "reason": "specific issue",
+                    "confidence": 0.0,
+                    "suggested_action": "replace_shot|reorder|rerender|tighten_cut|manual_review",
+                    "shot_indices": [],
+                }
+            ],
+        },
+    }
+    _write_json(request_path, request)
+    return request
+
+
+def _load_agent_visual_review(result_path: Path, request: dict[str, Any]) -> dict[str, Any]:
+    review = _read_json(result_path)
+    if review.get("artifact_type") != "agent_visual_review":
+        raise ValueError("Agent Visual Review result has the wrong artifact_type")
+    if int(review.get("attempt") or 0) != int(request["attempt"]):
+        raise ValueError("Agent Visual Review result belongs to a different attempt")
+    if str(review.get("media_sha256") or "") != str(request.get("media_sha256") or ""):
+        raise ValueError("Agent Visual Review result media_sha256 does not match the rendered attempt")
+    reviewer = review.get("reviewer") if isinstance(review.get("reviewer"), dict) else {}
+    if reviewer.get("type") != "visual_agent" or reviewer.get("reviewed_with_images") is not True:
+        raise ValueError("Agent Visual Review must declare a visual_agent that reviewed the images")
+    if not str(reviewer.get("model") or "").strip():
+        raise ValueError("Agent Visual Review must identify the reviewing model")
+    status = str(review.get("status") or "").lower()
+    if status not in AGENT_REVIEW_STATUSES:
+        raise ValueError("Agent Visual Review status must be pass, warning, or fail")
+    summary = str(review.get("summary") or "").strip()
+    if not summary:
+        raise ValueError("Agent Visual Review requires a summary")
+
+    def confidence(value: Any, label: str) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label} confidence must be numeric") from exc
+        if not 0.0 <= parsed <= 1.0:
+            raise ValueError(f"{label} confidence must be in [0, 1]")
+        return round(parsed, 4)
+
+    required = {int(value) for value in request.get("required_entry_indices", [])}
+    observations = review.get("observations") if isinstance(review.get("observations"), list) else []
+    seen: set[int] = set()
+    normalized_observations: list[dict[str, Any]] = []
+    for item in observations:
+        if not isinstance(item, dict):
+            raise ValueError("Agent Visual Review observations must be objects")
+        entry_index = int(item.get("entry_index") or 0)
+        item_status = str(item.get("status") or "").lower()
+        reason = str(item.get("reason") or "").strip()
+        if entry_index not in required or item_status not in AGENT_REVIEW_STATUSES or not reason:
+            raise ValueError("Agent Visual Review observation is incomplete or references unknown evidence")
+        timestamp = float(item.get("timestamp_seconds"))
+        normalized_observations.append(
+            {
+                **item,
+                "entry_index": entry_index,
+                "timestamp_seconds": round(timestamp, 4),
+                "status": item_status,
+                "reason": reason,
+                "confidence": confidence(item.get("confidence"), f"observation {entry_index}"),
+            }
+        )
+        seen.add(entry_index)
+    missing = sorted(required - seen)
+    if missing:
+        raise ValueError(f"Agent Visual Review did not inspect evidence entries: {missing}")
+
+    findings = review.get("findings") if isinstance(review.get("findings"), list) else []
+    normalized_findings: list[dict[str, Any]] = []
+    for item in findings:
+        if not isinstance(item, dict):
+            raise ValueError("Agent Visual Review findings must be objects")
+        item_status = str(item.get("status") or "").lower()
+        action = str(item.get("suggested_action") or "").lower()
+        reason = str(item.get("reason") or "").strip()
+        if item_status not in {"warning", "fail"} or action not in AGENT_REVIEW_ACTIONS or not reason:
+            raise ValueError("Agent Visual Review finding is incomplete")
+        normalized_findings.append(
+            {
+                **item,
+                "status": item_status,
+                "timestamp_seconds": round(float(item.get("timestamp_seconds")), 4),
+                "reason": reason,
+                "confidence": confidence(item.get("confidence"), "finding"),
+                "suggested_action": action,
+                "shot_indices": [int(value) for value in item.get("shot_indices", [])],
+            }
+        )
+    if status == "fail" and not any(item["status"] == "fail" for item in normalized_findings):
+        raise ValueError("A failing Agent Visual Review requires at least one fail finding")
+    return {
+        **review,
+        "status": status,
+        "summary": summary,
+        "confidence": confidence(review.get("confidence"), "overall"),
+        "observations": normalized_observations,
+        "findings": normalized_findings,
+        "qa_passed": status != "fail",
+        "reviewed_evidence_count": len(seen),
+    }
+
+
+def _agent_rejected_paths(review: dict[str, Any], plan: dict[str, Any]) -> set[str]:
+    indices = {
+        int(index)
+        for finding in review.get("findings", [])
+        if finding.get("status") == "fail" and finding.get("suggested_action") == "replace_shot"
+        for index in finding.get("shot_indices", [])
+    }
+    return {
+        os.path.normcase(str(Path(str(shot.get("local_path") or "")).resolve()))
+        for fallback, shot in enumerate(plan.get("shots", []))
+        if int(shot.get("index", fallback)) in indices and shot.get("local_path")
+    }
+
+
+def _without_rejected_paths(media_result: dict[str, Any], rejected: set[str]) -> dict[str, Any]:
+    if not rejected:
+        return media_result
+    filtered = dict(media_result)
+    for key in ("selected", "selected_assets", "sources", "assets"):
+        values = media_result.get(key)
+        if isinstance(values, list):
+            filtered[key] = [
+                item for item in values
+                if os.path.normcase(str(Path(str(item.get("local_path") or item.get("path") or "")).resolve()))
+                not in rejected
+            ]
+    return filtered
+
+
+def _promote_validation_artifacts(
+    validation: dict[str, Any],
+    attempt_dir: Path,
+    run_dir: Path,
+    final_output: Path,
+) -> dict[str, Any]:
+    """Promote the passed attempt's review packet and fix its stable paths."""
+
+    source_frames = attempt_dir / "validation_frames"
+    if source_frames.is_dir():
+        shutil.copytree(source_frames, run_dir / "validation_frames", dirs_exist_ok=True)
+    for name in (
+        "visual_review.json",
+        "visual_review.md",
+        "agent_visual_review_request.json",
+        "agent_visual_review.json",
+    ):
+        source = attempt_dir / name
+        if source.is_file():
+            shutil.copy2(source, run_dir / name)
+
+    source_prefix = str(attempt_dir.resolve())
+    target_prefix = str(run_dir.resolve())
+
+    def relocate(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: relocate(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [relocate(item) for item in value]
+        if isinstance(value, str) and value.casefold().startswith(source_prefix.casefold()):
+            return target_prefix + value[len(source_prefix):]
+        return value
+
+    promoted = relocate(validation)
+    promoted["path"] = str(final_output.resolve())
+    review_json = run_dir / "visual_review.json"
+    if review_json.is_file():
+        _write_json(review_json, relocate(_read_json(review_json)))
+    for name in ("agent_visual_review_request.json", "agent_visual_review.json"):
+        path = run_dir / name
+        if path.is_file():
+            _write_json(path, relocate(_read_json(path)))
+    return promoted
 
 
 def _find_jianying_python(explicit: str | None = None) -> Path:
@@ -321,11 +570,14 @@ def _export_jianying_draft(
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    """Run the v1.3.3 pipeline, checkpointing every reusable stage."""
+    """Run the v1.4.1 pipeline, checkpointing every reusable stage."""
 
     load_dotenv(PROJECT_ROOT / ".env", override=False)
     source_provider = str(_arg(args, "source_provider", "youtube-first")).lower()
     usage_mode = normalize_usage_mode(_arg(args, "usage_mode", "local_evaluation"))
+    agent_review_mode = str(_arg(args, "agent_visual_review", "off")).lower()
+    if agent_review_mode not in {"required", "off"}:
+        raise ValueError("--agent-visual-review must be required or off")
     if source_provider == "pixabay" and not os.getenv("PIXABAY_API_KEY"):
         raise RuntimeError(f"PIXABAY_API_KEY is missing. Put it in {PROJECT_ROOT / '.env'}.")
 
@@ -397,7 +649,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _write_json(
         state_path,
         {
-            "schema_version": "1.3.3",
+            "schema_version": "1.4.1",
             "run_id": run_id,
             "invocation_digest": invocation_digest,
             "invocation": invocation,
@@ -407,8 +659,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     run_report_path = run_dir / "run_report.json"
     report: dict[str, Any] = {
-        "schema_version": "1.3.3",
-        "skill_version": "1.3.3",
+        "schema_version": "1.4.1",
+        "skill_version": "1.4.1",
         "run_id": run_id,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "resumed": resume,
@@ -614,6 +866,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     max_search_rounds=int(_arg(args, "youtube_max_search_rounds", 3)),
                     wide_aerial_only=bool(_arg(args, "wide_aerial_only", False)),
                     usage_mode=usage_mode,
+                    source_windows=list(_arg(args, "youtube_source_windows", []) or []),
                 )
             elif source_provider == "youtube":
                 media_result = run_youtube_pipeline(
@@ -635,6 +888,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     max_download_candidates=int(_arg(args, "youtube_max_download_candidates", 36)),
                     max_search_rounds=int(_arg(args, "youtube_max_search_rounds", 3)),
                     usage_mode=usage_mode,
+                    source_windows=list(_arg(args, "youtube_source_windows", []) or []),
                 )
             else:
                 media_result = run_pixabay_pipeline(
@@ -696,6 +950,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         attempts: list[dict[str, Any]] = []
         successful_plan: dict[str, Any] | None = None
         successful_validation: dict[str, Any] | None = None
+        rejected_source_paths: set[str] = set()
         print(
             f"[6/7] Assigning assets, rendering, and auto-reworking up to {max_rework_attempts} time(s)",
             flush=True,
@@ -711,7 +966,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             try:
                 plan = build_timeline(
                     audio_profile,
-                    media_result,
+                    _without_rejected_paths(media_result, rejected_source_paths),
                     target_duration,
                     style_profile,
                     seed=seed,
@@ -745,9 +1000,56 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     audiomap=audio_profile,
                     expected_fps=30.0,
                 )
+                agent_review: dict[str, Any] | None = None
+                if validation.get("passed") and agent_review_mode == "required":
+                    request = _build_agent_visual_review_request(validation, attempt_dir, attempt_number)
+                    request_path = attempt_dir / "agent_visual_review_request.json"
+                    result_path = attempt_dir / "agent_visual_review.json"
+                    if not result_path.is_file():
+                        attempts.append(
+                            {
+                                "attempt": attempt_number,
+                                "status": "awaiting_agent_visual_review",
+                                "seed": seed,
+                                "plan": str(attempt_plan_path),
+                                "video": str(attempt_video),
+                                "report": str(attempt_report_path),
+                                "agent_visual_review_request": str(request_path),
+                            }
+                        )
+                        report["status"] = "awaiting_agent_visual_review"
+                        report["stages"]["render_attempts"] = attempts
+                        report["stages"]["agent_visual_review"] = {
+                            "status": "awaiting",
+                            "attempt": attempt_number,
+                            "request": str(request_path),
+                            "result": str(result_path),
+                        }
+                        report["artifacts"].update(
+                            {
+                                "pending_video": str(attempt_video),
+                                "visual_review_json": str((validation.get("visual_review") or {}).get("json") or ""),
+                                "visual_review_markdown": str((validation.get("visual_review") or {}).get("markdown") or ""),
+                                "agent_visual_review_request": str(request_path),
+                                "agent_visual_review_result": str(result_path),
+                            }
+                        )
+                        checkpoint()
+                        return report
+                    agent_review = _load_agent_visual_review(result_path, request)
+                    validation["agent_visual_review"] = agent_review
+                    validation.setdefault("checks", {})["agent_visual_review"] = bool(agent_review["qa_passed"])
+                    validation["passed"] = all(validation["checks"].values())
+                    _write_json(attempt_report_path, validation)
                 attempt_record = {
                     "attempt": attempt_number,
-                    "status": "passed" if validation.get("passed") else "failed_qa",
+                    "status": (
+                        "passed"
+                        if validation.get("passed")
+                        else "failed_agent_visual_review"
+                        if agent_review and not agent_review.get("qa_passed")
+                        else "failed_qa"
+                    ),
                     "seed": seed,
                     "plan": str(attempt_plan_path),
                     "video": str(attempt_video),
@@ -756,6 +1058,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         key for key, passed in validation.get("checks", {}).items() if not passed
                     ],
                 }
+                if agent_review:
+                    attempt_record["agent_visual_review"] = {
+                        "status": agent_review["status"],
+                        "summary": agent_review["summary"],
+                        "confidence": agent_review["confidence"],
+                        "findings": agent_review["findings"],
+                    }
+                    newly_rejected = _agent_rejected_paths(agent_review, plan)
+                    rejected_source_paths.update(newly_rejected)
+                    attempt_record["rework_excluded_source_paths"] = sorted(newly_rejected)
                 attempts.append(attempt_record)
                 report["stages"]["render_attempts"] = attempts
                 checkpoint()
@@ -765,6 +1077,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     if final_output.exists():
                         raise FileExistsError(f"Final output already exists and was not overwritten: {final_output}")
                     os.replace(attempt_video, final_output)
+                    successful_validation = _promote_validation_artifacts(
+                        successful_validation,
+                        attempt_dir,
+                        run_dir,
+                        final_output,
+                    )
                     break
             except (TimelineInsufficientMaterialError, MontageError) as exc:
                 attempts.append(
@@ -801,6 +1119,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "attempts": attempts,
             "successful_attempt": successful_plan.get("attempt"),
             "automatic_rework_count": max(0, int(successful_plan.get("attempt", 1)) - 1),
+            "agent_excluded_source_count": len(rejected_source_paths),
         }
         _write_json(render_report_path, successful_validation)
         _write_json(validation_path, successful_validation)
@@ -825,6 +1144,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "status": "ok",
             "checks": successful_validation.get("checks", {}),
         }
+        report["stages"]["agent_visual_review"] = (
+            {
+                "status": successful_validation["agent_visual_review"]["status"],
+                "confidence": successful_validation["agent_visual_review"]["confidence"],
+                "findings": successful_validation["agent_visual_review"]["findings"],
+            }
+            if successful_validation.get("agent_visual_review")
+            else {"status": "not_requested"}
+        )
         report["stages"]["visual_consistency"] = {
             "status": "ok" if successful_plan.get("visual_sequence_consistency", {}).get("passed") else "not_evaluated",
             **successful_plan.get("visual_sequence_consistency", {}),
@@ -835,9 +1163,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "edit_plan_compat": str(edit_plan_path),
                 "render_report": str(render_report_path),
                 "validation_compat": str(validation_path),
+                "visual_review_json": str(run_dir / "visual_review.json"),
+                "visual_review_markdown": str(run_dir / "visual_review.md"),
+                "validation_frames": str(run_dir / "validation_frames"),
                 "video": str(final_output),
             }
         )
+        if successful_validation.get("agent_visual_review"):
+            report["artifacts"].update(
+                {
+                    "agent_visual_review_request": str(run_dir / "agent_visual_review_request.json"),
+                    "agent_visual_review_result": str(run_dir / "agent_visual_review.json"),
+                }
+            )
         if bool(_arg(args, "jianying_draft", False)):
             print("[7/8] Building and structurally validating editable JianYing draft", flush=True)
             jianying_report = _export_jianying_draft(
@@ -862,6 +1200,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         else:
             report["stages"]["jianying_draft"] = {"status": "not_requested"}
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
+        report["status"] = "passed"
         report["passed"] = True
         checkpoint()
         print("[8/8] Final full-decode QA passed; usage history committed", flush=True)
@@ -878,7 +1217,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", action="version", version="bgm-montage 1.3.3")
+    parser.add_argument("--version", action="version", version="bgm-montage 1.4.1")
     parser.add_argument("--bgm", required=True, help="Input BGM/audio file")
     parser.add_argument("--theme", required=True, help="Theme used to generate English visual search queries")
     parser.add_argument("--duration", required=True, type=float, help="Requested output duration in seconds")
@@ -939,6 +1278,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--youtube-max-download-candidates", type=int, default=36)
     parser.add_argument("--youtube-max-search-rounds", type=int, default=3)
     parser.add_argument(
+        "--youtube-source-window",
+        dest="youtube_source_windows",
+        action="append",
+        default=[],
+        metavar="VIDEO_ID=START-END",
+        help="Use an absolute source interval when that YouTube ID is downloaded; repeat the same ID for multiple curated clips.",
+    )
+    parser.add_argument(
         "--exclude-youtube-id",
         dest="excluded_youtube_ids",
         action="append",
@@ -989,6 +1336,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Automatic re-edit attempts after the first failed render QA (default: 2).",
     )
     parser.add_argument(
+        "--agent-visual-review",
+        choices=("required", "off"),
+        default="required",
+        help="Require a visual Agent review after programmatic QA; resume after it writes the requested JSON (default: required).",
+    )
+    parser.add_argument(
         "--allow-semantic-fallback",
         action="store_true",
         help="Allow explicit structural-only reference analysis if the pretrained CLIP model is unavailable.",
@@ -1008,8 +1361,14 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         report = run(args)
-        print(json.dumps({"passed": report["passed"], "artifacts": report["artifacts"]}, ensure_ascii=False, indent=2))
-        return 0
+        print(
+            json.dumps(
+                {"status": report.get("status"), "passed": report["passed"], "artifacts": report["artifacts"]},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 3 if report.get("status") == "awaiting_agent_visual_review" else 0
     except Exception as exc:
         message = _strip_secret(str(exc))
         print(f"ERROR: {message}", file=sys.stderr)

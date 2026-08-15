@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -147,3 +149,151 @@ def test_legacy_cli_names_and_primary_invocation_remain_compatible() -> None:
     assert parsed.ratio == "16:9"
     assert parsed.max_reuse_per_asset == 2
     assert parsed.max_asset_screen_share == pytest.approx(0.25)
+
+
+def test_passed_attempt_review_artifacts_are_promoted_with_stable_paths(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    attempt_dir = run_dir / "attempts" / "attempt_01"
+    frames = attempt_dir / "validation_frames"
+    frames.mkdir(parents=True)
+    frame = frames / "event.jpg"
+    frame.write_bytes(b"jpeg")
+    review_json = attempt_dir / "visual_review.json"
+    review_json.write_text(
+        json.dumps({"artifacts": {"json": str(review_json)}, "entries": [{"frame_path": str(frame)}]}),
+        encoding="utf-8",
+    )
+    (attempt_dir / "visual_review.md").write_text("![frame](<validation_frames/event.jpg>)\n", encoding="utf-8")
+    final_output = run_dir / "final.mp4"
+    final_output.write_bytes(b"video")
+
+    promoted = entry._promote_validation_artifacts(
+        {"path": str(attempt_dir / "attempt.mp4"), "event_frames": [{"path": str(frame)}]},
+        attempt_dir,
+        run_dir,
+        final_output,
+    )
+
+    assert promoted["path"] == str(final_output.resolve())
+    assert promoted["event_frames"][0]["path"] == str(run_dir.resolve() / "validation_frames" / "event.jpg")
+    payload = json.loads((run_dir / "visual_review.json").read_text(encoding="utf-8"))
+    assert payload["entries"][0]["frame_path"] == str(run_dir.resolve() / "validation_frames" / "event.jpg")
+    assert (run_dir / "visual_review.md").is_file()
+
+
+def _write_agent_review(request_path: Path, status: str) -> Path:
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    observations = [
+        {
+            "entry_index": target["entry_index"],
+            "timestamp_seconds": target["timestamp_seconds"],
+            "status": status,
+            "reason": "Visible discontinuity requires another edit" if status == "fail" else "Frame is visually coherent",
+            "confidence": 0.91,
+        }
+        for target in request["review_targets"]
+    ]
+    findings = (
+        [{
+            "status": "fail",
+            "timestamp_seconds": observations[0]["timestamp_seconds"],
+            "reason": "Visible discontinuity requires another edit",
+            "confidence": 0.91,
+            "suggested_action": "rerender",
+            "shot_indices": [],
+        }]
+        if status == "fail"
+        else []
+    )
+    result_path = Path(request["result_json"])
+    result_path.write_text(
+        json.dumps({
+            "schema_version": "1.4.1",
+            "artifact_type": "agent_visual_review",
+            "attempt": request["attempt"],
+            "media_sha256": request["media_sha256"],
+            "reviewer": {"type": "visual_agent", "model": "test-vision-model", "reviewed_with_images": True},
+            "status": status,
+            "summary": "Retry required" if status == "fail" else "Visual review passed",
+            "confidence": 0.91,
+            "observations": observations,
+            "findings": findings,
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return result_path
+
+
+def test_agent_visual_review_failure_triggers_existing_rework_loop_then_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "references").mkdir()
+    (tmp_path / "music.wav").write_bytes(b"audio")
+    _stub_pipeline(monkeypatch, tmp_path)
+    render_calls: list[str] = []
+
+    def render(_plan: dict, _bgm: Path, output: Path, *_args: object, **_kwargs: object) -> Path:
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(f"render-{output.parent.name}".encode())
+        render_calls.append(output.parent.name)
+        return output
+
+    def validate(media: Path, *args: object, **kwargs: object) -> dict:
+        media = Path(media)
+        frames = Path(kwargs["frames_dir"])
+        frames.mkdir(parents=True, exist_ok=True)
+        frame = frames / "event.jpg"
+        frame.write_bytes(b"jpeg")
+        attempt_dir = frames.parent
+        review_path = attempt_dir / "visual_review.json"
+        digest = hashlib.sha256(media.read_bytes()).hexdigest()
+        review_path.write_text(json.dumps({
+            "schema_version": "1.4.1",
+            "artifact_type": "visual_review",
+            "media_sha256": digest,
+            "entries": [{
+                "index": 1,
+                "time_seconds": 1.0,
+                "frame_path": str(frame.resolve()),
+                "event_types": ["climaxes"],
+                "details": [{"type": "music_event", "event": "climaxes", "shot_index": 0}],
+            }],
+            "planned_cut_pairs": [],
+        }), encoding="utf-8")
+        (attempt_dir / "visual_review.md").write_text("![frame](<validation_frames/event.jpg>)\n", encoding="utf-8")
+        return {
+            "passed": True,
+            "checks": {"programmatic_fixture": True},
+            "sha256": digest,
+            "path": str(media),
+            "visual_review": {"json": str(review_path), "markdown": str(attempt_dir / "visual_review.md")},
+        }
+
+    monkeypatch.setattr(entry, "render_timeline", render)
+    monkeypatch.setattr(entry, "validate_output", validate)
+    args = _args(tmp_path, run_id="agent-loop")
+    args.agent_visual_review = "required"
+
+    pending_first = entry.run(args)
+    run_dir = Path(pending_first["artifacts"]["run_report"]).parent
+    assert pending_first["status"] == "awaiting_agent_visual_review"
+    _write_agent_review(run_dir / "attempts" / "attempt_01" / "agent_visual_review_request.json", "fail")
+
+    args.resume_run = True
+    pending_second = entry.run(args)
+    assert pending_second["status"] == "awaiting_agent_visual_review"
+    assert [item["status"] for item in pending_second["stages"]["render_attempts"]] == [
+        "failed_agent_visual_review",
+        "awaiting_agent_visual_review",
+    ]
+    _write_agent_review(run_dir / "attempts" / "attempt_02" / "agent_visual_review_request.json", "pass")
+
+    completed = entry.run(args)
+    assert completed["passed"] is True
+    assert render_calls == ["attempt_01", "attempt_02"]
+    final_report = json.loads(Path(completed["artifacts"]["render_report"]).read_text(encoding="utf-8"))
+    assert final_report["checks"]["agent_visual_review"] is True
+    assert final_report["agent_visual_review"]["status"] == "pass"
+    assert final_report["rework"]["automatic_rework_count"] == 1
+    assert Path(completed["artifacts"]["agent_visual_review_result"]).is_file()

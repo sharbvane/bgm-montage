@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import shutil
 import subprocess
@@ -285,6 +286,7 @@ def test_v12_real_dissolve_atomic_render_and_event_qa(tmp_path: Path) -> None:
         output,
         expected_duration=requested_duration,
         expected_ratio="640:360",
+        report_path=tmp_path / "render_report.json",
         frames_dir=tmp_path / "event frames",
         edit_plan=plan,
         ffmpeg=str(FFMPEG),
@@ -303,6 +305,7 @@ def test_v12_real_dissolve_atomic_render_and_event_qa(tmp_path: Path) -> None:
     assert report["checks"]["music_cut_alignment"] is True
     assert report["checks"]["source_intervals_nonoverlap"] is True
     assert report["checks"]["event_frames"] is True
+    assert report["checks"]["visual_review_artifacts"] is True
     assert report["checks"]["climax_visual_response"] is True
     assert report["checks"]["no_terminal_microshot"] is True
     assert report["checks"]["no_terminal_planned_microshot"] is True
@@ -324,6 +327,34 @@ def test_v12_real_dissolve_atomic_render_and_event_qa(tmp_path: Path) -> None:
     assert report["music_cut_alignment"]["aligned_share"] == pytest.approx(1.0)
     assert report["detectors"]["terminal_scene_seconds"] >= 0.25
     assert len(report["event_frames"]) >= 6
+    review = report["visual_review"]
+    review_json = Path(review["json"])
+    review_markdown = Path(review["markdown"])
+    assert review_json.parent == (tmp_path / "render_report.json").parent
+    assert review_json.is_file() and review_markdown.is_file()
+    evidence = json.loads(review_json.read_text(encoding="utf-8"))
+    evidence_types = {
+        evidence_type
+        for entry in evidence["entries"]
+        for evidence_type in entry["evidence_types"]
+    }
+    assert {"opening", "ending", "music_event", "planned_cut_before", "planned_cut_after"} <= evidence_types
+    sampled_events = {event for entry in evidence["entries"] for event in entry["event_types"]}
+    assert {"drops", "climaxes", "phrases"} <= sampled_events
+    assert all(
+        any(detail.get("shot_index") is not None for detail in entry["details"])
+        for entry in evidence["entries"]
+        if "music_event" in entry["evidence_types"]
+    )
+    assert evidence["summary"]["complete_planned_cut_pair_count"] >= 1
+    for pair in evidence["planned_cut_pairs"]:
+        if "before" in pair and "after" in pair:
+            assert Path(pair["before"]["frame_path"]).is_file()
+            assert Path(pair["after"]["frame_path"]).is_file()
+    assert "## Planned cut pairs" in review_markdown.read_text(encoding="utf-8")
+    delivered = tmp_path / "delivered.mp4"
+    output.replace(delivered)
+    assert review_json.is_file() and all(Path(item["frame_path"]).is_file() for item in evidence["entries"])
 
 
 @pytest.mark.skipif(not FFMPEG or not FFPROBE, reason="requires ffmpeg/ffprobe")

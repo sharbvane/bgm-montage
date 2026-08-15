@@ -357,7 +357,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Canonical bgm-montage Skill directory",
     )
     parser.add_argument("--output", help="Destination .zip path")
-    parser.add_argument("--version", default="1.3.3", help="Version used by the default ZIP filename")
+    parser.add_argument("--version", default="1.4.1", help="Version used by the default ZIP filename")
     parser.add_argument("--force", action="store_true", help="Explicitly replace an existing ZIP")
     return parser
 
