@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Task-driven YouTube acquisition for bgm-montage v1.3.3.
+"""Task-driven YouTube acquisition for bgm-montage v1.4.
 
 This module only implements material discovery, machine-wide reuse, download,
 sampled-frame QA, and provider-compatible manifests.  The stable reference,
@@ -33,7 +33,7 @@ from visual_intelligence import (
 )
 
 
-SCHEMA_VERSION = "1.3.3-youtube.2"
+SCHEMA_VERSION = "1.4-youtube.1"
 ASSET_MANIFEST_SCHEMA_VERSION = 3
 INDEX_SCHEMA_VERSION = 1
 
@@ -223,7 +223,73 @@ def _merge_candidates(rows: Iterable[Mapping[str, Any]], visual_profile: Mapping
     return sorted(merged.values(), key=lambda item: (-float(item["metadata_score"]), int(item.get("query_rank") or 999), str(item["youtube_id"])))
 
 
-def _segment_window(duration: float | None) -> tuple[float, float] | None:
+def _coerce_segment_window(value: Any, *, duration: float | None = None) -> tuple[float, float]:
+    if isinstance(value, Mapping):
+        start, end = value.get("start"), value.get("end")
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)) and len(value) == 2:
+        start, end = value
+    else:
+        raise ValueError("source window must contain numeric start and end values")
+    try:
+        start, end = float(start), float(end)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("source window start and end must be numeric") from exc
+    if not math.isfinite(start) or not math.isfinite(end) or start < 0.0 or end <= start:
+        raise ValueError("source window must satisfy 0 <= start < end")
+    if isinstance(duration, (int, float)) and duration > 0:
+        if start >= float(duration):
+            raise ValueError(f"source window starts after video duration ({duration:.3f}s)")
+        end = min(end, float(duration))
+    return round(start, 3), round(end, 3)
+
+
+def _normalize_source_windows(values: Mapping[str, Any] | Sequence[str] | None) -> dict[str, dict[str, float]]:
+    if not values:
+        return {}
+    pairs: Iterable[tuple[Any, Any]]
+    if isinstance(values, Mapping):
+        pairs = values.items()
+    else:
+        parsed: list[tuple[str, tuple[str, str]]] = []
+        for raw in values:
+            video_id, separator, interval = str(raw).partition("=")
+            start, dash, end = interval.partition("-")
+            if not separator or not dash:
+                raise ValueError("--youtube-source-window must be VIDEO_ID=START-END")
+            parsed.append((video_id, (start, end)))
+        pairs = parsed
+    normalized: dict[str, dict[str, float]] = {}
+    for raw_id, raw_window in pairs:
+        video_id = str(raw_id).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{6,20}", video_id):
+            raise ValueError(f"invalid YouTube video ID in source window: {video_id!r}")
+        try:
+            start, end = _coerce_segment_window(raw_window)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid source window for {video_id}: {exc}") from exc
+        normalized[video_id] = {"start": start, "end": end}
+    return normalized
+
+
+def _recorded_source_window(record: Mapping[str, Any]) -> dict[str, float] | None:
+    for key in ("requested_download_section", "download_section"):
+        value = record.get(key)
+        if value is None:
+            continue
+        try:
+            start, end = _coerce_segment_window(value)
+        except ValueError:
+            continue
+        return {"start": start, "end": end}
+    return None
+
+
+def _segment_window(
+    duration: float | None,
+    requested: Mapping[str, Any] | Sequence[float] | None = None,
+) -> tuple[float, float] | None:
+    if requested is not None:
+        return _coerce_segment_window(requested, duration=duration)
     if not isinstance(duration, (int, float)) or duration <= 85.0:
         return None
     clip_duration = 38.0
@@ -241,7 +307,12 @@ def _download_candidate(candidate: Mapping[str, Any], destination: Path, yt_dlp:
         "--force-overwrites", "--merge-output-format", "mp4", "--remux-video", "mp4",
         "-f", "bv*[height<=1080]+ba/b[height<=1080]", "-o", f"{temp_stem}.%(ext)s",
     ]
-    window = _segment_window(candidate.get("duration"))
+    requested = candidate.get("requested_download_section") or candidate.get("source_window")
+    try:
+        requested_window = _coerce_segment_window(requested) if requested is not None else None
+        window = _segment_window(candidate.get("duration"), requested_window)
+    except ValueError as exc:
+        raise YouTubePipelineError(f"Invalid source window for {candidate['youtube_id']}: {exc}") from exc
     if window:
         command.extend(["--download-sections", f"*{window[0]}-{window[1]}", "--force-keyframes-at-cuts"])
     command.append(str(candidate["page_url"]))
@@ -256,7 +327,13 @@ def _download_candidate(candidate: Mapping[str, Any], destination: Path, yt_dlp:
     os.replace(media, destination)
     for path in files:
         path.unlink(missing_ok=True)
-    return {"section": {"start": window[0], "end": window[1]} if window else None}
+    return {
+        "section": {"start": window[0], "end": window[1]} if window else None,
+        "requested_section": (
+            {"start": requested_window[0], "end": requested_window[1]} if requested_window else None
+        ),
+        "section_strategy": "explicit" if requested is not None else ("automatic" if window else "full_video"),
+    }
 
 
 def _asset_score(record: Mapping[str, Any], visual_profile: Mapping[str, Any]) -> tuple[float, dict[str, Any]]:
@@ -302,6 +379,8 @@ def _asset_record(candidate: Mapping[str, Any], path: Path, quality: Mapping[str
         "visual_profile": quality.get("visual_features", {}), "fingerprint": fingerprint,
         "file_hash": str(fingerprint.get("sha256") or ""), "hash": str(fingerprint.get("sha256") or ""), "canonical_source_id": f"youtube:{video_id}",
         "available": True, "download_status": "downloaded_youtube", "download_section": download_info.get("section"),
+        "requested_download_section": download_info.get("requested_section"),
+        "download_section_strategy": download_info.get("section_strategy", "automatic"),
         "metadata_score": float(candidate.get("metadata_score") or 0.0),
         "upload_date": str(candidate.get("upload_date") or ""), "upload_timestamp": candidate.get("timestamp"),
         "upload_metadata": {"date": str(candidate.get("upload_date") or ""), "timestamp": candidate.get("timestamp")},
@@ -346,7 +425,13 @@ def _load_library(index_path: Path) -> list[dict[str, Any]]:
 def _persist_library(index_path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     merged: dict[str, dict[str, Any]] = {}
     for row in [*_load_library(index_path), *rows]:
-        key = str(row.get("youtube_id") or row.get("file_hash") or "")
+        section = _recorded_source_window(row) or {}
+        section_key = (
+            f"@{float(section['start']):.3f}-{float(section['end']):.3f}"
+            if isinstance(section.get("start"), (int, float)) and isinstance(section.get("end"), (int, float))
+            else ""
+        )
+        key = f"{row.get('youtube_id') or row.get('file_hash') or ''}{section_key}"
         if key:
             merged[key] = dict(row)
     _write_json(index_path, {"schema_version": INDEX_SCHEMA_VERSION, "updated_at": _utc_now(), "assets": list(merged.values())})
@@ -422,10 +507,12 @@ def run_youtube_pipeline(
     excluded_youtube_ids: Sequence[str] = (), results_per_query: int = 8,
     max_download_candidates: int = 36, max_search_rounds: int = 3,
     usage_mode: str = "local_evaluation", allow_insufficient: bool = False,
+    source_windows: Mapping[str, Any] | Sequence[str] | None = None,
 ) -> dict[str, Any]:
     if int(desired_count) < 1:
         raise ValueError("desired_count must be positive")
     usage_mode = normalize_usage_mode(usage_mode)
+    normalized_windows = _normalize_source_windows(source_windows)
     visual_profile, query_plan = build_youtube_query_plan(
         theme, style_profile, audio_profile, visual_cohesion_profile, priority_queries, max_rounds=max_search_rounds
     )
@@ -439,14 +526,30 @@ def run_youtube_pipeline(
         directory.mkdir(parents=True, exist_ok=True)
 
     excluded = {str(value) for value in excluded_youtube_ids}
-    library = [row for row in _load_library(index_path) if str(row.get("youtube_id")) not in excluded]
+    library: list[dict[str, Any]] = []
+    for row in _load_library(index_path):
+        video_id = str(row.get("youtube_id") or "")
+        if video_id in excluded:
+            continue
+        requested = normalized_windows.get(video_id)
+        if requested:
+            if _recorded_source_window(row) != requested:
+                continue
+        elif str(row.get("download_section_strategy") or "automatic") == "explicit":
+            continue
+        library.append(row)
     if library:
         _persist_library(index_path, library)
     local_candidates: list[dict[str, Any]] = []
     for row in library:
-        destination = material_dir / f"youtube_{row['youtube_id']}.mp4"
+        window = normalized_windows.get(str(row["youtube_id"]))
+        suffix = f"_{window['start']:.3f}-{window['end']:.3f}" if window else ""
+        destination = material_dir / f"youtube_{row['youtube_id']}{suffix}.mp4"
         reused = _reuse_record(row, destination, visual_profile, usage_mode)
         if reused:
+            if window:
+                reused["requested_download_section"] = window
+                reused["download_section_strategy"] = "explicit_reuse"
             local_candidates.append(reused)
     local_candidates.sort(key=lambda item: (-float(item.get("score") or 0.0), str(item.get("youtube_id"))))
     quality_floor = float((visual_profile.get("quality") or {}).get("aesthetic_floor") or 0.42) * 0.72
@@ -472,6 +575,10 @@ def run_youtube_pipeline(
             search_rows.extend(rows)
             search_rounds.append(report)
             ranked = _merge_candidates(search_rows, visual_profile)
+            for item in ranked:
+                requested = normalized_windows.get(str(item.get("youtube_id") or ""))
+                if requested:
+                    item["requested_download_section"] = requested
             eligible_ranked = [
                 item for item in ranked
                 if str(item.get("youtube_id")) not in excluded
@@ -496,7 +603,7 @@ def run_youtube_pipeline(
     ]
     for candidate in eligible_ranked:
         video_id = str(candidate["youtube_id"])
-        public = {key: candidate.get(key) for key in ("youtube_id", "title", "channel", "duration", "page_url", "matched_queries", "query_rank", "metadata_score")}
+        public = {key: candidate.get(key) for key in ("youtube_id", "title", "channel", "duration", "page_url", "matched_queries", "query_rank", "metadata_score", "requested_download_section")}
         if video_id in excluded or video_id in selected_by_id:
             continue
         text = f"{candidate.get('title', '')} {candidate.get('description', '')} {candidate.get('channel', '')}".casefold()
@@ -511,8 +618,10 @@ def run_youtube_pipeline(
         if attempted_downloads >= int(max_download_candidates):
             break
         assert yt_dlp is not None
-        cached = global_videos / f"youtube_{video_id}.mp4"
-        destination = material_dir / f"youtube_{video_id}.mp4"
+        window = normalized_windows.get(video_id)
+        suffix = f"_{window['start']:.3f}-{window['end']:.3f}" if window else ""
+        cached = global_videos / f"youtube_{video_id}{suffix}.mp4"
+        destination = material_dir / f"youtube_{video_id}{suffix}.mp4"
         try:
             attempted_downloads += 1
             download_info = _download_candidate(candidate, cached, yt_dlp)
@@ -550,7 +659,7 @@ def run_youtube_pipeline(
         "schema_version": SCHEMA_VERSION, "asset_manifest_schema_version": ASSET_MANIFEST_SCHEMA_VERSION,
         "manifest_type": "asset_manifest", "provider": "youtube", "generated_at": _utc_now(),
         "status": status, "theme": theme, "theme_directory": str(material_dir),
-        "requested": {"desired_count": desired_count, "aspect_ratio": aspect_ratio, "min_resolution": {"width": min_resolution[0], "height": min_resolution[1]}, "candidate_pool_multiplier": candidate_pool_multiplier, "results_per_query": results_per_query, "max_download_candidates": max_download_candidates, "priority_queries": list(priority_queries), "excluded_youtube_ids": sorted(excluded)},
+        "requested": {"desired_count": desired_count, "aspect_ratio": aspect_ratio, "min_resolution": {"width": min_resolution[0], "height": min_resolution[1]}, "candidate_pool_multiplier": candidate_pool_multiplier, "results_per_query": results_per_query, "max_download_candidates": max_download_candidates, "priority_queries": list(priority_queries), "excluded_youtube_ids": sorted(excluded), "source_windows": normalized_windows},
         "query_plan": query_plan, "timeline_plan": {"provided": bool(timeline_plan), "slot_count": len((timeline_plan or {}).get("slots", []))},
         "candidate_pool_gate": gate, "visual_style_profile": visual_profile,
         "cache_layout": {"youtube_root": str(cache_root), "global_library": str(library_root), "asset_index": str(index_path), "videos": str(global_videos)},
@@ -587,6 +696,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate-pool-multiplier", type=int, default=6)
     parser.add_argument("--search-query", action="append", dest="queries", default=[], help="Optional high-priority query; dynamic queries are always generated.")
     parser.add_argument("--visual-style", default="auto"); parser.add_argument("--exclude-youtube-id", action="append", default=[])
+    parser.add_argument("--youtube-source-window", action="append", default=[], metavar="VIDEO_ID=START-END")
     parser.add_argument("--results-per-query", type=int, default=8); parser.add_argument("--max-download-candidates", type=int, default=36)
     parser.add_argument("--max-search-rounds", type=int, default=3); parser.add_argument("--usage-mode", choices=USAGE_MODES, default="local_evaluation")
     parser.add_argument("--allow-insufficient", action="store_true"); parser.add_argument("--result-json")
@@ -607,6 +717,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         excluded_youtube_ids=args.exclude_youtube_id, results_per_query=args.results_per_query,
         max_download_candidates=args.max_download_candidates, max_search_rounds=args.max_search_rounds,
         usage_mode=args.usage_mode, allow_insufficient=args.allow_insufficient,
+        source_windows=args.youtube_source_window,
     )
     if args.result_json:
         _write_json(Path(args.result_json).expanduser().resolve(), result)

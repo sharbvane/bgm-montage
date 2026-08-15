@@ -1,5 +1,5 @@
-# bgm-montage v1.3.3
-# Core environment verified with CPython 3.11.9 / Windows 11 x64 on 2026-08-11.
+# bgm-montage v1.4
+# Core environment verified with CPython 3.11.9 / Windows 11 x64 on 2026-08-15.
 # Install with: python -m pip install -r requirements.lock.txt
 audioread==3.1.0
 certifi==2026.7.22

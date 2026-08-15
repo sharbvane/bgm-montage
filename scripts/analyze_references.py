@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Read-only reference-video analysis for the bgm-montage skill.
 
-The v1.2 analyzer combines explainable OpenCV measurements with a real,
+The v1.4 analyzer combines scene-aware OpenCV measurements with a real,
 pretrained CLIP zero-shot vision model.  Semantic output is always labelled
 with its backend and limitations; when the model cannot be loaded the result
 is explicitly degraded instead of pretending that heuristics are semantics.
@@ -21,6 +21,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import statistics
 import subprocess
@@ -44,12 +45,10 @@ from visual_semantics import (
 )
 
 
-ANALYZER_VERSION = "1.2.0"
-# v1.2 derives its additional pacing/transition/diversity fields from the
-# shot-level records already stored by v1.1.  Reusing that evidence avoids an
-# expensive model pass while the existing fingerprint check still forces
-# changed and newly added reference files through the full analyzer.
-MIGRATABLE_ANALYZER_VERSIONS: set[str] = {"1.1.0"}
+ANALYZER_VERSION = "1.4.0"
+# v1.4 changes which frames establish cut evidence, so older sampled records
+# must be reanalyzed even when their source fingerprints are unchanged.
+MIGRATABLE_ANALYZER_VERSIONS: set[str] = set()
 CACHE_SCHEMA_VERSION = 2
 PROFILE_SCHEMA_VERSION = "1.2"
 VIDEO_EXTENSIONS = {
@@ -73,8 +72,15 @@ TARGET_SAMPLE_FPS = 2.0
 MIN_SAMPLES = 16
 MAX_SAMPLES = 96
 MAX_SEMANTIC_SAMPLES = 18
+SCENE_CHANGE_THRESHOLD = 0.22
+MAX_SCENE_CANDIDATES = 64
+SAMPLE_DEDUP_SECONDS = 0.04
 ANALYSIS_WIDTH = 384
 FINGERPRINT_BLOCK_BYTES = 256 * 1024
+
+_SHOWINFO_PTS_TIME = re.compile(
+    r"\bpts_time:\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+)
 
 
 class ReferenceAnalysisError(RuntimeError):
@@ -733,6 +739,179 @@ def _sample_times(duration: float, fps: float, frame_count: int) -> list[float]:
     return [start + (end - start) * index / (count - 1) for index in range(count)]
 
 
+def _evenly_cap_times(values: Sequence[float], limit: int) -> list[float]:
+    """Keep ordered temporal coverage while bounding a candidate list."""
+
+    ordered = sorted(_finite_float(value) for value in values)
+    if limit <= 0:
+        return []
+    if len(ordered) <= limit:
+        return ordered
+    if limit == 1:
+        return [ordered[len(ordered) // 2]]
+    return [
+        ordered[round(index * (len(ordered) - 1) / (limit - 1))]
+        for index in range(limit)
+    ]
+
+
+def _deduplicate_times(
+    values: Iterable[float],
+    duration: float,
+    *,
+    separation: float = SAMPLE_DEDUP_SECONDS,
+) -> list[float]:
+    cleaned = sorted(
+        value
+        for raw in values
+        if math.isfinite(value := _finite_float(raw, float("nan")))
+        and value >= 0.0
+        and (duration <= 0.0 or value <= duration)
+    )
+    result: list[float] = []
+    for value in cleaned:
+        if not result or value - result[-1] >= separation:
+            result.append(value)
+    return result
+
+
+def _scene_change_times(
+    path: Path,
+    duration: float,
+    *,
+    ffmpeg: str | None = None,
+) -> tuple[list[float], dict[str, Any]]:
+    """Scan the full video for hard scene candidates without extracting media."""
+
+    executable = ffmpeg or shutil.which("ffmpeg")
+    audit: dict[str, Any] = {
+        "method": "ffmpeg_select_scene_showinfo",
+        "threshold": SCENE_CHANGE_THRESHOLD,
+        "status": "unavailable",
+        "raw_candidate_count": 0,
+        "deduplicated_candidate_count": 0,
+        "candidate_count": 0,
+        "candidate_times_seconds": [],
+    }
+    if not executable:
+        audit["error"] = "ffmpeg was not found on PATH"
+        return [], audit
+
+    command = [
+        executable,
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        "info",
+        "-i",
+        os.fspath(path),
+        "-map",
+        "0:v:0",
+        "-an",
+        "-vf",
+        f"scale={ANALYSIS_WIDTH}:-2,select='gt(scene,{SCENE_CHANGE_THRESHOLD})',showinfo",
+        "-f",
+        "null",
+        "-",
+    ]
+    timeout = max(30.0, min(180.0, duration * 3.0 + 20.0)) if duration > 0 else 90.0
+    try:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        audit.update({"status": "timeout", "error": str(exc)})
+        return [], audit
+    except OSError as exc:
+        audit.update({"status": "error", "error": str(exc)})
+        return [], audit
+
+    if result.returncode != 0:
+        message = result.stderr.strip().replace("\r", " ").replace("\n", " ")
+        audit.update(
+            {
+                "status": "error",
+                "error": f"ffmpeg returned {result.returncode}: {message[:300]}",
+            }
+        )
+        return [], audit
+
+    parsed = [
+        _finite_float(match.group(1), float("nan"))
+        for match in _SHOWINFO_PTS_TIME.finditer(result.stderr)
+    ]
+    candidates = _deduplicate_times(parsed, duration)
+    deduplicated_count = len(candidates)
+    candidates = _evenly_cap_times(candidates, MAX_SCENE_CANDIDATES)
+    rounded = [_round(value, 3) for value in candidates]
+    audit.update(
+        {
+            "status": "ok",
+            "raw_candidate_count": len(parsed),
+            "deduplicated_candidate_count": deduplicated_count,
+            "candidate_count": len(candidates),
+            "candidate_times_seconds": rounded,
+        }
+    )
+    return candidates, audit
+
+
+def _merge_scene_sample_times(
+    uniform_times: Sequence[float],
+    scene_changes: Sequence[float],
+    duration: float,
+) -> tuple[list[float], dict[str, int]]:
+    """Merge scene evidence into the fixed structural-analysis sample budget."""
+
+    uniform = list(uniform_times)
+    changes = _deduplicate_times(scene_changes, duration)
+    if not changes:
+        return uniform, {
+            "uniform_candidate_count": len(uniform),
+            "scene_change_count": 0,
+            "shot_center_count": 0,
+            "scene_target_count": 0,
+            "selected_scene_target_count": 0,
+            "selected_uniform_target_count": len(uniform),
+            "merged_target_count": len(uniform),
+        }
+
+    boundaries = [0.0, *changes]
+    if duration > 0:
+        boundaries.append(duration)
+    shot_centers = [
+        (boundaries[index] + boundaries[index + 1]) / 2.0
+        for index in range(len(boundaries) - 1)
+        if boundaries[index + 1] > boundaries[index]
+    ]
+    scene_targets = _deduplicate_times([*changes, *shot_centers], duration)
+    minimum_uniform = min(len(uniform), MIN_SAMPLES, MAX_SAMPLES)
+    selected_scene = _evenly_cap_times(scene_targets, MAX_SAMPLES - minimum_uniform)
+    selected_uniform = _evenly_cap_times(uniform, MAX_SAMPLES - len(selected_scene))
+    selected_uniform = [
+        value
+        for value in selected_uniform
+        if all(abs(value - scene_value) >= SAMPLE_DEDUP_SECONDS for scene_value in selected_scene)
+    ]
+    merged = sorted([*selected_scene, *selected_uniform])
+    return merged, {
+        "uniform_candidate_count": len(uniform),
+        "scene_change_count": len(changes),
+        "shot_center_count": len(shot_centers),
+        "scene_target_count": len(scene_targets),
+        "selected_scene_target_count": len(selected_scene),
+        "selected_uniform_target_count": len(selected_uniform),
+        "merged_target_count": len(merged),
+    }
+
+
 def _tone_label(brightness: float, saturation: float, contrast: float, warmth: float) -> str:
     temperature = "warm" if warmth >= 0.035 else ("cool" if warmth <= -0.035 else "neutral")
     if brightness <= 0.35:
@@ -1240,12 +1419,17 @@ def _analyze_one(
     frame_count = int(_finite_float(metadata.get("estimated_frame_count"))) or int(
         _finite_float(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     )
-    targets = _sample_times(duration, fps, frame_count)
-    if not targets and fps > 0 and frame_count > 0:
-        targets = _sample_times(frame_count / fps, fps, frame_count)
-    if not targets:
+    sampling_duration = duration or (frame_count / fps if fps > 0 and frame_count > 0 else 0.0)
+    uniform_targets = _sample_times(sampling_duration, fps, frame_count)
+    if not uniform_targets:
         capture.release()
         raise ReferenceAnalysisError("duration/frame count unavailable; cannot choose sample frames")
+    scene_changes, scene_scan = _scene_change_times(path, sampling_duration)
+    targets, scene_merge = _merge_scene_sample_times(
+        uniform_targets,
+        scene_changes,
+        sampling_duration,
+    )
 
     frames: list[dict[str, Any]] = []
     transitions: list[dict[str, Any]] = []
@@ -1448,6 +1632,10 @@ def _analyze_one(
         warnings.append("Some requested sample frames could not be decoded.")
     if median_interval > 0.85:
         warnings.append("Sampling interval is coarse; very fast cuts may be under-counted.")
+    if scene_scan.get("status") not in {"ok", None}:
+        warnings.append(
+            f"Scene-candidate scan {scene_scan.get('status')}; uniform sampling fallback was used."
+        )
     if face_cascade is None:
         warnings.append("OpenCV face cascade unavailable; shot scale uses edge structure only.")
     if not semantic_summary.get("available"):
@@ -1469,13 +1657,19 @@ def _analyze_one(
         "relative_path": relative_path,
         "metadata": dict(metadata),
         "sampling": {
-            "method": "uniform_time_seek",
+            "method": (
+                "uniform_time_seek_plus_ffmpeg_scene_candidates"
+                if scene_changes
+                else "uniform_time_seek"
+            ),
             "requested_frames": len(targets),
             "decoded_frames": len(frames),
             "target_sample_fps": TARGET_SAMPLE_FPS,
             "median_interval_seconds": _round(median_interval, 3),
             "coverage_start_seconds": _round(decoded_times[0], 3),
             "coverage_end_seconds": _round(decoded_times[-1], 3),
+            "scene_scan": scene_scan,
+            "sample_merge": scene_merge,
         },
         "topic": {
             "classification": topic_label,
@@ -2165,7 +2359,7 @@ def analyze_references(
             },
             "methods": [
                 "ffprobe metadata",
-                "uniform OpenCV frame sampling",
+                "bounded uniform plus FFmpeg scene-aware OpenCV frame sampling",
                 "color and exposure statistics",
                 "frontal-face and edge-footprint framing heuristics",
                 "sparse optical-flow motion heuristic",

@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.4 — 2026-08-15
+
+- Replaced reference-only uniform sampling with a bounded full-duration FFmpeg scene pass merged with temporal coverage. Structural analysis remains capped at 96 decoded frames, semantic inference at 18, and failures fall back to the exact v1.3.3 uniform schedule. Analyzer cache version `1.4.0` forces old sampled evidence to refresh.
+- Connected `editing_grammar.json` to the production pre-download planner: reliability-weighted event preferences/offsets and energy duration, visual scale/motion matrices, transition distribution, and ending timing now alter real slots and record per-slot influence plus an applied-fields digest. Within v1.4, empty grammar produces the same plan as omitted grammar.
+- Added `visual_review.json` and `visual_review.md`, reusing final-QA extraction for pinned opening/ending, BGM events, deterministic coverage, and up to five planned-cut before/after pairs. Successful-attempt frames and paths are promoted to the run root after the final MP4 move.
+- Added repeatable `--youtube-source-window VIDEO_ID=START-END` support across unified, YouTube-first, and single-stage entry points, including input validation, resume fingerprints, manifest traceability, section-aware cache identity/reuse, and explicit-over-automatic window precedence.
+- Kept the v1.3 edit schema, established FFmpeg renderer, QA gates, CLIP semantics, optional JianYing adapter, and dependency set; no Whisper, new renderer, or new runtime dependency was added.
+
 ## v1.3.3 — 2026-08-11
 
 - Default provider strategy is now true `youtube-first`: machine-wide local reuse, dynamic multi-round YouTube discovery, sampled-frame filtering, automatic Pixabay fallback, provider-neutral merge/deduplication, and a hard combined sufficiency gate.

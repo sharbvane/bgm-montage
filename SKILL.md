@@ -3,9 +3,9 @@ name: bgm-montage
 description: Learn a dynamic visual profile and audio-linked editing grammar from read-only references and BGM, intelligently search/reuse Pixabay or YouTube footage, select aesthetically strong and sequence-coherent shots, render a low-repetition montage, optionally export an editable JianYing Pro draft, and enforce automatic media QA. Use when Codex must create a stock-footage montage from a BGM path, theme, duration, aspect ratio, and output directory.
 ---
 
-# BGM Montage v1.3.3
+# BGM Montage v1.4
 
-The unified entry defaults to `--source-provider youtube-first`: reuse high-quality assets from the machine-wide YouTube index, generate task-specific multi-round YouTube queries, download/analyze/filter, and invoke Pixabay only if hard candidate, diversity, quality, or style gates remain short. `--source-provider youtube` and `pixabay` remain explicit modes. `--search-query` is optional and additive. All sources are merged, deduplicated, and ranked by the same visual evidence rather than provider. The stable v1.3 reference/BGM/timeline/edit/render/QA core remains unchanged.
+The unified entry defaults to `--source-provider youtube-first`: reuse high-quality assets from the machine-wide YouTube index, generate task-specific multi-round YouTube queries, download/analyze/filter, and invoke Pixabay only if hard candidate, diversity, quality, or style gates remain short. `--source-provider youtube` and `pixabay` remain explicit modes. `--search-query` is optional and additive. v1.4 adds scene-aware reference evidence, applies learned editing grammar in the production planner, emits a visual review packet, and accepts explicit YouTube source windows without replacing the proven render/QA core.
 
 ## Material usage mode
 
@@ -24,12 +24,12 @@ Switch to `publish` only when the user explicitly says the specific video will b
 ```powershell
 & ".\.agents\skills\bgm-montage\.venv\Scripts\python.exe" `
   ".\.agents\skills\bgm-montage\scripts\bgm_montage.py" `
-  --bgm ".\music\track.wav" `
+  --bgm "D:\music\track.wav" `
   --theme "quiet coastal solitude" `
   --duration 30 `
   --ratio 9:16 `
   --visual-style "冷蓝灰、雾气、大纵深、克制的航拍推进" `
-  --output-dir ".\renders"
+  --output-dir "D:\renders"
 ```
 
 每次运行写入 `<output-dir>/<project-slug>/<run-id>/`。未传 `--run-id` 时自动生成 UTC 时间戳加随机后缀；已有目录不会被静默覆盖。失败运行可用完全相同的输入、原 `--run-id` 和 `--resume-run` 继续。
@@ -53,13 +53,14 @@ Switch to `publish` only when the user explicitly says the specific video will b
 - `asset_manifest.json`：检索轮次、审美筛选、缓存、去重、下载、复用、来源和实际使用区间。
 - `edit_decisions.json`：v1.3 统一时间线真值；保留原始路径、源/目标区间、速度、裁剪/变换、BGM 独立轨和 v1.2 兼容字段。
 - `render_report.json`：最终媒体探测、完整解码、音乐结构和全片视觉一致性 QA。
+- `visual_review.json` / `visual_review.md`：开头、结尾、音乐事件和计划切点的可审查帧证据。
 - `jianying_draft_report.json`（可选）：每镜独立、原素材引用和 BGM 独立轨的剪映草稿结构验证与未映射差异。
 
 为兼容旧项目，运行目录仍生成 `bgm_profile.json`、`edit_plan.json`、`sources.json` 和 `validation.json` 别名；v1.3 `edit_decisions` 保留 v1.2 字段并提供显式迁移。
 
 ## 已实现边界
 
-参考学习继续影响音乐边界吸附、镜头时长、段落密度、景别与运动目标、少量转场和结尾结构。v1.3 的视觉匹配是可审计的采样信号与元数据启发式，不等同于人工审美保证；轻度调色只做归一化，不能用来挽救本来不兼容的素材。
+参考学习会在生产下载前计划中影响音乐边界吸附、镜头时长、段落密度、景别与运动目标、少量转场和结尾结构。v1.4 的视觉匹配仍是可审计的采样信号与元数据启发式，不等同于人工审美保证；轻度调色只做归一化，不能用来挽救本来不兼容的素材。
 
 未实现或不宣称支持：复杂遮罩/wipe、语义级轮廓变形 match cut、速度坡度、字幕/OCR/动态图形、人物身份、可靠时序动作、逐帧主体跟踪及复杂特效复刻。剪映适配只映射原生可表达的切点、恒速和基础变换；裁剪或 FFmpeg 调色无法可靠映射时必须写入差异报告。
 

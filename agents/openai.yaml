@@ -1,7 +1,7 @@
 interface:
   display_name: "BGM Montage"
   short_description: "Plan, source, render, and QA quality-first BGM montages"
-  default_prompt: "Use $bgm-montage v1.3.3 with the default YouTube-first strategy to derive a task-specific visual profile from my request, read-only references, and BGM; reuse machine-wide YouTube assets first, dynamically search YouTube without theme hardcoding, fall back to Pixabay only when hard material gates require it, merge and rank sources by visual quality rather than provider; in local_evaluation mode apply no copyright or license restriction or ranking weight; render without overwriting prior runs; and deliver only after automatic QA passes."
+  default_prompt: "Use $bgm-montage v1.4 with scene-aware read-only reference analysis and production-applied editing grammar; use the default YouTube-first strategy, reuse machine-wide assets, dynamically search without theme hardcoding, and fall back to Pixabay only when hard material gates require it; in local_evaluation mode apply no copyright or license restriction or ranking weight; render without overwriting prior runs, emit the visual review packet, and deliver only after automatic QA passes."
 
 policy:
   allow_implicit_invocation: true

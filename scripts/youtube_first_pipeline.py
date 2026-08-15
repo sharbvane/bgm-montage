@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""YouTube-first orchestration with bounded Pixabay fallback for v1.3.3."""
+"""YouTube-first orchestration with bounded Pixabay fallback for v1.4."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from visual_intelligence import asset_profile_fit, build_visual_style_profile
 from youtube_pipeline import run_youtube_pipeline
 
 
-SCHEMA_VERSION = "1.3.3-youtube-first.1"
+SCHEMA_VERSION = "1.4-youtube-first.1"
 
 
 class YouTubeFirstPipelineError(RuntimeError):
@@ -152,6 +152,7 @@ def run_youtube_first_pipeline(
     excluded_pixabay_ids: Sequence[str] = (), results_per_query: int = 8,
     max_download_candidates: int = 36, max_search_rounds: int = 3,
     wide_aerial_only: bool = False, usage_mode: str = "local_evaluation",
+    source_windows: Mapping[str, Any] | Sequence[str] | None = None,
 ) -> dict[str, Any]:
     usage_mode = normalize_usage_mode(usage_mode)
     explicit = "" if str(visual_cohesion_profile).lower() in {"", "auto", "none"} else str(visual_cohesion_profile)
@@ -164,6 +165,7 @@ def run_youtube_first_pipeline(
         excluded_youtube_ids=excluded_youtube_ids, results_per_query=results_per_query,
         max_download_candidates=max_download_candidates, max_search_rounds=max_search_rounds,
         usage_mode=usage_mode, allow_insufficient=True,
+        source_windows=source_windows,
     )
     youtube_ok = bool((youtube.get("candidate_pool_gate") or {}).get("passed")) and bool((youtube.get("sufficiency") or {}).get("passed"))
     pixabay: dict[str, Any] | None = None
@@ -199,7 +201,7 @@ def run_youtube_first_pipeline(
     manifest = apply_usage_policy({
         "schema_version": SCHEMA_VERSION, "asset_manifest_schema_version": 3,
         "manifest_type": "asset_manifest", "provider": "youtube-first", "generated_at": datetime.now(timezone.utc).isoformat(),
-        "status": status, "theme": theme, "requested": {"desired_count": desired_count, "aspect_ratio": aspect_ratio, "candidate_pool_multiplier": candidate_pool_multiplier, "priority_queries": list(priority_queries)},
+        "status": status, "theme": theme, "requested": {"desired_count": desired_count, "aspect_ratio": aspect_ratio, "candidate_pool_multiplier": candidate_pool_multiplier, "priority_queries": list(priority_queries), "source_windows": source_windows or {}},
         "strategy": ["local reusable assets", "YouTube dynamic search", "Pixabay fallback when needed", "provider-neutral merge and hard sufficiency gate"],
         "youtube": {"status": youtube.get("status"), "manifest": youtube.get("sources_manifest"), "candidate_count": youtube.get("candidate_count"), "selected_count": youtube.get("selected_count"), "candidate_pool_gate": youtube.get("candidate_pool_gate"), "search_rounds": youtube.get("search_rounds", []), "query_plan": youtube.get("query_plan", [])},
         "pixabay_fallback": {**fallback, "manifest": (pixabay or {}).get("sources_manifest"), "candidate_count": (pixabay or {}).get("candidate_count", 0), "selected_count": (pixabay or {}).get("selected_count", 0), "search_rounds": (pixabay or {}).get("search_rounds", [])},

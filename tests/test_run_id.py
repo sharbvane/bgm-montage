@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -147,3 +148,33 @@ def test_legacy_cli_names_and_primary_invocation_remain_compatible() -> None:
     assert parsed.ratio == "16:9"
     assert parsed.max_reuse_per_asset == 2
     assert parsed.max_asset_screen_share == pytest.approx(0.25)
+
+
+def test_passed_attempt_review_artifacts_are_promoted_with_stable_paths(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    attempt_dir = run_dir / "attempts" / "attempt_01"
+    frames = attempt_dir / "validation_frames"
+    frames.mkdir(parents=True)
+    frame = frames / "event.jpg"
+    frame.write_bytes(b"jpeg")
+    review_json = attempt_dir / "visual_review.json"
+    review_json.write_text(
+        json.dumps({"artifacts": {"json": str(review_json)}, "entries": [{"frame_path": str(frame)}]}),
+        encoding="utf-8",
+    )
+    (attempt_dir / "visual_review.md").write_text("![frame](<validation_frames/event.jpg>)\n", encoding="utf-8")
+    final_output = run_dir / "final.mp4"
+    final_output.write_bytes(b"video")
+
+    promoted = entry._promote_validation_artifacts(
+        {"path": str(attempt_dir / "attempt.mp4"), "event_frames": [{"path": str(frame)}]},
+        attempt_dir,
+        run_dir,
+        final_output,
+    )
+
+    assert promoted["path"] == str(final_output.resolve())
+    assert promoted["event_frames"][0]["path"] == str(run_dir.resolve() / "validation_frames" / "event.jpg")
+    payload = json.loads((run_dir / "visual_review.json").read_text(encoding="utf-8"))
+    assert payload["entries"][0]["frame_path"] == str(run_dir.resolve() / "validation_frames" / "event.jpg")
+    assert (run_dir / "visual_review.md").is_file()

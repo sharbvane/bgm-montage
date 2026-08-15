@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bgm-montage v1.3.3 unified reference-style, BGM-driven montage entry."""
+"""bgm-montage v1.4 unified reference-style, BGM-driven montage entry."""
 
 from __future__ import annotations
 
@@ -201,6 +201,7 @@ def _invocation_payload(
         "youtube_results_per_query": int(_arg(args, "youtube_results_per_query", 8)),
         "youtube_max_download_candidates": int(_arg(args, "youtube_max_download_candidates", 36)),
         "excluded_youtube_ids": list(_arg(args, "excluded_youtube_ids", []) or []),
+        "youtube_source_windows": list(_arg(args, "youtube_source_windows", []) or []),
         "visual_style": str(_arg(args, "visual_style", "auto")),
         "excluded_pixabay_ids": list(_arg(args, "excluded_pixabay_ids", []) or []),
         "max_reuse_per_asset": int(_arg(args, "max_reuse_per_asset", 1)),
@@ -247,6 +248,42 @@ def _copy_or_create_sources(media_result: dict[str, Any], destination: Path) -> 
             "rejections": media_result.get("rejections", []),
         },
     )
+
+
+def _promote_validation_artifacts(
+    validation: dict[str, Any],
+    attempt_dir: Path,
+    run_dir: Path,
+    final_output: Path,
+) -> dict[str, Any]:
+    """Promote the passed attempt's review packet and fix its stable paths."""
+
+    source_frames = attempt_dir / "validation_frames"
+    if source_frames.is_dir():
+        shutil.copytree(source_frames, run_dir / "validation_frames", dirs_exist_ok=True)
+    for name in ("visual_review.json", "visual_review.md"):
+        source = attempt_dir / name
+        if source.is_file():
+            shutil.copy2(source, run_dir / name)
+
+    source_prefix = str(attempt_dir.resolve())
+    target_prefix = str(run_dir.resolve())
+
+    def relocate(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: relocate(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [relocate(item) for item in value]
+        if isinstance(value, str) and value.casefold().startswith(source_prefix.casefold()):
+            return target_prefix + value[len(source_prefix):]
+        return value
+
+    promoted = relocate(validation)
+    promoted["path"] = str(final_output.resolve())
+    review_json = run_dir / "visual_review.json"
+    if review_json.is_file():
+        _write_json(review_json, relocate(_read_json(review_json)))
+    return promoted
 
 
 def _find_jianying_python(explicit: str | None = None) -> Path:
@@ -321,7 +358,7 @@ def _export_jianying_draft(
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    """Run the v1.3.3 pipeline, checkpointing every reusable stage."""
+    """Run the v1.4 pipeline, checkpointing every reusable stage."""
 
     load_dotenv(PROJECT_ROOT / ".env", override=False)
     source_provider = str(_arg(args, "source_provider", "youtube-first")).lower()
@@ -397,7 +434,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _write_json(
         state_path,
         {
-            "schema_version": "1.3.3",
+            "schema_version": "1.4",
             "run_id": run_id,
             "invocation_digest": invocation_digest,
             "invocation": invocation,
@@ -407,8 +444,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     run_report_path = run_dir / "run_report.json"
     report: dict[str, Any] = {
-        "schema_version": "1.3.3",
-        "skill_version": "1.3.3",
+        "schema_version": "1.4",
+        "skill_version": "1.4",
         "run_id": run_id,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "resumed": resume,
@@ -614,6 +651,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     max_search_rounds=int(_arg(args, "youtube_max_search_rounds", 3)),
                     wide_aerial_only=bool(_arg(args, "wide_aerial_only", False)),
                     usage_mode=usage_mode,
+                    source_windows=list(_arg(args, "youtube_source_windows", []) or []),
                 )
             elif source_provider == "youtube":
                 media_result = run_youtube_pipeline(
@@ -635,6 +673,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     max_download_candidates=int(_arg(args, "youtube_max_download_candidates", 36)),
                     max_search_rounds=int(_arg(args, "youtube_max_search_rounds", 3)),
                     usage_mode=usage_mode,
+                    source_windows=list(_arg(args, "youtube_source_windows", []) or []),
                 )
             else:
                 media_result = run_pixabay_pipeline(
@@ -765,6 +804,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     if final_output.exists():
                         raise FileExistsError(f"Final output already exists and was not overwritten: {final_output}")
                     os.replace(attempt_video, final_output)
+                    successful_validation = _promote_validation_artifacts(
+                        successful_validation,
+                        attempt_dir,
+                        run_dir,
+                        final_output,
+                    )
                     break
             except (TimelineInsufficientMaterialError, MontageError) as exc:
                 attempts.append(
@@ -835,6 +880,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "edit_plan_compat": str(edit_plan_path),
                 "render_report": str(render_report_path),
                 "validation_compat": str(validation_path),
+                "visual_review_json": str(run_dir / "visual_review.json"),
+                "visual_review_markdown": str(run_dir / "visual_review.md"),
+                "validation_frames": str(run_dir / "validation_frames"),
                 "video": str(final_output),
             }
         )
@@ -878,7 +926,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", action="version", version="bgm-montage 1.3.3")
+    parser.add_argument("--version", action="version", version="bgm-montage 1.4")
     parser.add_argument("--bgm", required=True, help="Input BGM/audio file")
     parser.add_argument("--theme", required=True, help="Theme used to generate English visual search queries")
     parser.add_argument("--duration", required=True, type=float, help="Requested output duration in seconds")
@@ -938,6 +986,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--youtube-results-per-query", type=int, default=8)
     parser.add_argument("--youtube-max-download-candidates", type=int, default=36)
     parser.add_argument("--youtube-max-search-rounds", type=int, default=3)
+    parser.add_argument(
+        "--youtube-source-window",
+        dest="youtube_source_windows",
+        action="append",
+        default=[],
+        metavar="VIDEO_ID=START-END",
+        help="Use an absolute source interval when that YouTube ID is downloaded; repeat as needed.",
+    )
     parser.add_argument(
         "--exclude-youtube-id",
         dest="excluded_youtube_ids",

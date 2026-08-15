@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pre-download music-event timeline planning for bgm-montage v1.2.
+"""Pre-download music-event timeline planning for bgm-montage v1.4.
 
 The planner consumes the deterministic ``audiomap.json`` produced by
 ``analyze_bgm.py`` and creates semantic shot slots before media search or
@@ -18,9 +18,44 @@ import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from montage import (
+    _grammar_duration,
+    _grammar_event_offsets,
+    _grammar_event_weights,
+    _mapping_at,
+    _normalize_scale,
+    _normalize_transition,
+    _transition_choice,
+)
+
 
 SCHEMA_VERSION = "1.2"
-PLANNER_VERSION = "1.2.1"
+PLANNER_VERSION = "1.4.0"
+
+_EVENT_GROUP = {
+    "strong_accent": "accents",
+    "accent": "accents",
+    "downbeat": "accents",
+    "onset": "accents",
+    "weak_beat": "beats",
+    "beat": "beats",
+    "phrase": "phrases",
+    "phrase_boundary": "phrases",
+    "section": "sections",
+    "section_boundary": "sections",
+    "pause": "pauses",
+    "pause_edge": "pauses",
+    "hard_stop": "pauses",
+}
+
+_PREFERRED_EVENT = {
+    "strong_accent": "accent",
+    "weak_beat": "beat",
+    "phrase": "phrase_boundary",
+    "section": "section_boundary",
+    "pause": "hard_stop",
+    "pause_edge": "hard_stop",
+}
 
 
 class TimelinePlanningError(RuntimeError):
@@ -341,6 +376,8 @@ def _boundary(
     maximum: float,
     mode: str,
     events: Sequence[Mapping[str, Any]],
+    event_weights: Mapping[str, float] | None = None,
+    event_offsets: Mapping[str, float] | None = None,
 ) -> tuple[float, dict[str, Any]]:
     target = min(section_end, current + target_length)
     low = current + minimum
@@ -360,14 +397,28 @@ def _boundary(
     for event in events:
         event_type = str(event.get("type") or "")
         time_value = _number(event.get("time"), -1.0)
+        group = _EVENT_GROUP.get(event_type)
+        learned_offset = _number((event_offsets or {}).get(group), 0.0) if group else 0.0
+        learned_time = time_value + learned_offset
         allowed_high = elastic_high if event_type in elastic_types else high
-        if event_type not in rank or not low - 1e-6 <= time_value <= allowed_high + 1e-6:
+        if event_type not in rank or not low - 1e-6 <= learned_time <= allowed_high + 1e-6:
             continue
-        distance = abs(time_value - target) / span
-        if time_value > high:
-            distance += (time_value - high) / max(0.15, maximum) * 0.18
+        distance = abs(learned_time - target) / span
+        if learned_time > high:
+            distance += (learned_time - high) / max(0.15, maximum) * 0.18
         score = distance + rank[event_type] * 0.065 - _clamp(event.get("strength", 0.5)) * 0.08
-        candidates.append((score, time_value, event))
+        if event_weights and group:
+            score += (1.0 - _clamp(event_weights.get(group, 1.0))) * 0.28
+        adjusted = dict(event)
+        if learned_offset:
+            adjusted.update(
+                {
+                    "source_time": time_value,
+                    "time": learned_time,
+                    "learned_offset_seconds": learned_offset,
+                }
+            )
+        candidates.append((score, learned_time, adjusted))
     if candidates:
         _, time_value, event = min(candidates, key=lambda item: (item[0], item[1], str(item[2].get("type"))))
         return time_value, dict(event)
@@ -418,6 +469,64 @@ def plan_timeline_slots(
     events = _events(audiomap, total)
     sections = _sections(audiomap, total)
     style_target = _style_shot_target(style_profile)
+    grammar = dict(editing_grammar or {})
+    grammar_digest = (
+        hashlib.sha256(
+            json.dumps(grammar, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if grammar
+        else None
+    )
+    raw_event_weights = _mapping_at(
+        grammar, ("event_weights", "boundary_event_weights", "cut_event_weights", "primary_distribution")
+    )
+    raw_event_offsets = _mapping_at(grammar, ("boundary_offsets_seconds", "event_offsets_seconds"))
+    raw_durations = _mapping_at(
+        grammar, ("energy_shot_duration_seconds", "shot_duration_by_energy", "energy_duration")
+    )
+    event_weights = _grammar_event_weights(grammar) if raw_event_weights else {}
+    event_offsets = _grammar_event_offsets(grammar) if raw_event_offsets else {}
+    scale_matrix = _mapping_at(grammar, ("scale_transition_matrix", "shot_scale_transition_matrix"))
+    motion_matrix = _mapping_at(grammar, ("motion_transition_matrix", "camera_motion_transition_matrix"))
+    transition_distribution = _mapping_at(
+        grammar, ("transition_distribution", "supported_transition_distribution")
+    )
+    reliability = _mapping_at(grammar, ("reliability",))
+    reliability_score = _clamp(reliability.get("score", 1.0)) if reliability else 1.0
+    event_weights = {
+        key: 1.0 + (value - 1.0) * reliability_score
+        for key, value in event_weights.items()
+    }
+    event_offsets = {key: value * reliability_score for key, value in event_offsets.items()}
+    beat_times = sorted(_number(event.get("time")) for event in events if event.get("type") == "beat")
+    beat_gaps = [right - left for left, right in zip(beat_times, beat_times[1:]) if 0.18 <= right - left <= 2.0]
+    beat_seconds = sorted(beat_gaps)[len(beat_gaps) // 2] if beat_gaps else 0.5
+    learned_transition = ""
+    if transition_distribution:
+        transition_name = max(
+            transition_distribution,
+            key=lambda key: (_number(transition_distribution.get(key)), str(key)),
+        )
+        learned_transition = _normalize_transition(transition_name)
+    policy = grammar.get("montage_policy") if isinstance(grammar.get("montage_policy"), Mapping) else {}
+    ending = (
+        dict(policy.get("ending"))
+        if isinstance(policy.get("ending"), Mapping)
+        else _mapping_at(grammar, ("ending", "ending_structure"))
+    )
+    applied_fields = [
+        name
+        for name, value in (
+            ("boundary_event_weights", raw_event_weights),
+            ("boundary_offsets_seconds", raw_event_offsets),
+            ("shot_duration_by_energy", raw_durations),
+            ("scale_transition_matrix", scale_matrix),
+            ("motion_transition_matrix", motion_matrix),
+            ("transition_distribution", transition_distribution),
+            ("ending", ending),
+        )
+        if value
+    ]
     global_mode = str((audiomap.get("rhythm_mode") or {}).get("mode") or "phrase_flow")
     if global_mode not in {"beat_cut", "phrase_flow"}:
         global_mode = "phrase_flow"
@@ -431,6 +540,8 @@ def plan_timeline_slots(
     slots: list[dict[str, Any]] = []
     snapped = 0
     fallback = 0
+    previous_scale = "wide"
+    previous_motion = "static_like"
 
     key_types = {"drop", "surge", "climax", "hard_stop"}
     for section in sections:
@@ -442,6 +553,19 @@ def plan_timeline_slots(
         if mode not in {"beat_cut", "phrase_flow"}:
             mode = global_mode
         low, target, high, intensity = _shot_target(section, style_target)
+        energy_root = section.get("energy") if isinstance(section.get("energy"), Mapping) else {}
+        section_energy = _clamp(energy_root.get("mean", section.get("energy", 0.5)))
+        learned_target = target
+        if raw_durations:
+            learned_target = _grammar_duration(grammar, section_energy, target, beat_seconds)
+            blended_target = target * (1.0 - reliability_score) + learned_target * reliability_score
+            duration_scale = blended_target / max(target, 1e-9)
+            low *= duration_scale
+            target = blended_target
+            high *= duration_scale
+            low = max(0.36, min(4.0, low))
+            high = max(low + 0.12, min(8.0, high))
+            target = max(low, min(high, target))
         if minimum_override > 0:
             low = max(0.24, minimum_override)
         if maximum_override > 0:
@@ -470,6 +594,8 @@ def plan_timeline_slots(
                 max(effective_low + 0.12, effective_high),
                 mode,
                 events,
+                event_weights,
+                event_offsets,
             )
             boundary = min(end, max(current + 0.24, boundary))
             if end - boundary < terminal_minimum:
@@ -496,8 +622,15 @@ def plan_timeline_slots(
             role = str(section.get("role") or "build")
             mood = str(section.get("estimated_mood") or section.get("mood") or "balanced/forward")
             content, scale, motion = _visual_intent(role, energy, emphasis_type)
+            prior_scale, prior_motion = previous_scale, previous_motion
+            if scale_matrix:
+                scale = _normalize_scale(_transition_choice(scale_matrix, previous_scale, [scale], len(slots)))
+            if motion_matrix:
+                motion = _transition_choice(motion_matrix, previous_motion, [motion], len(slots))
             is_last = boundary >= total - 0.02
             transition = _transition(mode, anchor_type, not slots, is_last)
+            if learned_transition and slots and not is_last:
+                transition = learned_transition
             anchor_payload = {
                 "type": anchor_type,
                 "time": round(_number(anchor.get("time"), boundary), 4),
@@ -505,6 +638,11 @@ def plan_timeline_slots(
                 "confidence": round(_clamp(anchor.get("confidence", 0.5)), 4),
                 "delta_seconds": round(boundary - _number(anchor.get("time"), boundary), 4),
             }
+            if anchor.get("source_time") is not None:
+                anchor_payload["source_event_time"] = round(_number(anchor.get("source_time")), 4)
+                anchor_payload["learned_offset_seconds"] = round(
+                    _number(anchor.get("learned_offset_seconds")), 4
+                )
             slot = {
                 "index": len(slots),
                 "start": round(current, 4),
@@ -531,8 +669,121 @@ def plan_timeline_slots(
                 "transition": transition,
                 "recommended_transition": transition,
             }
+            if grammar:
+                grammar_influence = {}
+                group = _EVENT_GROUP.get(anchor_type)
+                if raw_event_weights and group:
+                    grammar_influence["boundary_event_weight"] = round(event_weights.get(group, 1.0), 4)
+                if raw_event_offsets and group:
+                    grammar_influence["boundary_offset_seconds"] = round(event_offsets.get(group, 0.0), 4)
+                if raw_durations:
+                    grammar_influence.update(
+                        {
+                            "reference_duration_target_seconds": round(learned_target, 4),
+                            "duration_blend_reliability": round(reliability_score, 4),
+                        }
+                    )
+                if scale_matrix:
+                    grammar_influence["scale_transition"] = f"{prior_scale}->{scale}"
+                if motion_matrix:
+                    grammar_influence["motion_transition"] = f"{prior_motion}->{motion}"
+                if learned_transition:
+                    grammar_influence["transition_target"] = learned_transition
+                slot["grammar_influence"] = grammar_influence
             slots.append(slot)
+            previous_scale, previous_motion = scale, motion
             current = boundary
+
+    multiplier_value = ending.get(
+        "final_shot_multiplier",
+        ending.get("last_shot_multiplier", ending.get("last_shot_duration_multiplier")),
+    )
+    multiplier_present = multiplier_value is not None
+    learned_ending_multiplier = max(0.6, min(2.0, _number(multiplier_value, 1.0)))
+    ending_multiplier = 1.0 + (learned_ending_multiplier - 1.0) * reliability_score
+    preferred_end_event = str(ending.get("preferred_end_event") or "").strip().lower()
+    if grammar and ending and slots:
+        ending_target = {
+            "last_shot_duration_multiplier": round(ending_multiplier, 4),
+            "preferred_end_event": preferred_end_event if reliability_score > 0.0 else None,
+            "fade_out_seconds": round(
+                max(0.0, _number(ending.get("fade_out_seconds", ending.get("final_fade_seconds")), 0.0)),
+                4,
+            ),
+            "hold_last_frame": bool(ending.get("hold_last_frame", False)),
+        }
+        slots[-1]["ending_target"] = ending_target
+        slots[-1].setdefault("grammar_influence", {})["ending"] = ending_target
+    if (
+        multiplier_present
+        and reliability_score > 0.0
+        and len(slots) >= 2
+        and slots[-2]["section_index"] == slots[-1]["section_index"]
+    ):
+        previous, final = slots[-2], slots[-1]
+        typical_values = sorted(float(slot["duration"]) for slot in slots[:-1])
+        typical = typical_values[len(typical_values) // 2]
+        low_boundary = float(previous["start"]) + 0.24
+        high_boundary = total - terminal_minimum
+        target_boundary = max(low_boundary, min(high_boundary, total - typical * ending_multiplier))
+        preferred_type = _PREFERRED_EVENT.get(preferred_end_event, preferred_end_event)
+        preferred = [
+            event
+            for event in events
+            if str(event.get("type")) == preferred_type
+            and low_boundary <= _number(event.get("time"), -1.0) <= high_boundary
+            and abs(_number(event.get("time")) - target_boundary) <= max(0.35, typical * 0.35)
+        ]
+        chosen = min(preferred, key=lambda event: abs(_number(event.get("time")) - target_boundary), default=None)
+        new_boundary = _number(chosen.get("time"), target_boundary) if chosen else target_boundary
+        old_boundary = float(previous["end"])
+        if abs(new_boundary - old_boundary) > 0.004:
+            old_type = str((previous.get("anchor_event") or {}).get("type") or "flow_grid")
+            new_type = str(chosen.get("type")) if chosen else "flow_grid"
+            if old_type == "flow_grid" and new_type != "flow_grid":
+                fallback -= 1
+                snapped += 1
+            elif old_type != "flow_grid" and new_type == "flow_grid":
+                snapped -= 1
+                fallback += 1
+            previous.update(
+                {
+                    "end": round(new_boundary, 4),
+                    "output_end": round(new_boundary, 4),
+                    "duration": round(new_boundary - float(previous["start"]), 4),
+                    "output_duration": round(new_boundary - float(previous["start"]), 4),
+                    "anchor_event": {
+                        "type": new_type,
+                        "time": round(new_boundary, 4),
+                        "strength": round(_clamp(chosen.get("strength", 0.5)), 4) if chosen else 0.25,
+                        "confidence": round(_clamp(chosen.get("confidence", 0.5)), 4) if chosen else 0.35,
+                        "delta_seconds": 0.0,
+                        "ending_target": True,
+                    },
+                }
+            )
+            previous["transition"] = previous["recommended_transition"] = (
+                learned_transition
+                if learned_transition and int(previous["index"]) > 0
+                else _transition(
+                    str(previous.get("rhythm_mode") or global_mode),
+                    new_type,
+                    int(previous["index"]) == 0,
+                    False,
+                )
+            )
+            final.update(
+                {
+                    "start": round(new_boundary, 4),
+                    "output_start": round(new_boundary, 4),
+                    "duration": round(total - new_boundary, 4),
+                    "output_duration": round(total - new_boundary, 4),
+                }
+            )
+            previous.setdefault("grammar_influence", {})["ending_boundary_adjustment_seconds"] = round(
+                new_boundary - old_boundary, 4
+            )
+        slots[-1]["ending_target"]["actual_last_shot_duration_seconds"] = slots[-1]["duration"]
 
     if not slots or abs(slots[0]["start"]) > 0.02 or abs(slots[-1]["end"] - total) > 0.03:
         raise TimelinePlanningError("planner could not cover the full audiomap duration")
@@ -543,10 +794,12 @@ def plan_timeline_slots(
         "config": config,
         "slots": slots,
     }
+    if grammar_digest:
+        digest_payload["editing_grammar_digest"] = grammar_digest
     plan_digest = hashlib.sha256(
         json.dumps(digest_payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-    return {
+    plan = {
         "schema_version": SCHEMA_VERSION,
         "artifact_type": "timeline",
         "planner": {"name": "bgm-montage pre-download timeline planner", "version": PLANNER_VERSION},
@@ -581,6 +834,15 @@ def plan_timeline_slots(
             "Drop and climax slots request wide, high-impact, high-motion visuals.",
         ],
     }
+    if grammar:
+        plan.update(
+            {
+                "editing_grammar_digest": grammar_digest,
+                "editing_grammar_applied": bool(applied_fields),
+                "editing_grammar_applied_fields": applied_fields,
+            }
+        )
+    return plan
 
 
 def build_timeline_slots(*args: Any, **kwargs: Any) -> dict[str, Any]:
