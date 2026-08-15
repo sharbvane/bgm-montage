@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -52,6 +53,7 @@ def test_default_provider_is_youtube_first() -> None:
         "--ratio", "16:9", "--output-dir", "out",
     ])
     assert args.source_provider == "youtube-first"
+    assert args.agent_visual_review == "required"
     assert {"youtube-first", "youtube", "pixabay"} == set(
         next(action for action in bgm_montage.build_parser()._actions if action.dest == "source_provider").choices
     )
@@ -113,6 +115,145 @@ def test_candidate_pool_gate_is_hard_machine_readable() -> None:
     assert gate["available_candidate_count"] == 5
 
 
+def test_explicit_youtube_source_window_overrides_automatic_section(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[str] = []
+
+    def fake_run(command: list[str], timeout: int = 0) -> SimpleNamespace:
+        captured.extend(command)
+        output = Path(command[command.index("-o") + 1].replace("%(ext)s", "mp4"))
+        output.write_bytes(b"x" * (65 * 1024))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(youtube, "_run", fake_run)
+    destination = tmp_path / "curated.mp4"
+    report = youtube._download_candidate(
+        {
+            "youtube_id": "abcDEF12345",
+            "page_url": "https://www.youtube.com/watch?v=abcDEF12345",
+            "duration": 400.0,
+            "requested_download_section": {"start": 120.5, "end": 151.25},
+        },
+        destination,
+        "yt-dlp",
+    )
+    assert destination.is_file()
+    assert "*120.5-151.25" in captured
+    assert report == {
+        "section": {"start": 120.5, "end": 151.25},
+        "requested_section": {"start": 120.5, "end": 151.25},
+        "section_strategy": "explicit",
+    }
+
+
+def test_youtube_source_window_cli_is_validated_and_resume_sensitive(tmp_path: Path) -> None:
+    assert youtube._normalize_source_windows(["abcDEF12345=12.5-27"]) == {
+        "abcDEF12345": [{"start": 12.5, "end": 27.0}]
+    }
+    with pytest.raises(ValueError, match="0 <= start < end"):
+        youtube._normalize_source_windows(["abcDEF12345=27-12.5"])
+    args = bgm_montage.build_parser().parse_args([
+        "--bgm", "a.mp3", "--theme", "arctic landscape", "--duration", "8",
+        "--ratio", "16:9", "--output-dir", "out",
+        "--youtube-source-window", "abcDEF12345=12.5-27",
+    ])
+    assert args.youtube_source_windows == ["abcDEF12345=12.5-27"]
+    bgm = tmp_path / "a.mp3"
+    bgm.write_bytes(b"audio")
+    assert bgm_montage._invocation_payload(
+        bgm_path=bgm, reference_dir=Path("refs"), material_dir=Path("media"), args=args,
+    )["youtube_source_windows"] == ["abcDEF12345=12.5-27"]
+
+
+def test_same_youtube_video_accepts_multiple_curated_windows_and_reuses_each(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert youtube._normalize_source_windows(
+        ["abcDEF12345=10-14", "abcDEF12345=30-35", "abcDEF12345=10-14"]
+    ) == {
+        "abcDEF12345": [
+            {"start": 10.0, "end": 14.0},
+            {"start": 30.0, "end": 35.0},
+        ]
+    }
+
+    library_root = tmp_path / "library"
+    monkeypatch.setenv("BGM_MONTAGE_LIBRARY_ROOT", str(library_root))
+    rows = []
+    for index, window in enumerate(((10.0, 14.0), (30.0, 35.0))):
+        video = library_root / "youtube" / "videos" / f"youtube_video000_{window[0]}-{window[1]}.mp4"
+        video.parent.mkdir(parents=True, exist_ok=True)
+        video.write_bytes(bytes([65 + index]) * (65 * 1024))
+        rows.append({
+            **_asset(index, "youtube", "mountain" if index == 0 else "coast"),
+            "id": f"video000@{index}",
+            "asset_id": f"video000@{index}",
+            "canonical_source_id": f"youtube:video000@{index}",
+            "file_hash": str(index + 1) * 64,
+            "youtube_id": "video000",
+            "local_path": str(video),
+            "title": "Arctic glacier cinematic",
+            "channel": "camera-0",
+            "requested_download_section": {"start": window[0], "end": window[1]},
+            "download_section": {"start": window[0], "end": window[1]},
+            "download_section_strategy": "explicit",
+        })
+    index_path = library_root / "youtube" / "asset_index.json"
+    index_path.write_text(json.dumps({"schema_version": 1, "assets": rows}), encoding="utf-8")
+    monkeypatch.setattr(youtube, "_yt_dlp_executable", lambda: pytest.fail("curated cache must skip network"))
+
+    result = youtube.run_youtube_pipeline(
+        "arctic glacier cinematic", {}, {}, tmp_path / "materials", tmp_path / "cache",
+        2, "16:9", timeline_plan={"slots": [{}, {}]}, candidate_pool_multiplier=1,
+        source_windows=["video000=10-14", "video000=30-35"],
+    )
+
+    assert len(result["selected"]) == 2
+    assert {tuple(item["requested_download_section"].values()) for item in result["selected"]} == {
+        (10.0, 14.0),
+        (30.0, 35.0),
+    }
+    assert len({item["local_path"] for item in result["selected"]}) == 2
+
+
+def test_explicit_window_reuses_matching_cached_section_and_keeps_request_trace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    library_root = tmp_path / "library"
+    monkeypatch.setenv("BGM_MONTAGE_LIBRARY_ROOT", str(library_root))
+    video = library_root / "youtube" / "videos" / "youtube_video000.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"x" * (65 * 1024))
+    row = {
+        **_asset(0, "youtube", "mountain"),
+        "youtube_id": "video000",
+        "local_path": str(video),
+        "title": "Arctic glacier cinematic",
+        "channel": "camera-0",
+        "download_section": {"start": 12.0, "end": 16.0},
+        "download_section_strategy": "automatic",
+    }
+    index_path = library_root / "youtube" / "asset_index.json"
+    index_path.write_text(json.dumps({"schema_version": 1, "assets": [row]}), encoding="utf-8")
+    monkeypatch.setattr(youtube, "_yt_dlp_executable", lambda: pytest.fail("matching cache must skip network"))
+
+    result = youtube.run_youtube_pipeline(
+        "arctic glacier cinematic", {}, {}, tmp_path / "materials", tmp_path / "cache",
+        1, "16:9", timeline_plan={"slots": [{}]}, candidate_pool_multiplier=1,
+        source_windows=["video000=12-16"],
+    )
+
+    selected = result["selected"][0]
+    assert selected["reuse_mode"] == "global_index"
+    assert selected["requested_download_section"] == {"start": 12.0, "end": 16.0}
+    assert selected["download_section_strategy"] == "explicit_reuse"
+    assert youtube._recorded_source_window({
+        "requested_download_section": {"start": 120.5, "end": 500.0},
+        "download_section": {"start": 120.5, "end": 400.0},
+    }) == {"start": 120.5, "end": 500.0}
+
+
 def test_youtube_shortfall_triggers_pixabay_and_combined_passes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     yt_assets = [_asset(1, "youtube", "mountain")]
     px_assets = [_asset(2, "pixabay", "coast"), _asset(3, "pixabay", "forest")]
@@ -142,18 +283,26 @@ def _asset_id(item: dict) -> str:
 
 def test_sufficient_youtube_skips_pixabay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assets = [_asset(1, "youtube", "mountain"), _asset(2, "youtube", "coast")]
-    monkeypatch.setattr(first, "run_youtube_pipeline", lambda *a, **k: {
-        "status": "ok", "selected": assets, "selected_count": 2, "candidate_count": 6,
-        "candidate_pool_gate": {"passed": True}, "sufficiency": {"passed": True, "failures": []},
-        "search_rounds": [],
-    })
+    captured: dict = {}
+
+    def youtube_run(*args, **kwargs):
+        captured.update(kwargs)
+        return {
+            "status": "ok", "selected": assets, "selected_count": 2, "candidate_count": 6,
+            "candidate_pool_gate": {"passed": True}, "sufficiency": {"passed": True, "failures": []},
+            "search_rounds": [],
+        }
+
+    monkeypatch.setattr(first, "run_youtube_pipeline", youtube_run)
     monkeypatch.setattr(first, "run_pixabay_pipeline", lambda *a, **k: pytest.fail("Pixabay must not run"))
     result = first.run_youtube_first_pipeline(
         "arctic glacier cinematic", {}, {}, tmp_path / "materials", tmp_path / "cache",
         2, "16:9", timeline_plan={"slots": [{}]}, candidate_pool_multiplier=2,
+        source_windows=["video001=10-20"],
     )
     assert result["pixabay_fallback"]["triggered"] is False
     assert result["sufficiency"]["passed"] is True
+    assert captured["source_windows"] == ["video001=10-20"]
 
 
 def test_merge_deduplicates_and_never_repeats_shots() -> None:

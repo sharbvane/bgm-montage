@@ -275,6 +275,8 @@ def test_offline_reference_bgm_grammar_timeline_render_and_full_decode(tmp_path:
     assert style_profile["run_report"]["analyzed"] == 1
     assert style_profile["source_policy"] == "read_only"
     reference_summary = style_profile["videos"][0]
+    assert reference_summary["sampling"]["scene_scan"]["status"] == "ok"
+    assert reference_summary["sampling"]["sample_merge"]["selected_scene_target_count"] > 0
     semantic = reference_summary["semantic_analysis"]
     assert semantic["available"] is False
     assert semantic["backend"] == "disabled"

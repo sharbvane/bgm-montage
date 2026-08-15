@@ -204,3 +204,124 @@ def test_terminal_remainder_is_merged_instead_of_creating_a_flash_shot() -> None
     assert plan["slots"][-1]["end"] == pytest.approx(2.334)
     assert min(float(slot["duration"]) for slot in plan["slots"]) >= 0.50
     assert plan["metrics"]["minimum_slot_duration_seconds"] >= 0.50
+
+
+def test_production_planner_applies_editing_grammar_counterfactually() -> None:
+    profile = _audiomap("beat_cut")
+    fast_detail = {
+        "reliability": {"score": 1.0},
+        "montage_policy": {
+            "boundary_event_weights": {
+                "strong_accent": 1.0,
+                "weak_beat": 0.15,
+                "phrase_boundary": 0.10,
+            },
+            "boundary_offsets_seconds": {"strong_accent": 0.12},
+            "shot_duration_by_energy": {
+                "high": {"median_seconds": 0.68, "median_beats": 1.0},
+            },
+            "scale_transition_matrix": {
+                "wide": {"detail": 1.0},
+                "detail": {"wide": 1.0},
+                "medium": {"detail": 1.0},
+            },
+            "motion_transition_matrix": {
+                "static_like": {"push_in": 1.0},
+                "push_in": {"pan_right": 1.0},
+                "pan_right": {"push_in": 1.0},
+            },
+            "transition_distribution": {"hard_cut": 1.0},
+            "ending": {
+                "last_shot_duration_multiplier": 0.65,
+                "preferred_end_event": "strong_accent",
+                "fade_out_seconds": 0.15,
+                "hold_last_frame": False,
+            },
+        },
+    }
+    slow_wide = {
+        "reliability": {"score": 1.0},
+        "montage_policy": {
+            "boundary_event_weights": {
+                "strong_accent": 0.10,
+                "weak_beat": 0.10,
+                "phrase_boundary": 1.0,
+            },
+            "boundary_offsets_seconds": {"phrase_boundary": -0.08},
+            "shot_duration_by_energy": {
+                "high": {"median_seconds": 2.5, "median_beats": 4.0},
+            },
+            "scale_transition_matrix": {
+                "wide": {"wide": 1.0},
+                "medium": {"wide": 1.0},
+                "detail": {"wide": 1.0},
+            },
+            "motion_transition_matrix": {"static_like": {"static_like": 1.0}},
+            "transition_distribution": {"dissolve": 1.0},
+            "ending": {
+                "last_shot_duration_multiplier": 1.75,
+                "preferred_end_event": "phrase_boundary",
+                "fade_out_seconds": 0.75,
+                "hold_last_frame": True,
+            },
+        },
+    }
+
+    fast = plan_timeline_slots(profile, editing_grammar=fast_detail)
+    repeated_fast = plan_timeline_slots(profile, editing_grammar=fast_detail)
+    slow = plan_timeline_slots(profile, editing_grammar=slow_wide)
+
+    assert fast["plan_digest"] == repeated_fast["plan_digest"]
+    assert fast["plan_digest"] != slow["plan_digest"]
+    assert len(fast["slots"]) > len(slow["slots"])
+    assert [slot["end"] for slot in fast["slots"][:-1]] != [
+        slot["end"] for slot in slow["slots"][:-1]
+    ]
+    shifted = [
+        slot["anchor_event"]
+        for slot in fast["slots"]
+        if slot["anchor_event"].get("learned_offset_seconds") == pytest.approx(0.12)
+    ]
+    assert shifted and all(
+        anchor["time"] == pytest.approx(anchor["source_event_time"] + 0.12)
+        for anchor in shifted
+    )
+    assert fast["slots"][0]["recommended_shot_scale"] == "detail"
+    assert slow["slots"][0]["recommended_shot_scale"] == "wide"
+    assert fast["slots"][0]["recommended_motion"] == "push_in"
+    assert slow["slots"][0]["recommended_motion"] == "static_like"
+    assert {slot["transition"] for slot in fast["slots"][1:-1]} == {"hard_cut"}
+    assert {slot["transition"] for slot in slow["slots"][1:-1]} == {"dissolve"}
+    assert fast["slots"][-1]["ending_target"]["last_shot_duration_multiplier"] == 0.65
+    assert slow["slots"][-1]["ending_target"]["last_shot_duration_multiplier"] == 1.75
+    assert fast["slots"][-1]["duration"] < slow["slots"][-1]["duration"]
+    assert fast["editing_grammar_applied"] is True
+    assert set(fast["editing_grammar_applied_fields"]) == {
+        "boundary_event_weights",
+        "boundary_offsets_seconds",
+        "shot_duration_by_energy",
+        "scale_transition_matrix",
+        "motion_transition_matrix",
+        "transition_distribution",
+        "ending",
+    }
+
+    no_grammar = plan_timeline_slots(profile)
+    empty_grammar = plan_timeline_slots(profile, editing_grammar={})
+    assert no_grammar == empty_grammar
+
+    unreliable = plan_timeline_slots(
+        profile,
+        editing_grammar={**fast_detail, "reliability": {"score": 0.0}},
+    )
+    assert [slot["end"] for slot in unreliable["slots"]] == [
+        slot["end"] for slot in no_grammar["slots"]
+    ]
+    assert unreliable["slots"][-1]["ending_target"]["last_shot_duration_multiplier"] == 1.0
+    assert unreliable["slots"][-1]["ending_target"]["preferred_end_event"] is None
+    for slot in unreliable["slots"]:
+        influence = slot.get("grammar_influence", {})
+        if "boundary_event_weight" in influence:
+            assert influence["boundary_event_weight"] == 1.0
+        if "boundary_offset_seconds" in influence:
+            assert influence["boundary_offset_seconds"] == 0.0
