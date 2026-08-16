@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bgm-montage v1.4.1 unified reference-style, BGM-driven montage entry."""
+"""bgm-montage v1.4.3 unified reference-style, BGM-driven montage entry."""
 
 from __future__ import annotations
 
@@ -37,6 +37,8 @@ from youtube_pipeline import run_youtube_pipeline
 from youtube_first_pipeline import InsufficientMaterialError as YouTubeFirstInsufficientMaterialError
 from youtube_first_pipeline import run_youtube_first_pipeline
 from material_usage_policy import USAGE_MODES, apply_usage_policy, material_usage_policy, normalize_usage_mode
+from local_library import InsufficientMaterialError as LocalLibraryInsufficientMaterialError
+from local_library import run_local_library_pipeline
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -188,6 +190,7 @@ def _invocation_payload(
         "bgm": {"path": str(bgm_path), "fingerprint": _file_fingerprint(bgm_path)},
         "reference_dir": str(reference_dir),
         "material_dir": str(material_dir),
+        "local_library_dir": str(_arg(args, "local_library_dir", "") or ""),
         "theme": args.theme,
         "duration": float(args.duration),
         "ratio": args.ratio,
@@ -267,7 +270,7 @@ def _build_agent_visual_review_request(
     result_path = attempt_dir / "agent_visual_review.json"
     request_path = attempt_dir / "agent_visual_review_request.json"
     request = {
-        "schema_version": "1.4.1",
+        "schema_version": "1.4.3",
         "artifact_type": "agent_visual_review_request",
         "attempt": attempt_number,
         "media_sha256": str(validation.get("sha256") or evidence.get("media_sha256") or ""),
@@ -299,7 +302,7 @@ def _build_agent_visual_review_request(
         ],
         "planned_cut_pairs": list(evidence.get("planned_cut_pairs") or []),
         "response_template": {
-            "schema_version": "1.4.1",
+            "schema_version": "1.4.3",
             "artifact_type": "agent_visual_review",
             "attempt": attempt_number,
             "media_sha256": str(validation.get("sha256") or evidence.get("media_sha256") or ""),
@@ -570,7 +573,7 @@ def _export_jianying_draft(
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    """Run the v1.4.1 pipeline, checkpointing every reusable stage."""
+    """Run the v1.4.3 pipeline, checkpointing every reusable stage."""
 
     load_dotenv(PROJECT_ROOT / ".env", override=False)
     source_provider = str(_arg(args, "source_provider", "youtube-first")).lower()
@@ -584,11 +587,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     bgm_path = Path(args.bgm).expanduser().resolve()
     reference_dir = Path(args.reference_dir).expanduser().resolve()
     material_dir = Path(args.material_dir).expanduser().resolve()
+    local_library_dir = (
+        Path(str(_arg(args, "local_library_dir", ""))).expanduser().resolve()
+        if _arg(args, "local_library_dir", None)
+        else None
+    )
     output_root = Path(args.output_dir).expanduser().resolve()
     if not bgm_path.is_file():
         raise FileNotFoundError(f"BGM not found: {bgm_path}")
     if not reference_dir.is_dir():
         raise FileNotFoundError(f"Reference directory not found: {reference_dir}")
+    if source_provider == "local-library" and not local_library_dir:
+        raise ValueError("--source-provider local-library requires --local-library-dir")
+    if local_library_dir is not None and not local_library_dir.is_dir():
+        raise FileNotFoundError(f"Local library directory not found: {local_library_dir}")
     parse_ratio(args.ratio)
     if args.duration <= 0:
         raise ValueError("--duration must be greater than zero")
@@ -649,7 +661,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _write_json(
         state_path,
         {
-            "schema_version": "1.4.1",
+            "schema_version": "1.4.3",
             "run_id": run_id,
             "invocation_digest": invocation_digest,
             "invocation": invocation,
@@ -659,8 +671,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     run_report_path = run_dir / "run_report.json"
     report: dict[str, Any] = {
-        "schema_version": "1.4.1",
-        "skill_version": "1.4.1",
+        "schema_version": "1.4.3",
+        "skill_version": "1.4.3",
         "run_id": run_id,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "resumed": resume,
@@ -671,6 +683,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "bgm": str(bgm_path),
             "reference_dir": str(reference_dir),
             "material_dir": str(material_dir),
+            "local_library_dir": str(local_library_dir) if local_library_dir else None,
         },
         "source_provider": source_provider,
         "usage_mode": usage_mode,
@@ -825,7 +838,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         asset_manifest_path = run_dir / "asset_manifest.json"
         sources_path = run_dir / "sources.json"
         print(
-            f"[5/7] Searching a >= {_arg(args, 'candidate_pool_multiplier', 6)}x pool and selecting {desired_assets} {source_provider} assets",
+            (
+                f"[5/7] Syncing the local library and selecting {desired_assets} indexed assets"
+                if source_provider == "local-library"
+                else f"[5/7] Searching a >= {_arg(args, 'candidate_pool_multiplier', 6)}x pool and selecting {desired_assets} {source_provider} assets"
+            ),
             flush=True,
         )
         material_sources_path: Path | None = None
@@ -843,7 +860,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             _copy_or_create_sources(media_result, asset_manifest_path)
             pixabay_resumed = True
         else:
-            if source_provider == "youtube-first":
+            if source_provider == "local-library":
+                media_result = run_local_library_pipeline(
+                    args.theme,
+                    style_profile,
+                    audio_profile,
+                    local_library_dir,
+                    cache_root,
+                    desired_assets,
+                    args.ratio,
+                    min_resolution=(args.min_width, args.min_height),
+                    target_duration=target_duration,
+                    timeline_plan=timeline_plan,
+                )
+            elif source_provider == "youtube-first":
                 media_result = run_youtube_first_pipeline(
                     args.theme,
                     style_profile,
@@ -929,6 +959,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "search_rounds": len(media_result.get("search_rounds", [])),
             "rejections": len(media_result.get("rejections", [])),
         }
+        if source_provider == "local-library":
+            report["stages"][source_provider].update(
+                {
+                    "library_index": media_result.get("library_index"),
+                    "sync": media_result.get("sync", {}),
+                    "selection": media_result.get("selection", {}),
+                }
+            )
+            report["artifacts"]["local_library_index"] = str(media_result.get("library_index") or "")
         report["artifacts"].update(
             {"asset_manifest": str(asset_manifest_path), "sources_compat": str(sources_path)}
         )
@@ -1209,7 +1248,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
         report["passed"] = False
         report["failure"] = {"type": type(exc).__name__, "message": _strip_secret(str(exc))}
-        if isinstance(exc, (PixabayInsufficientMaterialError, YouTubeInsufficientMaterialError, YouTubeFirstInsufficientMaterialError, TimelineInsufficientMaterialError)):
+        if isinstance(exc, (PixabayInsufficientMaterialError, YouTubeInsufficientMaterialError, YouTubeFirstInsufficientMaterialError, LocalLibraryInsufficientMaterialError, TimelineInsufficientMaterialError)):
             report["failure"]["category"] = "insufficient_material"
         checkpoint()
         raise
@@ -1217,7 +1256,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", action="version", version="bgm-montage 1.4.1")
+    parser.add_argument("--version", action="version", version="bgm-montage 1.4.3")
     parser.add_argument("--bgm", required=True, help="Input BGM/audio file")
     parser.add_argument("--theme", required=True, help="Theme used to generate English visual search queries")
     parser.add_argument("--duration", required=True, type=float, help="Requested output duration in seconds")
@@ -1238,9 +1277,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", default=str(PROJECT_ROOT / ".bgm-montage-cache"))
     parser.add_argument(
         "--source-provider",
-        choices=("youtube-first", "youtube", "pixabay"),
+        choices=("youtube-first", "youtube", "pixabay", "local-library"),
         default="youtube-first",
-        help="Material strategy (default: youtube-first with automatic Pixabay fallback).",
+        help="Material strategy (default: youtube-first; local-library performs no network acquisition).",
+    )
+    parser.add_argument(
+        "--local-library-dir",
+        help="Read-only local video library root used by --source-provider local-library; its persistent index is stored under --cache-dir.",
     )
     parser.add_argument(
         "--usage-mode",

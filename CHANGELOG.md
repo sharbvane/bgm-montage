@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.4.3 — 2026-08-16
+
+- Cleaned the release layout without changing the runtime version: stable functional test filenames replace historical version suffixes, obsolete upgrade reports are removed, and packaging now emits explicit `runtime` and `development` profiles.
+- Replaced filename-only local-library inventory with a persistent six-frame lightweight visual profile for every new, changed, or migrated asset, reusing the existing CV signals for scene/subject, shot scale, motion, HSV, sharpness, exposure, aesthetics, and perceptual hashes.
+- Kept full-library work bounded: all assets participate in BGM-aware coarse ranking from the lightweight index, while only `min(64, max(16, assets×3, slots×2))` candidates can enter the existing 48-frame deep analysis.
+- Added bounded sampled-content SHA-256 identity so usage history follows ordinary moves/renames but resets when a path is replaced by different content; stale manifests cannot write old history onto replacement content.
+- Made sync, lightweight writes, deep-result merges, selection signatures, and usage history transactional with the existing heartbeat/O_EXCL locks and atomic JSON replacement. Per-content deep locks prevent duplicate analysis across concurrent jobs.
+- Extended manifests with lightweight analyzed/cache-hit counts and paths. No dependency, BGM, timeline, render, Scene Pass, or Agent QA core changes.
+
+## v1.4.2 — 2026-08-16
+
+- Added network-free `local-library` acquisition using a read-only media root and a persistent index stored under the project cache.
+- Added automatic lightweight sync before each formal edit: ffprobe inventories only new/changed files, unchanged files reuse the index, and deleted files are removed.
+- Added bounded two-stage selection: fast index-wide ranking followed by at most 64 fine candidates; only candidates without a valid cache run the existing 48-frame analysis before the existing BGM-slot, diversity, continuity, and deterministic-jitter scoring.
+- Reused the established post-QA usage-history transaction so successful local-library clips receive cross-project soft reuse penalties without permanently excluding strong material.
+- Kept reference/BGM analysis, Scene Pass, timeline planning, speed/frame interpolation, renderer, programmatic QA, and Agent Visual Review unchanged; added no dependency.
+
 ## v1.4.1 — 2026-08-15
 
 - Connected the existing `visual_review` evidence to a required visual-Agent handoff after programmatic QA. The request requires image-tool inspection of every sampled frame and validates structured `pass` / `warning` / `fail`, timestamps, reasons, confidence, actions, attempt number, and render SHA-256.

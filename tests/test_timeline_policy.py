@@ -125,6 +125,15 @@ def test_independent_asset_or_scene_shortage_fails_explicitly(
         )
 
 
+def test_local_library_default_keeps_single_theme_scene_diversity_advisory(tmp_path: Path) -> None:
+    assets = _assets(tmp_path, 5, scenes=("polar_ice",))
+    for asset in assets:
+        asset["provider"] = "local-library"
+    plan = build_timeline(_audio(8.0), assets, 8.0, seed="local-library")
+    assert plan["content_policy"]["min_scene_categories"] == 1
+    assert plan["content_policy"]["local_library_scene_diversity"] == "advisory"
+
+
 @pytest.mark.parametrize(
     "guard",
     [

@@ -1,11 +1,11 @@
 ---
 name: bgm-montage
-description: Learn a dynamic visual profile and audio-linked editing grammar from read-only references and BGM, intelligently search/reuse Pixabay or YouTube footage, render a low-repetition montage, enforce automatic media QA, and require a frame-viewing visual Agent review with bounded rework. Use when Codex must create a stock-footage montage from a BGM path, theme, duration, aspect ratio, and output directory.
+description: Learn a dynamic visual profile and audio-linked editing grammar from read-only references and BGM, incrementally index and reuse large local video libraries or intelligently acquire Pixabay/YouTube footage, render a low-repetition montage, enforce automatic media QA, and require a frame-viewing visual Agent review with bounded rework. Use when Codex must create a BGM montage from a local library or online material using a theme, duration, aspect ratio, and output directory.
 ---
 
-# BGM Montage v1.4.1
+# BGM Montage v1.4.3
 
-The unified entry defaults to `--source-provider youtube-first`: reuse high-quality assets from the machine-wide YouTube index, generate task-specific multi-round YouTube queries, download/analyze/filter, and invoke Pixabay only if hard candidate, diversity, quality, or style gates remain short. `--source-provider youtube` and `pixabay` remain explicit modes. `--search-query` is optional and additive. v1.4.1 keeps the v1.4 scene pass, grammar, renderer, and programmatic QA intact; it adds a required frame-viewing Agent review gate and accepts multiple curated windows for one YouTube video.
+The unified entry defaults to `--source-provider youtube-first`. Use `--source-provider local-library --local-library-dir PATH` for a network-free local workflow. v1.4.3 keeps the BGM, scene, grammar, timeline, renderer, and QA cores intact; it adds a persistent six-frame visual profile for every new or changed local asset, content-based history identity, and transactional bounded two-stage selection.
 
 ## Material usage mode
 
@@ -33,6 +33,18 @@ Switch to `publish` only when the user explicitly says the specific video will b
   --output-dir "D:\renders"
 ```
 
+大型本地素材库模式：
+
+```powershell
+& ".\.agents\skills\bgm-montage\.venv\Scripts\python.exe" `
+  ".\.agents\skills\bgm-montage\scripts\bgm_montage.py" `
+  --bgm "D:\music\track.wav" --theme "冰岛冰川与火山" --duration 30 --ratio 16:9 `
+  --source-provider local-library --local-library-dir "E:\media\iceland" `
+  --output-dir "D:\renders"
+```
+
+每次正式运行先轻扫目录。索引位于 `--cache-dir/local-library/libraries/<library-id>/library_index.json`，不写入素材库；每个新增、修改或 v1.4.2 旧条目只做一次 ffprobe、内容采样指纹与 6 帧轻量视觉画像，未变化条目直接复用，删除文件同步移出。选片先按全库轻量画像、BGM 和历史粗排，再只对最多 64 个有界高相关候选执行现有 48 帧视觉分析。索引和 usage 回写使用现有跨进程锁及原子替换；同内容移动/改名保留历史，同路径内容替换不继承历史。`asset_manifest.json` 记录轻量命中率、粗筛数、精筛数、深度分析/复用数和选中数。
+
 每次运行写入 `<output-dir>/<project-slug>/<run-id>/`。未传 `--run-id` 时自动生成 UTC 时间戳加随机后缀；已有目录不会被静默覆盖。失败运行可用完全相同的输入、原 `--run-id` 和 `--resume-run` 继续。
 
 ## 执行约束
@@ -43,6 +55,7 @@ Switch to `publish` only when the user explicitly says the specific video will b
 4. 先由用户要求、参考画像与 BGM 动态生成本次 `visual_style_profile.json`。检索词必须组合主题、情绪、环境/地点、光线天气、摄影方式和镜头运动；不得用固定地点或固定风格白名单代替任务推理。
 5. “主题相关”只允许进入候选池。完整素材还必须通过纵深、构图、视觉冲击、光线氛围、色彩、摄影机运动、电影感、普通旅游记录风险、清晰度和可用区间检查；不足时扩搜或明确失败。
 6. 已下载素材通过统一索引跨主题、跨项目复用。分析缓存带 schema、引擎版本和文件哈希；同一成片继续限制 canonical source、近似内容、累计占比、重复间隔和源区间重叠。
+   本地库索引按内容指纹持久保存使用历史；历史只降低反复抽中概率，不永久封禁优秀素材。
 7. 选片在既有 BGM 槽位内增加世界观、色彩、时间天气、镜头语言和视觉连续性评分；运动方向、景别、颜色、亮度、纹理和构图关系优先由镜头本身完成，默认仍使用干净硬切。
 8. 先通过完整解码、音视频流、时长、分辨率、帧率、音量、黑帧、冻结、静音、尾部碎片、重复率、裁剪、卡点、高潮响应和序列一致性检查，再完成 Agent Visual Review；任一硬失败均进入既有换镜头/重排/重渲染循环。全部返工失败则不交付成片。
 
@@ -73,7 +86,7 @@ Switch to `publish` only when the user explicitly says the specific video will b
 
 ## 已实现边界
 
-参考学习会在生产下载前计划中影响音乐边界吸附、镜头时长、段落密度、景别与运动目标、少量转场和结尾结构。Agent Visual Review 只审查有界证据帧，不等同于逐帧观看整片；轻度调色只做归一化，不能用来挽救本来不兼容的素材。
+参考学习会在生产下载前计划中影响音乐边界吸附、镜头时长、段落密度、景别与运动目标、少量转场和结尾结构。Agent Visual Review 只审查有界证据帧，不等同于逐帧观看整片；轻度调色只做归一化，不能用来挽救本来不兼容的素材。本地内容身份使用文件大小加首部/中部/尾部采样 SHA-256，目标是以有界 I/O 识别普通替换、移动和改名，不宣称抗恶意碰撞的全文件哈希。
 
 未实现或不宣称支持：复杂遮罩/wipe、语义级轮廓变形 match cut、速度坡度、字幕/OCR/动态图形、人物身份、可靠时序动作、逐帧主体跟踪及复杂特效复刻。剪映适配只映射原生可表达的切点、恒速和基础变换；裁剪或 FFmpeg 调色无法可靠映射时必须写入差异报告。
 

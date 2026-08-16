@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a portable, secret-safe bgm-montage Skill ZIP from a strict allowlist."""
+"""Build runtime or development bgm-montage ZIPs from strict allowlists."""
 
 from __future__ import annotations
 
@@ -18,30 +18,29 @@ from typing import Iterable, Sequence
 SKILL_NAME = "bgm-montage"
 ARCHIVE_PREFIX = PurePosixPath(".agents") / "skills" / SKILL_NAME
 
-REQUIRED_ROOT_FILES = (
+RUNTIME_ROOT_FILES = (
     ".env.example",
-    "CHANGELOG.md",
     "SKILL.md",
-    "TEST_REPORT.md",
     "requirements.txt",
     "requirements.lock.txt",
     "requirements-jianying.lock.txt",
 )
+DEVELOPMENT_ROOT_FILES = ("CHANGELOG.md", "TEST_REPORT.md")
 OPTIONAL_ROOT_FILES = (
     "requirements-dev.txt",
     "requirements-dev.lock.txt",
     "pytest.ini",
     "pyproject.toml",
 )
-REQUIRED_SCRIPTS = (
+RUNTIME_SCRIPTS = (
     "analyze_bgm.py",
     "analyze_editing_grammar.py",
     "analyze_references.py",
     "bgm_montage.py",
     "edit_schema.py",
     "jianying_export.py",
+    "local_library.py",
     "montage.py",
-    "package_skill.py",
     "pixabay_pipeline.py",
     "runtime_paths.py",
     "timeline_planner.py",
@@ -52,6 +51,7 @@ REQUIRED_SCRIPTS = (
     "youtube_pipeline.py",
     "youtube_first_pipeline.py",
 )
+DEVELOPMENT_SCRIPTS = ("package_skill.py",)
 REQUIRED_EXACT_FILES = (
     Path("agents/openai.yaml"),
     Path("references/usage.md"),
@@ -132,18 +132,25 @@ def _safe_regular_file(path: Path, skill_root: Path) -> Path | None:
     return None if _is_forbidden(relative) else relative
 
 
-def collect_allowlisted_files(skill_root: str | os.PathLike[str]) -> list[Path]:
-    """Return deterministic relative paths admitted to the release archive."""
+def collect_allowlisted_files(
+    skill_root: str | os.PathLike[str], profile: str = "runtime"
+) -> list[Path]:
+    """Return deterministic paths for one explicit release profile."""
 
     root = Path(skill_root).expanduser().resolve(strict=True)
     if not root.is_dir() or root.name != SKILL_NAME:
         raise PackagingError(f"Skill root must be a directory named {SKILL_NAME}: {root}")
+    if profile not in {"runtime", "development"}:
+        raise PackagingError(f"Unknown package profile: {profile}")
 
     required_relatives = [
-        *map(Path, REQUIRED_ROOT_FILES),
+        *map(Path, RUNTIME_ROOT_FILES),
         *REQUIRED_EXACT_FILES,
-        *(Path("scripts") / name for name in REQUIRED_SCRIPTS),
+        *(Path("scripts") / name for name in RUNTIME_SCRIPTS),
     ]
+    if profile == "development":
+        required_relatives.extend(map(Path, DEVELOPMENT_ROOT_FILES))
+        required_relatives.extend(Path("scripts") / name for name in DEVELOPMENT_SCRIPTS)
     missing: list[str] = []
     for relative in required_relatives:
         required_path = root / relative
@@ -159,24 +166,26 @@ def collect_allowlisted_files(skill_root: str | os.PathLike[str]) -> list[Path]:
         if relative is not None:
             selected[relative.as_posix()] = relative
 
-    for name in (*REQUIRED_ROOT_FILES, *OPTIONAL_ROOT_FILES):
+    root_files = RUNTIME_ROOT_FILES + (
+        DEVELOPMENT_ROOT_FILES + OPTIONAL_ROOT_FILES if profile == "development" else ()
+    )
+    for name in root_files:
         path = root / name
         if path.exists():
             admit(path)
 
     admit(root / "agents" / "openai.yaml")
-    for path in sorted((root / "references").glob("*.md")):
-        admit(path)
-    for path in sorted((root / "scripts").glob("*.py")):
-        admit(path)
-    tests_root = root / "tests"
-    if tests_root.is_dir():
-        for path in sorted(tests_root.rglob("*")):
-            if path.suffix.casefold() in {".py", ".json", ".txt", ".yaml", ".yml"}:
-                admit(path)
-
-    if not any(relative.parts and relative.parts[0] == "tests" for relative in selected.values()):
-        raise PackagingError("At least one allowlisted automated test is required under tests/")
+    admit(root / "references" / "usage.md")
+    for name in RUNTIME_SCRIPTS + (DEVELOPMENT_SCRIPTS if profile == "development" else ()):
+        admit(root / "scripts" / name)
+    if profile == "development":
+        tests_root = root / "tests"
+        if tests_root.is_dir():
+            for path in sorted(tests_root.rglob("*")):
+                if path.suffix.casefold() in {".py", ".json", ".txt", ".yaml", ".yml"}:
+                    admit(path)
+        if not any(relative.parts and relative.parts[0] == "tests" for relative in selected.values()):
+            raise PackagingError("Development package requires at least one automated test under tests/")
     selected_names = set(selected)
     omitted_required = sorted(
         relative.as_posix()
@@ -291,10 +300,11 @@ def build_package(
     skill_root: str | os.PathLike[str],
     output_path: str | os.PathLike[str],
     *,
+    profile: str = "runtime",
     force: bool = False,
     extra_secrets: Iterable[str] = (),
 ) -> dict[str, object]:
-    """Create and validate one portable ZIP, refusing silent overwrites."""
+    """Create and validate one profiled ZIP, refusing silent overwrites."""
 
     root = Path(skill_root).expanduser().resolve(strict=True)
     destination = Path(output_path).expanduser().resolve(strict=False)
@@ -309,7 +319,7 @@ def build_package(
     if destination.exists() and not force:
         raise FileExistsError(f"Refusing to overwrite existing package without --force: {destination}")
 
-    relatives = collect_allowlisted_files(root)
+    relatives = collect_allowlisted_files(root, profile)
     secrets = _configured_secrets(root, extra_secrets)
     _validate_source_contents(root, relatives, secrets)
     archive_names = [_archive_name(relative) for relative in relatives]
@@ -334,6 +344,7 @@ def build_package(
 
     return {
         "skill": SKILL_NAME,
+        "profile": profile,
         "output": str(destination),
         "sha256": _sha256(destination),
         "size_bytes": destination.stat().st_size,
@@ -344,9 +355,9 @@ def build_package(
     }
 
 
-def _default_output(skill_root: Path, version: str) -> Path:
+def _default_output(skill_root: Path, version: str, profile: str) -> Path:
     project_root = _project_root_for(skill_root)
-    return project_root.parent / "skills" / project_root.name / f"{SKILL_NAME}-v{version}.zip"
+    return project_root.parent / "skills" / project_root.name / f"{SKILL_NAME}-v{version}-{profile}.zip"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -357,7 +368,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Canonical bgm-montage Skill directory",
     )
     parser.add_argument("--output", help="Destination .zip path")
-    parser.add_argument("--version", default="1.4.1", help="Version used by the default ZIP filename")
+    parser.add_argument("--version", default="1.4.3", help="Version used by the default ZIP filename")
+    parser.add_argument(
+        "--profile",
+        choices=("runtime", "development"),
+        default="runtime",
+        help="runtime excludes tests/reports/packager; development includes them",
+    )
     parser.add_argument("--force", action="store_true", help="Explicitly replace an existing ZIP")
     return parser
 
@@ -365,9 +382,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     skill_root = Path(args.skill_root).expanduser().resolve(strict=True)
-    output = Path(args.output).expanduser() if args.output else _default_output(skill_root, args.version)
+    output = (
+        Path(args.output).expanduser()
+        if args.output
+        else _default_output(skill_root, args.version, args.profile)
+    )
     try:
-        report = build_package(skill_root, output, force=args.force)
+        report = build_package(skill_root, output, profile=args.profile, force=args.force)
     except (PackagingError, FileExistsError, FileNotFoundError, OSError) as exc:
         print(f"package_skill: {exc}", file=__import__("sys").stderr)
         return 2

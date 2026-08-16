@@ -54,7 +54,7 @@ def test_default_provider_is_youtube_first() -> None:
     ])
     assert args.source_provider == "youtube-first"
     assert args.agent_visual_review == "required"
-    assert {"youtube-first", "youtube", "pixabay"} == set(
+    assert {"youtube-first", "youtube", "pixabay", "local-library"} == set(
         next(action for action in bgm_montage.build_parser()._actions if action.dest == "source_provider").choices
     )
 

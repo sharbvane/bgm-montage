@@ -1454,7 +1454,9 @@ def _metadata_score(
 ) -> tuple[float, dict[str, float]]:
     variant = candidate["variant"]
     tags = str(candidate.get("tags") or "")
-    tag_tokens = _token_set([tags])
+    semantic_text = " ".join(str(value) for value in candidate.get("semantic_tags", []) if value)
+    visual_text = f"{tags} {semantic_text}".strip()
+    tag_tokens = _token_set([visual_text])
     style_profile = _style_payload(style_profile)
     audio_profile = _audio_payload(audio_profile)
     visual_profile = _resolve_visual_profile(
@@ -1463,7 +1465,7 @@ def _metadata_score(
         audio_profile,
         "" if visual_cohesion_profile in {"", "none", "auto"} else visual_cohesion_profile.replace("_", " "),
     )
-    visual_metadata = metadata_profile_fit(tags, visual_profile)
+    visual_metadata = metadata_profile_fit(visual_text, visual_profile)
     relevant = _token_set(
         [theme]
         + _theme_terms(theme)
@@ -1500,10 +1502,13 @@ def _metadata_score(
     )
     duration = float(candidate.get("duration") or 0)
     duration_score = float(np.clip(duration / 6.0, 0.0, 1.0) * np.clip((90.0 - duration) / 45.0, 0.3, 1.0))
-    motion = _motion_tag_score(tags)
+    try:
+        motion = float(candidate.get("motion_score_estimate"))
+    except (TypeError, ValueError):
+        motion = _motion_tag_score(tags)
     desired = _desired_motion(style_profile, audio_profile)
     motion_style = float(np.clip(1.0 - abs(motion - desired), 0.0, 1.0))
-    metadata_face_risk = face_content_risk(tags, None, None)
+    metadata_face_risk = max(face_content_risk(tags, None, None), float(candidate.get("face_content_risk") or 0.0))
     environment_terms = {
         "environment", "landscape", "nature", "architecture", "building", "road",
         "traffic", "aerial", "drone", "forest", "mountain", "ocean", "factory",
@@ -1512,7 +1517,7 @@ def _metadata_score(
     environment_priority = min(1.0, len(tag_tokens & environment_terms) / 2.0)
     human_theme = _human_focused_theme(_theme_terms(theme))
     face_penalty = metadata_face_risk * (0.28 if human_theme else 0.72)
-    shot_type = _infer_shot_type(tags)
+    shot_type = str(candidate.get("shot_type") or _infer_shot_type(tags))
     spatial_scale_priority = {
         "aerial": 1.0,
         "wide": 0.85,
@@ -1598,11 +1603,21 @@ def _score_candidates(
             local_fingerprint = local_entry.get("fingerprint") if isinstance(local_entry.get("fingerprint"), Mapping) else {}
             local_visual = local_quality.get("visual_analysis") if isinstance(local_quality.get("visual_analysis"), Mapping) else {}
             hashes = list(local_fingerprint.get("perceptual_hashes") or [])
+            local_hsv = local_entry.get("mean_hsv") if isinstance(local_entry.get("mean_hsv"), Mapping) else local_quality.get("mean_hsv", {})
+            try:
+                local_color_score = _color_similarity(
+                    float(local_hsv.get("hue_degrees")),
+                    float(local_hsv.get("saturation")),
+                    float(local_hsv.get("value")),
+                    target_color,
+                )
+            except (AttributeError, TypeError, ValueError):
+                local_color_score = float(local_quality.get("color_score", 0.65))
             thumbnail = {
                 "available": True,
                 "sharpness_score": float(local_quality.get("sharpness_score", 0.65)),
                 "exposure_score": float(local_quality.get("exposure_score", 0.65)),
-                "color_score": float(local_quality.get("color_score", 0.65)),
+                "color_score": local_color_score,
                 "text_watermark_risk": float(local_quality.get("text_watermark_risk", 0.0)),
                 "perceptual_hash": hashes[0] if hashes else None,
                 "subject_profile": local_quality.get("subject_profile", {}),
@@ -1668,11 +1683,13 @@ def _score_candidates(
             - history_penalty
         )
         candidate["pre_score"] = round(float(pre_score), 6)
-        candidate["shot_type"] = _infer_shot_type(str(candidate.get("tags") or ""))
-        candidate["shot_scale"] = _infer_shot_scale(str(candidate.get("tags") or ""))
-        candidate["motion_score_estimate"] = round(_motion_tag_score(str(candidate.get("tags") or "")), 4)
+        if not isinstance(local_entry, Mapping):
+            candidate["shot_type"] = _infer_shot_type(str(candidate.get("tags") or ""))
+            candidate["shot_scale"] = _infer_shot_scale(str(candidate.get("tags") or ""))
+            candidate["motion_score_estimate"] = round(_motion_tag_score(str(candidate.get("tags") or "")), 4)
         candidate["face_content_risk"] = round(visual_face_risk, 4)
-        candidate["scene_category"] = _scene_category(str(candidate.get("tags") or ""), None)
+        if not isinstance(local_entry, Mapping):
+            candidate["scene_category"] = _scene_category(str(candidate.get("tags") or ""), None)
         candidate["semantic_tags"] = _semantic_tags(
             candidate.get("tags"),
             candidate.get("scene_category"),
@@ -4053,11 +4070,12 @@ def update_usage_intervals(
         if library_path in seen_library_paths:
             continue
         seen_library_paths.add(library_path)
-        with _exclusive_catalog_lock(library_path):
+        with _exclusive_catalog_lock(library_path, timeout_seconds=600.0):
             # Usage updates can finish concurrently with another project's
             # acquisition. Re-read under the same lock used by catalog merges.
             if not library_path.is_file():
                 continue
+            raw_library = _read_json_strict(library_path, {})
             library = _load_fingerprint_library(library_path, strict=True)
             changed = False
             entries: list[dict[str, Any]] = []
@@ -4071,6 +4089,13 @@ def update_usage_intervals(
                         str(Path(str(entry["local_path"])).expanduser().resolve())
                     )
                     source = source_by_path.get(normalized_path)
+                    if (
+                        source is not None
+                        and entry.get("provider") == "local-library"
+                        and str(entry.get("canonical_source_id") or "")
+                        != str(source.get("canonical_source_id") or "")
+                    ):
+                        source = None
                 if source is not None:
                     merged_history = _merge_usage_history(
                         entry.get("usage_history"), source.get("usage_history")
@@ -4085,13 +4110,17 @@ def update_usage_intervals(
                     entry["last_used_at"] = recorded_at
                 entries.append(entry)
             if changed:
-                _atomic_write_json(
-                    library_path,
+                updated_library = dict(raw_library) if isinstance(raw_library, Mapping) else {}
+                updated_library.update(
                     {
-                        "schema_version": SCHEMA_VERSION,
+                        "schema_version": library.get("schema_version", SCHEMA_VERSION),
                         "updated_at": recorded_at,
                         "entries": entries,
-                    },
+                    }
+                )
+                _atomic_write_json(
+                    library_path,
+                    updated_library,
                 )
                 updated_libraries += 1
     return {

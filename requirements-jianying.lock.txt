@@ -1,4 +1,4 @@
-# Optional bgm-montage v1.4.1 JianYing adapter dependency (unchanged from v1.3.3).
+# Optional bgm-montage v1.4.3 JianYing adapter dependency (unchanged from v1.3.3).
 # Verified on Windows 11 x64 with CPython 3.11.9 and JianYing Pro 11.1.0.14287.
 # Keep this in a separate environment from the core Skill:
 #   py -3.11 -m venv .venv-jianying

@@ -1397,6 +1397,13 @@ def build_timeline(
     slot_records = _coerce_timeline_slots(timeline_plan, slots, duration)
     policy_input = dict(content_policy or {})
     policy = {**default_content_policy(duration), **policy_input}
+    if (
+        not policy_input.get("min_scene_categories")
+        and assets
+        and all(str(asset.get("provider") or "") == "local-library" for asset in assets)
+    ):
+        policy["min_scene_categories"] = 1
+        policy["local_library_scene_diversity"] = "advisory"
     policy["visual_style_profile_digest"] = visual_profile.get("profile_digest")
     policy["visual_style_profile_schema"] = visual_profile.get("schema_version")
     if slot_records is None:

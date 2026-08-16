@@ -296,7 +296,7 @@ def _write_visual_review(
 
     planned_cut_pairs = [pairs[key] for key in sorted(pairs)]
     payload = {
-        "schema_version": "1.4.1",
+        "schema_version": "1.4.3",
         "artifact_type": "visual_review",
         "media_sha256": media_sha256,
         "duration_seconds": round(duration, 4),

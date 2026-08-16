@@ -208,7 +208,7 @@ def _write_agent_review(request_path: Path, status: str) -> Path:
     result_path = Path(request["result_json"])
     result_path.write_text(
         json.dumps({
-            "schema_version": "1.4.1",
+            "schema_version": "1.4.3",
             "artifact_type": "agent_visual_review",
             "attempt": request["attempt"],
             "media_sha256": request["media_sha256"],
@@ -249,7 +249,7 @@ def test_agent_visual_review_failure_triggers_existing_rework_loop_then_passes(
         review_path = attempt_dir / "visual_review.json"
         digest = hashlib.sha256(media.read_bytes()).hexdigest()
         review_path.write_text(json.dumps({
-            "schema_version": "1.4.1",
+            "schema_version": "1.4.3",
             "artifact_type": "visual_review",
             "media_sha256": digest,
             "entries": [{

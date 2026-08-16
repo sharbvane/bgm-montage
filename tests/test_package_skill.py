@@ -36,7 +36,7 @@ def _make_fixture_skill(base: Path) -> Path:
     _write(root / "TEST_REPORT.md", "# Test Report\n")
     _write(root / "agents" / "openai.yaml", 'interface:\n  display_name: "BGM Montage"\n')
     _write(root / "references" / "usage.md", "# Usage\n")
-    for name in package_skill.REQUIRED_SCRIPTS:
+    for name in package_skill.RUNTIME_SCRIPTS + package_skill.DEVELOPMENT_SCRIPTS:
         if name == "package_skill.py":
             (root / "scripts").mkdir(parents=True, exist_ok=True)
             (root / "scripts" / name).write_bytes(MODULE_PATH.read_bytes())
@@ -46,7 +46,7 @@ def _make_fixture_skill(base: Path) -> Path:
     return root
 
 
-def test_windows_unicode_paths_and_portable_allowlisted_zip(tmp_path: Path) -> None:
+def test_runtime_and_development_packages_have_distinct_allowlists(tmp_path: Path) -> None:
     root = _make_fixture_skill(tmp_path / "含 空格的造球项目")
 
     # These are deliberately present but must never enter the strict allowlist.
@@ -57,13 +57,14 @@ def test_windows_unicode_paths_and_portable_allowlisted_zip(tmp_path: Path) -> N
     _write(root / "references" / "debug.log")
     (root / "tests" / "render.mp4").write_bytes(b"not media")
 
-    destination = tmp_path / "发布 包" / "bgm-montage-v1.3.zip"
-    report = package_skill.build_package(root, destination)
-    assert Path(report["output"]) == destination.resolve()
-    assert report["path_separator"] == "/"
-    assert report["sensitive_files_included"] is False
+    runtime = tmp_path / "发布 包" / "bgm-montage-v1.4.3-runtime.zip"
+    runtime_report = package_skill.build_package(root, runtime, profile="runtime")
+    assert Path(runtime_report["output"]) == runtime.resolve()
+    assert runtime_report["profile"] == "runtime"
+    assert runtime_report["path_separator"] == "/"
+    assert runtime_report["sensitive_files_included"] is False
 
-    with zipfile.ZipFile(destination, "r") as archive:
+    with zipfile.ZipFile(runtime, "r") as archive:
         names = archive.namelist()
         assert archive.testzip() is None
         assert names == sorted(names)
@@ -73,7 +74,10 @@ def test_windows_unicode_paths_and_portable_allowlisted_zip(tmp_path: Path) -> N
         assert ".agents/skills/bgm-montage/requirements.lock.txt" in names
         assert ".agents/skills/bgm-montage/requirements-jianying.lock.txt" in names
         assert ".agents/skills/bgm-montage/scripts/timeline_planner.py" in names
-        assert ".agents/skills/bgm-montage/tests/test_smoke.py" in names
+        assert ".agents/skills/bgm-montage/tests/test_smoke.py" not in names
+        assert ".agents/skills/bgm-montage/CHANGELOG.md" not in names
+        assert ".agents/skills/bgm-montage/TEST_REPORT.md" not in names
+        assert ".agents/skills/bgm-montage/scripts/package_skill.py" not in names
         assert not any(name.endswith("/.env") or "/.venv/" in name for name in names)
         assert not any(
             {part.casefold() for part in PurePosixPath(name).parts}
@@ -88,10 +92,20 @@ def test_windows_unicode_paths_and_portable_allowlisted_zip(tmp_path: Path) -> N
     assert (installed / "SKILL.md").is_file()
     assert (installed / "scripts" / "bgm_montage.py").is_file()
 
+    development = tmp_path / "发布 包" / "bgm-montage-v1.4.3-development.zip"
+    development_report = package_skill.build_package(root, development, profile="development")
+    assert development_report["profile"] == "development"
+    with zipfile.ZipFile(development, "r") as archive:
+        names = archive.namelist()
+        assert ".agents/skills/bgm-montage/tests/test_smoke.py" in names
+        assert ".agents/skills/bgm-montage/CHANGELOG.md" in names
+        assert ".agents/skills/bgm-montage/TEST_REPORT.md" in names
+        assert ".agents/skills/bgm-montage/scripts/package_skill.py" in names
+
 
 def test_package_rejects_secret_embedded_in_allowlisted_source(tmp_path: Path) -> None:
     root = _make_fixture_skill(tmp_path / "项目")
-    _write(root / "scripts" / "leak.py", "PIXABAY_API_KEY=12345678-secret-material\n")
+    _write(root / "scripts" / "montage.py", "PIXABAY_API_KEY=12345678-secret-material\n")
     with pytest.raises(package_skill.PackagingError, match="Non-placeholder"):
         package_skill.build_package(root, tmp_path / "bad.zip")
 
@@ -135,3 +149,10 @@ def test_package_refuses_silent_overwrite(tmp_path: Path) -> None:
     assert destination.read_bytes() == original
     package_skill.build_package(root, destination, force=True)
     assert destination.is_file()
+
+
+def test_development_package_requires_tests(tmp_path: Path) -> None:
+    root = _make_fixture_skill(tmp_path / "项目")
+    (root / "tests" / "test_smoke.py").unlink()
+    with pytest.raises(package_skill.PackagingError, match="requires at least one"):
+        package_skill.build_package(root, tmp_path / "development.zip", profile="development")

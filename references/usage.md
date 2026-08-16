@@ -1,8 +1,22 @@
-# bgm-montage v1.4.1 使用说明
+# bgm-montage v1.4.3 使用说明
+
+## Local Library Mode
+
+`--source-provider local-library --local-library-dir PATH` 完全禁止素材联网搜索/下载。每次正式剪辑先递归轻扫目录，将持久索引写到 `<cache-dir>/local-library/libraries/<library-id>/library_index.json`，不修改素材库。首次、文件变化或 v1.4.2 索引迁移时，对每条素材执行 ffprobe、一次有界内容指纹和 6 帧轻量视觉画像；未变化条目直接复用 JSON，删除文件会从索引移除。
+
+```powershell
+& $Python (Join-Path $SkillRoot "scripts\bgm_montage.py") `
+  --source-provider local-library `
+  --local-library-dir "E:\media\冰岛" `
+  --bgm "D:\music\track.mp3" --theme "冰岛冰川、瀑布与火山" `
+  --duration 30 --ratio 16:9 --output-dir "D:\renders"
+```
+
+多阶段选片不会重新深解码全库：第一阶段用全库持久轻量画像（场景/主体、景别、运动、HSV、清晰度、曝光和感知哈希）、BGM 需求、已有深度特征与历史次数粗排；第二阶段只保留 `min(64, max(16, assets×3, slots×2))` 个高相关候选。候选没有有效深度缓存时才执行现有 48 帧分析，再交给已有片段窗口、BGM 槽位、连续性与多样性评分。`sync.light_analyzed`、`light_cache_hits`、`light_cache_hit_rate`、`deep_analyzed` 与 `selection.deep_analysis_during_selection` 给出本轮真实计算量。新增 100 条会让 100 条全部获得轻量画像，但只有 Top-K 进入深析。成功成片后，实际使用区间与 run ID 按内容指纹回写持久索引；移动/改名保留历史，同路径替换内容则重置历史。同步、深析合并和历史回写均使用跨进程锁与原子 JSON 替换。
 
 ## YouTube-first acquisition
 
-The unified entry defaults to `--source-provider youtube-first`. It first reuses machine-wide indexed YouTube assets, then generates task-specific multi-round queries from the visual profile, downloads and analyzes candidates, and invokes Pixabay only when hard candidate-pool, diversity, quality, or style-fit gates remain short. Explicit `youtube` and `pixabay` modes remain available. v1.4.1 retains the v1.4 scene sampling and production grammar, adds a required visual-Agent QA handoff, and lets one YouTube ID expose multiple curated source windows. `yt-dlp` is installed by the formal lock file; a JavaScript runtime is still required for YouTube extraction.
+The unified entry defaults to `--source-provider youtube-first`. Explicit `youtube`, `pixabay`, and network-free `local-library` modes remain available. v1.4.3 retains the v1.4 scene/grammar work and v1.4.1 Agent review, adding persistent whole-library lightweight visual recognition and concurrent local-index updates. `yt-dlp` is only needed by YouTube modes.
 
 ```powershell
 & $Python (Join-Path $SkillRoot "scripts\bgm_montage.py") `
@@ -70,10 +84,10 @@ $env:BGM_MONTAGE_PROJECT_ROOT = "E:\资料\造球计划"
 从发布 ZIP 安装到全局 Codex Skill 时，先解压到临时目录，再同步 ZIP 内部的标准路径；不要把 ZIP 直接解压到全局 `skills` 根目录，否则会形成错误的 `.agents/skills` 嵌套。以下流程保留已有 `.venv`，并先备份旧源码：
 
 ```powershell
-$Package = "E:\资料\skills\造球计划\bgm-montage-v1.4.1.zip"
+$Package = "E:\资料\skills\造球计划\bgm-montage-v1.4.3.zip"
 $GlobalSkill = Join-Path $env:USERPROFILE ".codex\skills\bgm-montage"
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$Stage = Join-Path ([IO.Path]::GetTempPath()) "bgm-montage-v1.4.1-$Stamp"
+$Stage = Join-Path ([IO.Path]::GetTempPath()) "bgm-montage-v1.4.3-$Stamp"
 $Backup = Join-Path $env:USERPROFILE ".codex\skills\.backups\bgm-montage-$Stamp"
 
 New-Item -ItemType Directory -Path $Stage, $Backup -Force | Out-Null
@@ -156,7 +170,8 @@ $env:BGM_MONTAGE_PROJECT_ROOT = $ProjectRoot
 - `--assets`：覆盖按时长/镜头槽位推导的最终入选素材数量。
 - `--candidate-pool-multiplier`：每个计划镜头槽位所需的元数据候选倍数，默认 `6`。
 - `--max-search-pages`：每轮扩展查询的 Pixabay 最大页数，默认 `3`。
-- `--source-provider`：默认 `youtube-first`；也可显式选择 `youtube` 或 `pixabay`。
+- `--source-provider`：默认 `youtube-first`；也可显式选择 `youtube`、`pixabay` 或完全离线的 `local-library`。
+- `--local-library-dir`：`local-library` 模式的只读视频素材根目录；索引写到 `--cache-dir`，不写入素材库。
 - `--search-query`：显式优先查询，可重复；它只提高优先级，不关闭动态查询扩展。
 - `--exclude-youtube-id ID`：审片后排除指定 YouTube ID，可重复。
 - `--youtube-source-window VIDEO_ID=START-END`：指定某个 YouTube 候选的绝对源时间窗；同一 ID 可重复指定多个独立区间。
@@ -184,7 +199,7 @@ $env:BGM_MONTAGE_PROJECT_ROOT = $ProjectRoot
 
 未给 `--run-id` 时会生成 UTC 时间戳和随机后缀。运行目录存在且未传 `--resume-run` 时直接失败；不会静默覆盖历史成片。`--resume-run` 会校验 BGM 指纹、主题、时长、比例、素材/缓存路径和主要约束，然后复用已成功写出的阶段产物。已经成功且成片仍存在的运行会直接返回既有报告。
 
-## 4. v1.4.1 产物契约
+## 4. v1.4.3 产物契约
 
 成功运行至少包含：
 
@@ -193,6 +208,7 @@ $env:BGM_MONTAGE_PROJECT_ROOT = $ProjectRoot
 - `timeline.json`：正式下载前生成的镜头槽位计划。
 - `visual_style_profile.json`：本次任务的动态世界观、色彩、时间天气、摄影、运动与审美门槛。
 - `asset_manifest.json`：候选、搜索意图/轮次、拒绝原因、来源、缓存/下载状态、审美/语义/镜头元数据、哈希、可用区间和实际使用区间。
+- `local_library_index`（本地库模式）：全库文件签名、内容采样指纹、轻量视觉画像、深度分析结果、可用片段、使用历史和最近同步统计的持久索引。
 - `edit_decisions.json`：schema `1.3` 的统一时间线真值；逐镜保留原始路径、源/目标区间、恒速、裁剪/基础变换、视觉匹配评分，并含 BGM 独立轨。原 v1.2 字段仍保留。
 - `render_report.json`：最终成片的结构化媒体、节奏和序列视觉一致性 QA。
 - `visual_review.json` / `visual_review.md`：开头、结尾、BGM 事件和计划切点的时间戳、原因与检查帧；用于人工或代理审片，不替代硬 QA。
@@ -206,7 +222,7 @@ $env:BGM_MONTAGE_PROJECT_ROOT = $ProjectRoot
 
 v1.1 兼容别名仍会生成：
 
-| v1.4.1 主产物 | 兼容别名 |
+| v1.4.3 主产物 | 兼容别名 |
 |---|---|
 | `audiomap.json` | `bgm_profile.json` |
 | `asset_manifest.json` | `sources.json` |
@@ -436,36 +452,46 @@ py -3.11 -m venv $JianYingVenv
 
 适配器默认查找 `%LOCALAPPDATA%\JianyingPro\User Data\Projects\com.lveditor.draft` 并要求其中存在 `root_meta_info.json`。写入前备份根索引；已存在同名草稿时拒绝覆盖。每个视频镜头和 BGM 都是独立原始素材引用，不复制素材。切点、source range、target range、恒速、基础 scale/position/rotation/opacity 可原生映射；非完整裁剪矩形、FFmpeg 调色和无原生等价项写入 `unmapped_or_approximate`，不得静默伪装成功。
 
-## 11. 测试与打包
+## 11. Runtime 与开发交付包
 
-运行自动化测试：
+以下测试与打包命令只在唯一开发源码或 Development 包中执行；Runtime 包只用于安装和运行，不携带打包器。
+
+从开发源运行自动化测试：
 
 ```powershell
 & $Python -m pytest -q (Join-Path $SkillRoot "tests")
 ```
 
-构建 v1.4.1 ZIP：
+构建精简 Runtime Skill 包：
 
 ```powershell
 & $Python (Join-Path $SkillRoot "scripts\package_skill.py") `
-  --version 1.4.1 `
-  --output "E:\资料\skills\造球计划\bgm-montage-v1.4.1.zip"
+  --version 1.4.3 --profile runtime `
+  --output "E:\资料\skills\造球计划\bgm-montage-v1.4.3-runtime.zip"
 ```
 
-ZIP 成员使用标准 `/` 分隔符，并以 `.agents/skills/bgm-montage/` 为根前缀。真实 `.env`、API Key、`.venv`、模型、缓存、下载素材、测试输出和成片不进入发布包。目标 ZIP 已存在时默认拒绝覆盖；只有明确传入 `--force` 才替换。
+构建开发交付包：
+
+```powershell
+& $Python (Join-Path $SkillRoot "scripts\package_skill.py") `
+  --version 1.4.3 --profile development `
+  --output "E:\资料\skills\造球计划\bgm-montage-v1.4.3-development.zip"
+```
+
+Runtime 包只包含 `SKILL.md`、Agent 元数据、运行说明、依赖锁和运行脚本，不含测试、测试报告、Changelog 或打包器。Development 包是其超集，额外包含当前测试、当前测试报告、Changelog 和打包器。两个包都使用标准 `/` 分隔符和 `.agents/skills/bgm-montage/` 根前缀；真实 `.env`、API Key、`.venv`、模型、缓存、下载素材、测试输出和成片均不进入。目标 ZIP 已存在时默认拒绝覆盖，只有显式 `--force` 才替换。
 
 Windows 解压：
 
 ```powershell
-Expand-Archive -LiteralPath "D:\downloads\bgm-montage-v1.4.1.zip" `
+Expand-Archive -LiteralPath "D:\downloads\bgm-montage-v1.4.3-runtime.zip" `
   -DestinationPath "D:\my-montage-project"
 ```
 
-Linux/Docker 可使用 `unzip bgm-montage-v1.4.1.zip -d /workspace/project` 或 `python -m zipfile -e ...`。这只表示 ZIP 路径兼容；本版本不宣称已完成 Linux/Docker 的依赖、模型、FFmpeg 或剪映现场运行验证。
+Linux/Docker 可使用 `unzip bgm-montage-v1.4.3-runtime.zip -d /workspace/project` 或 `python -m zipfile -e ...`。这只表示 ZIP 路径兼容；本版本不宣称已完成 Linux/Docker 的依赖、模型、FFmpeg 或剪映现场运行验证。
 
 ## 12. 能力状态
 
-已实现：v1.2 的确定性 `audiomap`、`beat_cut`/`phrase_flow`、下载前时间线、参考视觉/音频语法、跨项目素材复用、来源约束、内部最佳区间、裁剪、FFmpeg 渲染和完整 QA；v1.3 的动态多轴检索、审美评分/缓存、世界观与色彩画像、序列一致性、镜头视觉匹配、schema 迁移、BGM 独立轨和可选剪映可编辑草稿；v1.4 的场景感知参考证据、生产时间线 grammar 接通和审片证据包；以及 v1.4.1 的视觉 Agent QA/返工闭环和单视频多 curated source window。
+当前 Runtime 包含确定性音乐时间线、BGM 驱动选片、全库轻量视觉索引、有界深析、增量缓存、内容身份、并发事务、渲染、程序化 QA 与视觉 Agent 返工闭环。
 
 实验性增强：采样帧 CLIP 零样本主体/场景/外观动作/情绪分类；采样显著区域与正脸几何裁剪；参考视频淡化/叠化提示。这些能力会在报告中保留模型和降级状态，不能当作逐帧真值。
 
