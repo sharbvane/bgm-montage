@@ -16,7 +16,9 @@ import pixabay_pipeline as pipeline  # noqa: E402
 from montage import (  # noqa: E402
     InsufficientMaterialError,
     _candidate_score,
+    _select_option_with_tie_break,
     build_timeline,
+    JITTER_TIE_BAND,
     parse_ratio,
     plan_subject_crop,
 )
@@ -170,6 +172,11 @@ def test_successful_plan_never_exceeds_reuse_share_or_face_budgets(tmp_path: Pat
         content_policy=policy,
         seed="hard-policy",
     )
+    assert plan["capacity_contract"]["preflight"]["status"] == "passed"
+    assert plan["capacity_contract"]["assignment"]["status"] == "passed"
+    assert [item["selected_canonical_source_key"] for item in plan["capacity_contract"]["preflight"]["slots"]] == [
+        item["selected_canonical_source_key"] for item in plan["capacity_contract"]["assignment"]["slots"]
+    ]
 
     by_asset: dict[str, float] = {}
     face_seconds = 0.0
@@ -421,3 +428,161 @@ def test_structural_motion_scoring_reserves_fast_clips_for_climax() -> None:
     assert climax_fast > climax_slow
     assert intro_slow_parts["structural_motion_target"] == pytest.approx(0.34)
     assert climax_fast_parts["structural_motion_target"] == pytest.approx(0.82)
+
+
+def test_missing_score_dimensions_are_excluded_and_reported() -> None:
+    asset = {
+        "canonical_source_key": "fixture:unknown-metadata",
+        "motion": 0.72,
+        "motion_label": "dynamic",
+        "quality_score": 0.84,
+        "stability_score": 0.80,
+        "width": 1920,
+        "height": 1080,
+        "score": 0.82,
+        "face_risk": 0.0,
+    }
+    slot = {"index": 0, "recommended_content": [], "mood": "balanced", "section_role": "intro"}
+
+    score, components = _candidate_score(
+        asset, slot, None, "wide", 0.5, "dynamic", parse_ratio("16:9"), "", "missing-fixture"
+    )
+
+    assert score >= 0.0
+    assert components.get("semantic_available", 0.0) == 0.0
+    assert "semantic" in components["missing_dimensions"]
+    assert "theme" in components["missing_dimensions"]
+    assert components["effective_weight_sum"] < components["full_weight_sum"]
+
+
+def test_chinese_filename_terms_are_comparable_to_english_theme() -> None:
+    asset = {
+        "canonical_source_key": "fixture:coast",
+        "filename_semantics": {"terms": ["海岸"]},
+        "motion": 0.55,
+        "motion_label": "gentle",
+        "quality_score": 0.80,
+        "stability_score": 0.80,
+        "width": 1920,
+        "height": 1080,
+        "score": 0.80,
+        "face_risk": 0.0,
+    }
+    slot = {"index": 0, "recommended_content": ["coast"], "mood": "balanced", "section_role": "intro"}
+
+    _score, components = _candidate_score(
+        asset, slot, None, "wide", 0.5, "gentle", parse_ratio("16:9"), "coast", "filename-fixture"
+    )
+
+    assert components["theme"] > 0.0
+    assert "theme" not in components["missing_dimensions"]
+
+
+def test_unknown_motion_label_does_not_cancel_numeric_motion() -> None:
+    asset = {
+        "canonical_source_key": "fixture:numeric-motion",
+        "tags": "coast",
+        "motion": 0.86,
+        "motion_label": "unknown",
+        "quality_score": 0.80,
+        "stability_score": 0.80,
+        "width": 1920,
+        "height": 1080,
+        "score": 0.80,
+        "face_risk": 0.0,
+    }
+    slot = {"index": 0, "recommended_content": ["coast"], "mood": "balanced", "section_role": "climax"}
+
+    _score, components = _candidate_score(
+        asset, slot, None, "wide", 0.8, "dynamic", parse_ratio("16:9"), "coast", "motion-fixture"
+    )
+
+    assert components["motion"] > 0.9
+    assert components["motion_available"] == 1
+    assert components["motion_label_available"] == 0
+    assert "motion_label" in components["missing_dimensions"]
+
+
+def test_seed_jitter_is_deterministic_and_tie_break_only() -> None:
+    asset = {
+        "canonical_source_key": "fixture:deterministic",
+        "tags": "coast",
+        "motion": 0.55,
+        "motion_label": "gentle",
+        "quality_score": 0.80,
+        "stability_score": 0.80,
+        "width": 1920,
+        "height": 1080,
+        "score": 0.80,
+        "face_risk": 0.0,
+    }
+    slot = {"index": 0, "recommended_content": ["coast"], "mood": "balanced", "section_role": "intro"}
+    args = (asset, slot, None, "wide", 0.5, "gentle", parse_ratio("16:9"), "coast", "same-seed")
+    first = _candidate_score(*args)
+    second = _candidate_score(*args)
+
+    assert first == second
+    assert first[1]["jitter_contribution"] == 0.0
+    assert first[1]["jitter_tie_band"] == pytest.approx(JITTER_TIE_BAND)
+    high_jitter = {
+        "asset": {"canonical_source_key": "fixture:high"},
+        "base_score": 1.0 - JITTER_TIE_BAND / 2,
+        "components": {"seed_jitter": 1.0},
+    }
+    low_jitter = {
+        "asset": {"canonical_source_key": "fixture:low"},
+        "base_score": 1.0,
+        "components": {"seed_jitter": 0.0},
+    }
+    assert _select_option_with_tie_break([low_jitter, high_jitter]) is high_jitter
+    outside_band = {**high_jitter, "base_score": 1.0 - JITTER_TIE_BAND - 0.001}
+    assert _select_option_with_tie_break([low_jitter, outside_band]) is low_jitter
+
+
+def test_capacity_preflight_reports_theoretical_shortage_before_slot_assignment(tmp_path: Path) -> None:
+    assets = _assets(tmp_path, 12)
+    slots = [
+        {"start": float(index), "end": float(index + 1), "duration": 1.0, "section_role": "body"}
+        for index in range(23)
+    ]
+    policy = _relaxed_policy(
+        min_unique_assets=1,
+        min_scene_categories=1,
+        max_reuse_per_asset=1,
+        max_asset_screen_share=1.0,
+        min_repeat_gap_shots=0,
+        min_repeat_gap_seconds=0.0,
+        max_prominent_face_screen_share=1.0,
+    )
+
+    with pytest.raises(InsufficientMaterialError, match=r"Capacity preflight failed.*required_slots=23.*effective_capacity=12"):
+        build_timeline(
+            _audio(23.0),
+            assets,
+            23.0,
+            content_policy=policy,
+            timeline_plan={"slots": slots},
+        )
+
+
+def test_capacity_preflight_reports_usable_duration_reason(tmp_path: Path) -> None:
+    asset = _assets(tmp_path, 1)[0]
+    asset["duration"] = 0.5
+    asset["usable_segments"] = [{"start": 0.0, "end": 0.2, "duration": 0.2}]
+    policy = _relaxed_policy(
+        min_unique_assets=1,
+        min_scene_categories=1,
+        max_reuse_per_asset=1,
+        max_asset_screen_share=1.0,
+        max_prominent_face_screen_share=1.0,
+        min_repeat_gap_shots=0,
+        min_repeat_gap_seconds=0.0,
+    )
+    slots = [{"start": 0.0, "end": 1.0, "duration": 1.0, "section_role": "body"}]
+
+    with pytest.raises(InsufficientMaterialError, match=r"usable_duration"):
+        build_timeline(
+            _audio(1.0), [asset], 1.0,
+            content_policy=policy,
+            timeline_plan={"slots": slots},
+        )

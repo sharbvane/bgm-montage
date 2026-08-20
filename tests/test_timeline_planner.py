@@ -12,7 +12,9 @@ SCRIPTS = SKILL_ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+from music_event_contract import normalize_music_event_contract  # noqa: E402
 from timeline_planner import build_timeline_slots, plan_timeline_slots  # noqa: E402
+from validate_output import _cut_alignment  # noqa: E402
 
 
 def _audiomap(mode: str = "phrase_flow") -> dict[str, object]:
@@ -124,6 +126,43 @@ def test_timeline_duration_override_never_exceeds_available_audio() -> None:
     assert plan["duration_seconds"] == pytest.approx(6.25)
     assert plan["slots"][0]["start"] == 0.0
     assert plan["slots"][-1]["end"] == pytest.approx(6.25)
+
+
+def test_music_event_contract_is_shared_by_planner_and_validator() -> None:
+    profile = _audiomap("phrase_flow")
+    phrase_contract = normalize_music_event_contract(profile, 10.0)
+    beat_contract = normalize_music_event_contract({**profile, "rhythm_mode": {"mode": "beat_cut"}}, 10.0)
+
+    assert phrase_contract["schema_version"] == "music-event-contract.1"
+    assert "beat" not in phrase_contract["allowed_event_types"]
+    assert "onset" in phrase_contract["allowed_event_types"]
+    assert "beat" in beat_contract["allowed_event_types"]
+    plan = plan_timeline_slots(profile)
+    assert plan["music_event_contract"]["contract_digest"] == phrase_contract["contract_digest"]
+    shots = [
+        {"output_start": 0.0, "output_end": 2.3},
+        {"output_start": 2.3, "output_end": 5.15},
+        {"output_start": 5.15, "output_end": 10.0},
+    ]
+    alignment = _cut_alignment(shots, profile, 10.0)
+    assert alignment is not None
+    assert alignment["contract_digest"] == phrase_contract["contract_digest"]
+    assert alignment["allowed_event_types"] == phrase_contract["allowed_event_types"]
+    assert alignment["passed"] is True
+
+
+def test_legacy_audiomap_without_alignment_events_is_explicitly_unavailable() -> None:
+    profile = {"duration_seconds": 4.0, "rhythm_mode": {"mode": "phrase_flow"}}
+    contract = normalize_music_event_contract(profile, 4.0)
+    assert contract["available"] is False
+    alignment = _cut_alignment(
+        [{"output_start": 0.0, "output_end": 1.0}, {"output_start": 1.0, "output_end": 4.0}],
+        profile,
+        4.0,
+    )
+    assert alignment is not None
+    assert alignment["available"] is False
+    assert alignment["passed"] is False
 
 
 def test_climax_role_is_denser_than_intro_with_the_same_raw_duration_guidance() -> None:

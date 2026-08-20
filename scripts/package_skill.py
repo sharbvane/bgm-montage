@@ -40,6 +40,7 @@ RUNTIME_SCRIPTS = (
     "edit_schema.py",
     "jianying_export.py",
     "local_library.py",
+    "music_event_contract.py",
     "montage.py",
     "pixabay_pipeline.py",
     "runtime_paths.py",
@@ -368,7 +369,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Canonical bgm-montage Skill directory",
     )
     parser.add_argument("--output", help="Destination .zip path")
-    parser.add_argument("--version", default="1.4.3", help="Version used by the default ZIP filename")
+    parser.add_argument("--version", default="1.4.4", help="Version used by the default ZIP filename")
     parser.add_argument(
         "--profile",
         choices=("runtime", "development"),

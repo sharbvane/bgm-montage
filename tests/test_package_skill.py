@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import subprocess
 import sys
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -73,6 +75,7 @@ def test_runtime_and_development_packages_have_distinct_allowlists(tmp_path: Pat
         assert ".agents/skills/bgm-montage/.env.example" in names
         assert ".agents/skills/bgm-montage/requirements.lock.txt" in names
         assert ".agents/skills/bgm-montage/requirements-jianying.lock.txt" in names
+        assert ".agents/skills/bgm-montage/scripts/music_event_contract.py" in names
         assert ".agents/skills/bgm-montage/scripts/timeline_planner.py" in names
         assert ".agents/skills/bgm-montage/tests/test_smoke.py" not in names
         assert ".agents/skills/bgm-montage/CHANGELOG.md" not in names
@@ -101,6 +104,62 @@ def test_runtime_and_development_packages_have_distinct_allowlists(tmp_path: Pat
         assert ".agents/skills/bgm-montage/CHANGELOG.md" in names
         assert ".agents/skills/bgm-montage/TEST_REPORT.md" in names
         assert ".agents/skills/bgm-montage/scripts/package_skill.py" in names
+
+
+def test_runtime_package_clean_extract_cli_and_local_import_smoke(tmp_path: Path) -> None:
+    """The runtime ZIP must start without the source checkout on sys.path."""
+
+    archive_path = tmp_path / "bgm-montage-clean-extract.zip"
+    package_skill.build_package(SKILL_ROOT, archive_path, profile="runtime")
+    extract_root = tmp_path / "clean-extract"
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        archive.extractall(extract_root)
+
+    installed = extract_root / ".agents" / "skills" / "bgm-montage"
+    clean_env = os.environ.copy()
+    clean_env.pop("PYTHONPATH", None)
+    cli = subprocess.run(
+        [sys.executable, "scripts/bgm_montage.py", "--version"],
+        cwd=installed,
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert cli.returncode == 0, cli.stderr
+    assert cli.stdout.strip() == "bgm-montage 1.4.4"
+
+    import_code = """
+import importlib
+import pathlib
+import sys
+
+root = pathlib.Path.cwd().resolve()
+scripts = root / "scripts"
+sys.path.insert(0, str(scripts))
+modules = [
+    importlib.import_module("music_event_contract"),
+    importlib.import_module("timeline_planner"),
+    importlib.import_module("validate_output"),
+    importlib.import_module("bgm_montage"),
+]
+assert all(pathlib.Path(module.__file__).resolve().is_relative_to(root) for module in modules)
+print("clean-extract-import-smoke")
+"""
+    imports = subprocess.run(
+        [sys.executable, "-c", import_code],
+        cwd=installed,
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert imports.returncode == 0, imports.stderr
+    assert imports.stdout.strip() == "clean-extract-import-smoke"
 
 
 def test_package_rejects_secret_embedded_in_allowlisted_source(tmp_path: Path) -> None:

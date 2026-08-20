@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.4.4 — 2026-08-20
+
+- Added local-library metadata truth/provenance, missing-feature scoring normalization, and bounded lazy cache migration while preserving legacy report/cache fields.
+- Added shared asset-capacity preflight and the shared planner/validator music-event contract; preflight and assignment use the same resolved policy and constraint helpers.
+- Expanded visual QA coverage for whole-film consistency and adjacent-shot diversity, and added the Golden Fixture Identity Contract plus duration-stage instrumentation.
+- Fixed `colorbalance` `pl=0` handling and retained the evidence boundary; the remaining Duration status is `not reproduced / instrumented / known historical risk`.
+- Formalized `climax_visual_response` evidence sufficiency: a climax comparison requires valid counted climax and calm/reference evidence; missing comparator data is reported as `insufficient_evidence`, with unavailable density/intensity values kept as null and excluded from comparison.
+- Kept insufficient climax evidence non-blocking for the whole-video technical QA result, while preserving truthful `evidence_sufficient=false` and `passed=false` comparison details.
+- Added a permanent clean-extract runtime-package smoke regression so the published package is tested without project-source or installed-skill imports.
+- Recorded the planner boundary: `Reference Grammar beat_cut rhythm optimization deferred`.
+- Preserved v1.4.3 JSON/cache schema identifiers for compatibility; no planner, beat-cut, selection, threshold, renderer, metadata, capacity, or scoring redesign was added.
+
 ## v1.4.3 — 2026-08-16
 
 - Cleaned the release layout without changing the runtime version: stable functional test filenames replace historical version suffixes, obsolete upgrade reports are removed, and packaging now emits explicit `runtime` and `development` profiles.

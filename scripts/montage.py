@@ -21,9 +21,11 @@ from visual_intelligence import (
     asset_visual_features,
     build_light_grade,
     build_visual_style_profile,
+    english_terms,
     evaluate_sequence_consistency,
     transition_match,
 )
+from music_event_contract import normalize_music_event_contract
 
 
 class MontageError(RuntimeError):
@@ -32,6 +34,10 @@ class MontageError(RuntimeError):
 
 class InsufficientMaterialError(MontageError):
     """Raised when diversity/reuse/screen-share constraints cannot be met."""
+
+
+SELECTION_SCORE_SCHEMA_VERSION = "selection-score.1"
+JITTER_TIE_BAND = 0.012
 
 
 @dataclass(frozen=True)
@@ -103,27 +109,14 @@ def _numeric_times(value: Any, duration: float) -> list[float]:
 
 
 def extract_musical_times(audio_profile: dict[str, Any], duration: float) -> dict[str, list[float]]:
-    groups = {
-        "beats": {"beats", "beat_times", "beat_times_seconds"},
-        "accents": {"accents", "accent_times", "accent_times_seconds", "emphasis_nodes", "onsets"},
-        "phrases": {"phrases", "phrase_boundaries", "phrase_boundaries_seconds"},
-        "sections": {"sections", "segments", "section_boundaries", "section_boundaries_seconds"},
-        "pauses": {"pauses", "silences", "pause_intervals"},
+    groups = normalize_music_event_contract(audio_profile, duration).get("groups", {})
+    return {
+        "beats": list(groups.get("beats", [])),
+        "accents": sorted(set(groups.get("accents", []) + groups.get("onsets", []))),
+        "phrases": list(groups.get("phrases", [])),
+        "sections": list(groups.get("sections", [])),
+        "pauses": list(groups.get("hard_stops", [])),
     }
-    result: dict[str, list[float]] = {}
-    for name, keys in groups.items():
-        times: list[float] = []
-        for value in _nested_values(audio_profile, keys):
-            if name == "pauses" and isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict):
-                        times.extend(_numeric_times(item.get("start", item.get("start_seconds")), duration))
-                    elif isinstance(item, (list, tuple)) and item:
-                        times.extend(_numeric_times(item[0], duration))
-            else:
-                times.extend(_numeric_times(value, duration))
-        result[name] = sorted({round(x, 4) for x in times if 0.02 < x < duration - 0.02})
-    return result
 
 
 def _energy_points(audio_profile: dict[str, Any], duration: float) -> list[tuple[float, float]]:
@@ -356,17 +349,23 @@ def _terms(value: Any) -> set[str]:
     if text_parts and all(isinstance(item, str) and " " not in item for item in text_parts):
         # Recursive calls return normalized tokens.  Avoid reparsing them as a
         # single concatenated phrase.
-        return {str(item) for item in text_parts if item}
+        result = {str(item) for item in text_parts if item}
+        result.update(english_terms(" ".join(text_parts)))
+        return result
     text = " ".join(str(item) for item in text_parts).lower()
     stop = {
         "the", "a", "an", "and", "or", "of", "in", "on", "with", "for",
         "cinematic", "video", "footage", "scene", "shot", "visual",
     }
-    return {
+    tokens = {
         token
         for token in re.findall(r"[a-z0-9][a-z0-9_-]{1,}|[\u4e00-\u9fff]{1,8}", text)
         if token not in stop
     }
+    # Reuse the visual metadata normalizer so Chinese topic/file hints and
+    # English provider tags share one comparable vocabulary.
+    tokens.update(term for term in english_terms(text) if term not in stop)
+    return tokens
 
 
 def _semantic_overlap(left: Any, right: Any) -> float:
@@ -374,6 +373,60 @@ def _semantic_overlap(left: Any, right: Any) -> float:
     if not left_terms or not right_terms:
         return 0.0
     return len(left_terms & right_terms) / max(1, min(len(left_terms), len(right_terms)))
+
+
+def _observed_value(value: Any) -> bool:
+    return value not in (None, "", "unknown", "unresolved", "none", "n/a")
+
+
+def _asset_signal_available(
+    asset: dict[str, Any],
+    keys: tuple[str, ...],
+    quality_keys: tuple[str, ...] = (),
+) -> bool:
+    if any(key in asset and _observed_value(asset.get(key)) for key in keys):
+        return True
+    quality = asset.get("quality") if isinstance(asset.get("quality"), dict) else {}
+    return any(key in quality and _observed_value(quality.get(key)) for key in quality_keys)
+
+
+def _feature_available(features: dict[str, Any], key: str, default: bool = False) -> bool:
+    details = features.get("feature_details") if isinstance(features.get("feature_details"), dict) else {}
+    detail = details.get(key) if isinstance(details.get(key), dict) else {}
+    if detail:
+        return bool(detail.get("available"))
+    return default
+
+
+def _normalized_weighted_score(
+    values: dict[str, float], weights: dict[str, float], available: dict[str, bool]
+) -> tuple[float, float, float]:
+    full_weight = sum(weights.values())
+    effective_weight = sum(weight for key, weight in weights.items() if available.get(key, False))
+    if effective_weight <= 0.0:
+        return 0.0, effective_weight, full_weight
+    total = sum(weights[key] * max(0.0, min(1.0, _as_float(values.get(key), 0.0))) for key in weights if available.get(key, False))
+    return total / effective_weight, effective_weight, full_weight
+
+
+def _select_option_with_tie_break(options: list[dict[str, Any]]) -> dict[str, Any]:
+    """Select by base score; deterministic seed jitter is tie-break-only."""
+
+    if not options:
+        raise MontageError("Cannot select from an empty option list")
+    top_base = max(_as_float(option.get("base_score"), -1e9) for option in options)
+    tied = [
+        option for option in options
+        if top_base - _as_float(option.get("base_score"), -1e9) <= JITTER_TIE_BAND
+    ]
+    return max(
+        tied,
+        key=lambda option: (
+            _as_float((option.get("components") or {}).get("seed_jitter"), 0.0),
+            _as_float(option.get("base_score"), -1e9),
+            str((option.get("asset") or {}).get("canonical_source_key") or ""),
+        ),
+    )
 
 
 def _extract_assets(media_result: Any) -> list[dict[str, Any]]:
@@ -1123,15 +1176,21 @@ def _candidate_score(
     theme: str,
     seed: str,
     visual_profile: dict[str, Any] | None = None,
-) -> tuple[float, dict[str, float]]:
+) -> tuple[float, dict[str, Any]]:
     visual_profile = visual_profile or {}
     asset_text = [
         asset.get("tags"), asset.get("scene_category"), asset.get("subject_label"),
         asset.get("search_query"), asset.get("search_queries"), asset.get("semantic"),
+        asset.get("semantic_tags"), asset.get("filename_semantics"),
     ]
     slot_text = [slot.get("recommended_content"), slot.get("mood"), slot.get("section_role")]
     semantic = _semantic_overlap(asset_text, slot_text)
     theme_match = _semantic_overlap(asset_text, theme)
+    asset_terms = _terms(asset_text)
+    slot_terms = _terms(slot_text)
+    theme_terms = _terms(theme)
+    semantic_available = bool(asset_terms and slot_terms)
+    theme_available = bool(asset_terms and theme_terms)
     source_motion = _as_float(asset.get("motion"), 0.5)
     section_role = str(slot.get("section_role") or slot.get("audio_section_role") or "").lower()
     # Reserve the genuinely high-motion inventory for drop/climax sections.
@@ -1150,6 +1209,7 @@ def _candidate_score(
         _semantic_overlap(asset_text, slot.get("mood")),
         0.65 if str(slot.get("mood", "")).lower() in {"balanced", "neutral", ""} else 0.20,
     )
+    mood_available = str(slot.get("mood", "")).lower() in {"balanced", "neutral", ""} or bool(asset_terms)
     source_ratio = _as_float(asset.get("width"), 0.0) / max(1.0, _as_float(asset.get("height"), 0.0))
     target_ratio = spec.width / spec.height
     ratio_fit = max(0.0, 1.0 - abs(math.log(max(source_ratio, 1e-4) / target_ratio)) / 1.6) if source_ratio > 0 else 0.35
@@ -1163,8 +1223,85 @@ def _candidate_score(
     history = min(1.0, _as_float(asset.get("history_usage_count"), 0.0) / 10.0)
     face_penalty = _as_float(asset.get("face_risk"), 0.0)
     difference_penalty = 0.0
+    visual_features = asset_visual_features(asset)
     visual_fit = asset_profile_fit(asset, visual_profile)
     visual_transition = transition_match(previous, asset, visual_profile)
+    details = visual_features.get("feature_details") if isinstance(visual_features.get("feature_details"), dict) else {}
+    desired_time = set((visual_profile.get("terms") or {}).get("lighting", [])) if isinstance(visual_profile.get("terms"), dict) else set()
+    desired_weather = set((visual_profile.get("terms") or {}).get("weather", [])) if isinstance(visual_profile.get("terms"), dict) else set()
+    desired_capture = set((visual_profile.get("terms") or {}).get("capture", [])) if isinstance(visual_profile.get("terms"), dict) else set()
+    desired_motion_terms = set((visual_profile.get("terms") or {}).get("motion", [])) if isinstance(visual_profile.get("terms"), dict) else set()
+    preferred_world = set((visual_profile.get("world_model") or {}).get("preferred_families", [])) if isinstance(visual_profile.get("world_model"), dict) else set()
+    world_available = not preferred_world or _feature_available(visual_features, "world")
+    time_weather_available = not (desired_time or desired_weather) or _feature_available(visual_features, "time_weather")
+    camera_language_available = not (desired_capture or desired_motion_terms) or _feature_available(visual_features, "camera_language")
+    shot_scale_available = _feature_available(
+        visual_features,
+        "shot_scale",
+        _asset_signal_available(asset, ("shot_scale",)),
+    )
+    motion_available = _asset_signal_available(
+        asset,
+        ("motion", "motion_score", "motion_score_estimate"),
+        ("motion", "motion_score"),
+    )
+    motion_label_available = _meaningful_label(asset.get("motion_label")) is not None and _meaningful_label(desired_motion_label) is not None
+    stability_available = _asset_signal_available(asset, ("stability_score", "stability"), ("stability_score", "stability"))
+    quality_available = _asset_signal_available(asset, ("quality_score", "overall_score", "score"), ("overall_score", "score"))
+    ratio_available = source_ratio > 0.0
+    resolution_available = _as_float(asset.get("width"), 0.0) > 0 and _as_float(asset.get("height"), 0.0) > 0
+    asset_score_available = _asset_signal_available(
+        asset,
+        ("score", "final_score", "diversity_adjusted_score", "pre_score"),
+    )
+    hsv = visual_features.get("mean_hsv") if isinstance(visual_features.get("mean_hsv"), dict) else {}
+    color_available = all(key in hsv for key in ("hue_degrees", "saturation", "value"))
+    visual_analysis = asset.get("visual_analysis") if isinstance(asset.get("visual_analysis"), dict) else {}
+    quality_mapping = asset.get("quality") if isinstance(asset.get("quality"), dict) else {}
+    quality_visual = quality_mapping.get("visual_analysis") if isinstance(quality_mapping.get("visual_analysis"), dict) else {}
+    aesthetic_available = bool(visual_analysis or quality_visual or "quality_score" in asset)
+    cinematic_available = "cinematic_score" in visual_analysis or "cinematic_score" in quality_visual
+    visual_values = {
+        "world": visual_fit["world"],
+        "color": visual_fit["color"],
+        "time_weather": visual_fit["time_weather"],
+        "camera_language": visual_fit["camera_language"],
+        "aesthetic": visual_fit["aesthetic"],
+    }
+    visual_available = {
+        "world": world_available,
+        "color": color_available,
+        "time_weather": time_weather_available,
+        "camera_language": camera_language_available,
+        "aesthetic": aesthetic_available,
+    }
+    visual_effective, visual_effective_weight, visual_full_weight = _normalized_weighted_score(
+        visual_values,
+        {"world": 0.27, "color": 0.20, "time_weather": 0.14, "camera_language": 0.13, "aesthetic": 0.26},
+        visual_available,
+    )
+    previous_features = asset_visual_features(previous) if previous is not None else {}
+    transition_available = previous is not None and any(
+        _feature_available(visual_features, key) or _feature_available(previous_features, key)
+        for key in ("shot_scale", "world", "time_weather", "camera_language", "motion")
+    )
+    score_available = {
+        "semantic": semantic_available,
+        "theme": theme_available,
+        "mood": mood_available,
+        "motion": motion_available,
+        "motion_label": motion_label_available,
+        "shot_scale": shot_scale_available,
+        "stability": stability_available,
+        "quality": quality_available,
+        "ratio_fit": ratio_available,
+        "resolution": resolution_available,
+        "asset_score": asset_score_available,
+        "visual_profile_fit": visual_effective_weight > 0.0,
+        "visual_transition_match": transition_available,
+        "aesthetic_quality": aesthetic_available,
+        "cinematic_quality": cinematic_available,
+    }
     adjacent_color_match = visual_transition["color"]
     adjacent_motion_match = visual_transition["motion"]
     if previous is not None:
@@ -1188,6 +1325,45 @@ def _candidate_score(
         f"{seed}|{slot['index']}|{asset['canonical_source_key']}".encode("utf-8")
     ).digest()
     jitter = int.from_bytes(digest[:4], "big") / 0xFFFFFFFF
+    transition_score = visual_transition.get("effective_total", visual_transition["total"])
+    score_values = {
+        "semantic": semantic,
+        "theme": theme_match,
+        "mood": mood_match,
+        "motion": motion_match,
+        "motion_label": motion_label_match,
+        "shot_scale": scale_match,
+        "stability": stability,
+        "quality": quality,
+        "ratio_fit": ratio_fit,
+        "resolution": resolution,
+        "asset_score": max(0.0, min(1.0, _as_float(asset.get("score"), 0.5))),
+        "visual_profile_fit": visual_effective,
+        "visual_transition_match": transition_score,
+        "aesthetic_quality": visual_fit["aesthetic"],
+        "cinematic_quality": visual_fit["cinematic"],
+    }
+    score_weights = {
+        "semantic": 0.18,
+        "theme": 0.10,
+        "mood": 0.08,
+        "motion": 0.14,
+        "motion_label": 0.05,
+        "shot_scale": 0.11,
+        "stability": 0.08,
+        "quality": 0.09,
+        "ratio_fit": 0.06,
+        "resolution": 0.04,
+        "asset_score": 0.07,
+        "visual_profile_fit": 0.16,
+        "visual_transition_match": 0.15,
+        "aesthetic_quality": 0.08,
+        "cinematic_quality": 0.04,
+    }
+    normalized_score, effective_weight_sum, full_weight_sum = _normalized_weighted_score(
+        score_values, score_weights, score_available
+    )
+    missing_dimensions = [key for key in score_weights if not score_available.get(key, False)]
     components = {
         "semantic": semantic,
         "theme": theme_match,
@@ -1205,42 +1381,313 @@ def _candidate_score(
         "adjacent_similarity_penalty": difference_penalty,
         "adjacent_color_match": adjacent_color_match,
         "adjacent_motion_match": adjacent_motion_match,
-        "visual_profile_fit": visual_fit["total"],
+        "visual_profile_fit": visual_effective,
+        "visual_profile_fit_legacy": visual_fit["total"],
+        "visual_profile_effective_weight": visual_effective_weight,
+        "visual_profile_full_weight": visual_full_weight,
         "world_fit": visual_fit["world"],
         "color_profile_fit": visual_fit["color"],
         "time_weather_fit": visual_fit["time_weather"],
         "camera_language_fit": visual_fit["camera_language"],
         "aesthetic_quality": visual_fit["aesthetic"],
         "cinematic_quality": visual_fit["cinematic"],
-        "visual_transition_match": visual_transition["total"],
+        "visual_transition_match": transition_score,
+        "visual_transition_match_legacy": visual_transition["total"],
+        "visual_transition_effective_weight": visual_transition.get("effective_weight_sum", 1.0),
+        "visual_transition_missing_dimensions": "|".join(visual_transition.get("missing_dimensions", [])),
         "transition_scale_match": visual_transition["scale"],
         "transition_world_match": visual_transition["world"],
         "transition_texture_match": visual_transition["texture"],
         "transition_composition_match": visual_transition["composition"],
         "seed_jitter": jitter,
+        "jitter_weight": 0.055,
+        "jitter_contribution": 0.0,
+        "jitter_tie_band": JITTER_TIE_BAND,
+        "jitter_applied": 0.0,
+        "base_score": normalized_score,
+        "effective_weight_sum": effective_weight_sum,
+        "full_weight_sum": full_weight_sum,
+        "normalization_factor": effective_weight_sum / max(full_weight_sum, 1e-9),
+        "missing_dimensions": "|".join(missing_dimensions),
+        **{f"{key}_available": float(value) for key, value in score_available.items()},
     }
     score = (
-        0.18 * semantic
-        + 0.10 * theme_match
-        + 0.08 * mood_match
-        + 0.14 * motion_match
-        + 0.05 * motion_label_match
-        + 0.11 * scale_match
-        + 0.08 * stability
-        + 0.09 * quality
-        + 0.06 * ratio_fit
-        + 0.04 * resolution
-        + 0.07 * max(0.0, min(1.0, _as_float(asset.get("score"), 0.5)))
-        + 0.16 * visual_fit["total"]
-        + 0.15 * visual_transition["total"]
-        + 0.08 * visual_fit["aesthetic"]
-        + 0.04 * visual_fit["cinematic"]
-        + 0.055 * jitter
+        normalized_score
         - 0.10 * history
         - 0.16 * face_penalty
         - difference_penalty
     )
-    return score, {key: round(value, 5) for key, value in components.items()}
+    return score, {
+        key: round(value, 5) if isinstance(value, (int, float)) else value
+        for key, value in components.items()
+    }
+
+
+def _new_assignment_state(assets: list[dict[str, Any]]) -> dict[str, Any]:
+    identities = {asset["canonical_source_key"] for asset in assets}
+    return {
+        "usage_count": {identity: 0 for identity in identities},
+        "screen_time": {identity: 0.0 for identity in identities},
+        "output_occurrences": {identity: [] for identity in identities},
+        "source_intervals": {identity: [] for identity in identities},
+        "prominent_face_time": 0.0,
+        "used_scenes": set(),
+        "previous": None,
+    }
+
+
+def _assignment_preview(asset: dict[str, Any]) -> dict[str, Any]:
+    """Keep dry-run and real assignment on the same previous-shot contract."""
+
+    return {
+        **asset,
+        "source_shot_scale": _normalize_scale(str(asset.get("shot_scale") or "unknown")),
+        "is_static_like": bool(asset.get("is_static_like")),
+        "is_aerial": bool(asset.get("is_aerial")),
+    }
+
+
+def _has_usable_duration(asset: dict[str, Any], output_duration: float) -> bool:
+    minimum_speed = 0.82
+    return any(
+        _as_float(segment.get("end"), 0.0) - _as_float(segment.get("start"), 0.0)
+        >= output_duration * minimum_speed - 1e-6
+        for segment in _usable_segments(asset)
+    )
+
+
+def _assignment_options_for_slot(
+    assets: list[dict[str, Any]],
+    slot: dict[str, Any],
+    state: dict[str, Any],
+    policy: dict[str, Any],
+    duration: float,
+    spec: OutputSpec,
+    theme: str,
+    seed: str,
+    visual_profile: dict[str, Any],
+    energy_points: list[tuple[float, float]],
+    desired_scale: str,
+    desired_motion: float,
+    desired_motion_label: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Apply every assignment constraint once for both preflight and real use."""
+
+    output_duration = _as_float(slot.get("duration"), 0.0)
+    energy = _slot_energy(slot, energy_points)
+    max_share_seconds = float(policy["max_asset_screen_share"]) * duration
+    max_face_seconds = float(policy["max_prominent_face_screen_share"]) * duration
+    prominent_threshold = float(policy["prominent_face_threshold"])
+    rejection_counts: dict[str, int] = {}
+    rejection_by_asset: dict[str, list[str]] = {}
+    options: list[dict[str, Any]] = []
+
+    def reject(identity: str, reasons: list[str]) -> None:
+        if not reasons:
+            return
+        rejection_by_asset[identity] = reasons
+        for reason in reasons:
+            rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+
+    for asset in assets:
+        identity = asset["canonical_source_key"]
+        reasons: list[str] = []
+        if state["usage_count"][identity] >= int(policy["max_reuse_per_asset"]):
+            reasons.append("reuse")
+        if state["screen_time"][identity] + output_duration > max_share_seconds + 0.02:
+            reasons.append("screen_share")
+        occurrences = state["output_occurrences"][identity]
+        if occurrences:
+            last_index, _, last_end = occurrences[-1]
+            if int(slot["index"]) - last_index < int(policy.get("min_repeat_gap_shots", 0)):
+                reasons.append("repeat_gap_shots")
+            if _as_float(slot["start"]) - last_end < _as_float(policy.get("min_repeat_gap_seconds"), 0.0):
+                reasons.append("repeat_gap_seconds")
+        if (
+            _as_float(asset.get("face_risk"), 0.0) >= prominent_threshold
+            and state["prominent_face_time"] + output_duration > max_face_seconds + 0.02
+        ):
+            reasons.append("face_budget")
+        if reasons:
+            reject(identity, reasons)
+            continue
+        window = _best_source_window(
+            asset,
+            output_duration,
+            energy,
+            state["source_intervals"][identity],
+            policy,
+            seed,
+            int(slot["index"]),
+        )
+        if window is None:
+            reason = "usable_duration" if not _has_usable_duration(asset, output_duration) else "source_interval_overlap"
+            reject(identity, [reason])
+            continue
+        score, components = _candidate_score(
+            asset,
+            slot,
+            state["previous"],
+            desired_scale,
+            desired_motion,
+            desired_motion_label,
+            spec,
+            theme,
+            seed,
+            visual_profile,
+        )
+        base_score = score + 0.10 * window["window_score"]
+        components["source_window_weight"] = 0.10
+        components["source_window_score"] = round(window["window_score"], 5)
+        components["base_score"] = round(base_score, 5)
+        options.append({"asset": asset, "window": window, "base_score": base_score, "score": base_score, "components": components})
+
+    used_sources = {key for key, count in state["usage_count"].items() if count > 0}
+    filtered_for_min_unique = False
+    if len(used_sources) < int(policy["min_unique_assets"]):
+        unused = [option for option in options if state["usage_count"][option["asset"]["canonical_source_key"]] == 0]
+        if unused:
+            options = unused
+            filtered_for_min_unique = True
+    filtered_for_scene = False
+    if len(state["used_scenes"]) < int(policy["min_scene_categories"]):
+        novel_scene = [
+            option
+            for option in options
+            if str(option["asset"].get("scene_category") or "general") not in state["used_scenes"]
+            and option["components"].get("world_fit", 0.0) >= 0.50
+            and option["components"].get("visual_transition_match", 0.0) >= 0.40
+        ]
+        if novel_scene:
+            options = novel_scene
+            filtered_for_scene = True
+    return options, {
+        "slot_index": int(slot["index"]),
+        "candidate_count": len(assets),
+        "eligible_count": len(options),
+        "rejection_counts": dict(sorted(rejection_counts.items())),
+        "rejection_by_asset": rejection_by_asset,
+        "filtered_for_min_unique": filtered_for_min_unique,
+        "filtered_for_scene": filtered_for_scene,
+    }
+
+
+def _mark_selected_option(selected: dict[str, Any]) -> dict[str, Any]:
+    selected_components = dict(selected["components"])
+    selected_jitter = 0.055 * _as_float(selected_components.get("seed_jitter"), 0.0)
+    selected_components["jitter_applied"] = 1.0
+    selected_components["jitter_contribution"] = round(selected_jitter, 5)
+    selected["components"] = selected_components
+    selected["score"] = selected["base_score"] + selected_jitter
+    return selected
+
+
+def _commit_assignment_state(
+    state: dict[str, Any],
+    selected: dict[str, Any],
+    slot: dict[str, Any],
+    policy: dict[str, Any],
+) -> None:
+    asset = selected["asset"]
+    identity = asset["canonical_source_key"]
+    output_duration = _as_float(slot.get("duration"), 0.0)
+    state["usage_count"][identity] += 1
+    state["screen_time"][identity] += output_duration
+    state["output_occurrences"][identity].append((int(slot["index"]), _as_float(slot["start"]), _as_float(slot["end"])))
+    state["source_intervals"][identity].append((selected["window"]["source_start"], selected["window"]["source_end"]))
+    if _as_float(asset.get("face_risk"), 0.0) >= float(policy["prominent_face_threshold"]):
+        state["prominent_face_time"] += output_duration
+    state["used_scenes"].add(str(asset.get("scene_category") or "general"))
+    state["previous"] = _assignment_preview(asset)
+
+
+def _capacity_contract(
+    assets: list[dict[str, Any]],
+    slot_records: list[dict[str, Any]],
+    duration: float,
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    unique_count = len({asset["canonical_source_key"] for asset in assets})
+    required_slots = len(slot_records)
+    min_slot_duration = min((_as_float(slot.get("duration"), 0.0) for slot in slot_records), default=0.0)
+    max_share_seconds = float(policy["max_asset_screen_share"]) * duration
+    share_slots_per_asset = math.floor(max_share_seconds / max(min_slot_duration, 1e-9) + 1e-9) if min_slot_duration > 0 else 0
+    reuse_capacity = unique_count * int(policy["max_reuse_per_asset"])
+    screen_share_capacity = unique_count * min(int(policy["max_reuse_per_asset"]), share_slots_per_asset)
+    theoretical_capacity = min(reuse_capacity, screen_share_capacity)
+    contract = {
+        "schema_version": "capacity-contract.1",
+        "required_slots": required_slots,
+        "asset_count": len(assets),
+        "unique_canonical_sources": unique_count,
+        "policy": {
+            key: policy.get(key)
+            for key in (
+                "max_reuse_per_asset", "max_asset_screen_share", "min_repeat_gap_shots",
+                "min_repeat_gap_seconds", "max_source_interval_overlap",
+                "max_prominent_face_screen_share", "prominent_face_threshold",
+            )
+        },
+        "theoretical_capacity": {
+            "reuse_slots": reuse_capacity,
+            "screen_share_slots": screen_share_capacity,
+            "effective_upper_bound_slots": theoretical_capacity,
+            "min_slot_duration_seconds": round(min_slot_duration, 4),
+        },
+        "preflight": {"status": "not_run", "assigned_slots": 0, "slots": []},
+        "assignment": {"status": "not_run", "slots": []},
+    }
+    if theoretical_capacity < required_slots:
+        raise InsufficientMaterialError(
+            "Capacity preflight failed before assignment: "
+            f"required_slots={required_slots}, effective_capacity={theoretical_capacity}, "
+            f"reuse_capacity={reuse_capacity}, screen_share_capacity={screen_share_capacity}, "
+            f"policy={json.dumps(contract['policy'], ensure_ascii=False, sort_keys=True)}; "
+            "Material constraints became infeasible before slot assignment."
+        )
+    return contract
+
+
+def _run_assignment_preflight(
+    assets: list[dict[str, Any]],
+    slot_records: list[dict[str, Any]],
+    policy: dict[str, Any],
+    duration: float,
+    spec: OutputSpec,
+    theme: str,
+    seed: str,
+    visual_profile: dict[str, Any],
+    energy_points: list[tuple[float, float]],
+) -> dict[str, Any]:
+    state = _new_assignment_state(assets)
+    records: list[dict[str, Any]] = []
+    for slot in slot_records:
+        slot["_energy"] = _slot_energy(slot, energy_points)
+        desired_scale = _normalize_scale(str(slot.get("recommended_shot_scale", "medium")))
+        desired_motion, desired_motion_label = _slot_motion_target(slot.get("recommended_motion"), slot["_energy"])
+        options, diagnostics = _assignment_options_for_slot(
+            assets, slot, state, policy, duration, spec, theme, seed, visual_profile,
+            energy_points, desired_scale, desired_motion, desired_motion_label,
+        )
+        if not options:
+            raise InsufficientMaterialError(
+                f"Capacity preflight failed at slot {slot['index']}: "
+                f"required_slots={len(slot_records)}, assigned_slots={len(records)}, "
+                f"rejection_counts={json.dumps(diagnostics['rejection_counts'], ensure_ascii=False, sort_keys=True)}; "
+                "Material constraints became infeasible before render."
+            )
+        selected = _mark_selected_option(_select_option_with_tie_break(options))
+        _commit_assignment_state(state, selected, slot, policy)
+        records.append({
+            **diagnostics,
+            "selected_asset_id": selected["asset"].get("asset_id"),
+            "selected_canonical_source_key": selected["asset"]["canonical_source_key"],
+        })
+    return {
+        "status": "passed",
+        "assigned_slots": len(records),
+        "slots": records,
+    }
 
 
 def _shot_from_choice(
@@ -1248,7 +1695,7 @@ def _shot_from_choice(
     asset: dict[str, Any],
     window: dict[str, float],
     score: float,
-    components: dict[str, float],
+    components: dict[str, Any],
     spec: OutputSpec,
     desired_scale: str,
     desired_motion: float,
@@ -1319,6 +1766,19 @@ def _shot_from_choice(
         "audio_section_role": slot.get("section_role"),
         "selection_score": round(score, 6),
         "selection_score_components": components,
+        "selection_score_stage": "montage_final",
+        "selection_score_explanation": {
+            "schema_version": SELECTION_SCORE_SCHEMA_VERSION,
+            "effective_weight_sum": components.get("effective_weight_sum", 0.0),
+            "full_weight_sum": components.get("full_weight_sum", 0.0),
+            "normalization_factor": components.get("normalization_factor", 0.0),
+            "missing_dimensions": [
+                item for item in str(components.get("missing_dimensions", "")).split("|") if item
+            ],
+            "jitter_tie_band": components.get("jitter_tie_band", JITTER_TIE_BAND),
+            "jitter_applied": bool(components.get("jitter_applied", 0.0)),
+            "jitter_contribution": components.get("jitter_contribution", 0.0),
+        },
         "candidate_scores": candidate_log,
         "grammar_influence": grammar_influence,
         "timeline_start": round(_as_float(slot["start"]), 4),
@@ -1511,13 +1971,21 @@ def build_timeline(
     if slot_records:
         slot_records[-1]["transition"] = "hard_cut"
 
-    usage_count: dict[str, int] = {asset["canonical_source_key"]: 0 for asset in assets}
-    screen_time: dict[str, float] = {asset["canonical_source_key"]: 0.0 for asset in assets}
-    output_occurrences: dict[str, list[tuple[int, float, float]]] = {asset["canonical_source_key"]: [] for asset in assets}
-    source_intervals: dict[str, list[tuple[float, float]]] = {asset["canonical_source_key"]: [] for asset in assets}
-    prominent_face_time = 0.0
-    max_share_seconds = float(policy["max_asset_screen_share"]) * duration
-    max_face_seconds = float(policy["max_prominent_face_screen_share"]) * duration
+    selection_theme = theme or str((timeline_plan or {}).get("theme", ""))
+    capacity_contract = _capacity_contract(assets, slot_records, duration, policy)
+    capacity_contract["preflight"] = _run_assignment_preflight(
+        assets,
+        slot_records,
+        policy,
+        duration,
+        spec,
+        selection_theme,
+        seed,
+        visual_profile,
+        energy_points,
+    )
+    assignment_state = _new_assignment_state(assets)
+    assignment_diagnostics: list[dict[str, Any]] = []
     prominent_threshold = float(policy["prominent_face_threshold"])
     timeline: list[dict[str, Any]] = []
 
@@ -1527,87 +1995,45 @@ def build_timeline(
         slot["_energy"] = energy
         desired_scale = _normalize_scale(str(slot.get("recommended_shot_scale", "medium")))
         desired_motion, desired_motion_label = _slot_motion_target(slot.get("recommended_motion"), energy)
-        previous = timeline[-1] if timeline else None
-        options: list[dict[str, Any]] = []
-        for asset in assets:
-            identity = asset["canonical_source_key"]
-            if usage_count[identity] >= int(policy["max_reuse_per_asset"]):
-                continue
-            if screen_time[identity] + output_duration > max_share_seconds + 0.02:
-                continue
-            occurrences = output_occurrences[identity]
-            if occurrences:
-                last_index, _, last_end = occurrences[-1]
-                if int(slot["index"]) - last_index < int(policy.get("min_repeat_gap_shots", 0)):
-                    continue
-                if _as_float(slot["start"]) - last_end < _as_float(policy.get("min_repeat_gap_seconds"), 0.0):
-                    continue
-            if (
-                _as_float(asset.get("face_risk"), 0.0) >= prominent_threshold
-                and prominent_face_time + output_duration > max_face_seconds + 0.02
-            ):
-                continue
-            window = _best_source_window(
-                asset,
-                output_duration,
-                energy,
-                source_intervals[identity],
-                policy,
-                seed,
-                int(slot["index"]),
-            )
-            if window is None:
-                continue
-            score, components = _candidate_score(
-                asset,
-                slot,
-                previous,
-                desired_scale,
-                desired_motion,
-                desired_motion_label,
-                spec,
-                theme or str((timeline_plan or {}).get("theme", "")),
-                seed,
-                visual_profile,
-            )
-            score += 0.10 * window["window_score"]
-            options.append({"asset": asset, "window": window, "score": score, "components": components})
-        used_sources = {key for key, count in usage_count.items() if count > 0}
-        if len(used_sources) < int(policy["min_unique_assets"]):
-            unused = [option for option in options if usage_count[option["asset"]["canonical_source_key"]] == 0]
-            if unused:
-                options = unused
-        used_scenes = {str(shot.get("scene_category") or "general") for shot in timeline}
-        if len(used_scenes) < int(policy["min_scene_categories"]):
-            novel_scene = [
-                option
-                for option in options
-                if str(option["asset"].get("scene_category") or "general") not in used_scenes
-                and option["components"].get("world_fit", 0.0) >= 0.50
-                and option["components"].get("visual_transition_match", 0.0) >= 0.40
-            ]
-            if novel_scene:
-                options = novel_scene
+        options, diagnostics = _assignment_options_for_slot(
+            assets,
+            slot,
+            assignment_state,
+            policy,
+            duration,
+            spec,
+            selection_theme,
+            seed,
+            visual_profile,
+            energy_points,
+            desired_scale,
+            desired_motion,
+            desired_motion_label,
+        )
         if not options:
             raise InsufficientMaterialError(
-                f"Material constraints became infeasible at slot {slot['index']} "
-                "(canonical reuse/share/gap, face budget, or non-overlapping usable segment exhausted)."
+                f"Material constraints became infeasible at slot {slot['index']}: "
+                f"rejection_counts={json.dumps(diagnostics['rejection_counts'], ensure_ascii=False, sort_keys=True)}; "
+                "shared capacity contract exhausted."
             )
-        options.sort(
-            key=lambda option: (option["score"], option["asset"]["canonical_source_key"]),
+        ranked_options = sorted(
+            options,
+            key=lambda option: (option["base_score"], option["asset"]["canonical_source_key"]),
             reverse=True,
         )
-        selected = options[0]
+        selected = _mark_selected_option(_select_option_with_tie_break(options))
         candidate_log = [
             {
                 "canonical_source_key": option["asset"]["canonical_source_key"],
                 "asset_id": option["asset"]["asset_id"],
-                "score": round(option["score"], 6),
+                "score": round(option["base_score"], 6),
+                "effective_score": round(option.get("score", option["base_score"]), 6),
+                "score_stage": "montage_final",
                 "score_components": option["components"],
                 "source_start": round(option["window"]["source_start"], 4),
                 "source_end": round(option["window"]["source_end"], 4),
             }
-            for option in options[:8]
+            for option in ranked_options[:8]
         ]
         grammar_influence = {
             "learned_shot_target_seconds": round(_as_float(slot.get("_learned_length"), output_duration), 4),
@@ -1630,15 +2056,19 @@ def build_timeline(
             candidate_log,
             grammar_influence,
         )
-        shot["_alternatives"] = options[1:8]
+        shot["_alternatives"] = [option for option in ranked_options if option is not selected][:7]
         timeline.append(shot)
-        identity = selected["asset"]["canonical_source_key"]
-        usage_count[identity] += 1
-        screen_time[identity] += output_duration
-        output_occurrences[identity].append((int(slot["index"]), float(slot["start"]), float(slot["end"])))
-        source_intervals[identity].append((selected["window"]["source_start"], selected["window"]["source_end"]))
-        if _as_float(selected["asset"].get("face_risk"), 0.0) >= prominent_threshold:
-            prominent_face_time += output_duration
+        _commit_assignment_state(assignment_state, selected, slot, policy)
+        assignment_diagnostics.append({
+            **diagnostics,
+            "selected_asset_id": selected["asset"].get("asset_id"),
+            "selected_canonical_source_key": selected["asset"]["canonical_source_key"],
+        })
+    capacity_contract["assignment"] = {
+        "status": "passed",
+        "assigned_slots": len(assignment_diagnostics),
+        "slots": assignment_diagnostics,
+    }
 
     before_repair = timeline_diversity_issues(timeline)
     repairs: list[dict[str, Any]] = []
@@ -1842,6 +2272,7 @@ def build_timeline(
         "timeline_plan_digest": slot_digest,
         "timeline_plan_applied": timeline_plan is not None or slots is not None,
         "content_policy": policy,
+        "capacity_contract": capacity_contract,
         "visual_style_profile": visual_profile,
         "visual_sequence_consistency": sequence_consistency,
         "sufficiency": {
@@ -1892,6 +2323,26 @@ def _eq_values(style_profile: dict[str, Any]) -> tuple[float, float, float]:
     return brightness, saturation, contrast
 
 
+def _colorbalance_filter(balance: Mapping[str, Any]) -> str:
+    """Build the bounded colorbalance filter used by the renderer.
+
+    ``pl=1`` is intentionally not an option here: the preserve-lightness path
+    produced the verified yellow-subject gray-fill/yellow-edge artifact in the
+    v1.4.3 production evidence.  Keeping this in one helper makes the
+    renderer contract directly regression-testable without changing the
+    surrounding grade policy.
+    """
+
+    return (
+        "colorbalance="
+        f"rs={_as_float(balance.get('rs')):.4f}:gs={_as_float(balance.get('gs')):.4f}:"
+        f"bs={_as_float(balance.get('bs')):.4f}:rm={_as_float(balance.get('rm')):.4f}:"
+        f"gm={_as_float(balance.get('gm')):.4f}:bm={_as_float(balance.get('bm')):.4f}:"
+        f"rh={_as_float(balance.get('rh')):.4f}:gh={_as_float(balance.get('gh')):.4f}:"
+        f"bh={_as_float(balance.get('bh')):.4f}:pl=0"
+    )
+
+
 def render_timeline(
     plan: dict[str, Any],
     bgm_path: str | Path,
@@ -1927,6 +2378,7 @@ def render_timeline(
     if duration <= 0:
         duration = max(_as_float(shot.get("output_end"), 0.0) for shot in shots)
     expected_start = 0.0
+    source_trim_stages: list[dict[str, Any]] = []
     for index, shot in enumerate(shots):
         source = Path(str(shot.get("local_path") or "")).expanduser().resolve()
         if not source.is_file():
@@ -1945,6 +2397,17 @@ def render_timeline(
             raise MontageError(
                 f"Shot {index} source interval is too short; refusing to freeze-pad the missing duration."
             )
+        source_trim_stages.append(
+            {
+                "shot_index": index,
+                "source_start_seconds": round(_as_float(shot.get("source_start"), 0.0), 6),
+                "source_end_seconds": round(_as_float(shot.get("source_end"), 0.0), 6),
+                "source_interval_seconds": round(source_duration, 6),
+                "planned_output_seconds": round(output_duration, 6),
+                "speed": round(speed, 6),
+                "speed_adjusted_required_seconds": round(output_duration * speed, 6),
+            }
+        )
     if abs(expected_start - duration) > max(0.08, duration * 0.005):
         raise MontageError(
             f"Edit plan covers {expected_start:.4f}s but declares {duration:.4f}s."
@@ -1997,6 +2460,42 @@ def render_timeline(
         render_frame_counts[index] += left_extension
         render_frame_counts[index + 1] += right_extension
     render_durations = [value / fps for value in render_frame_counts]
+    duration_instrumentation = {
+        "schema_version": "duration-instrumentation.1",
+        "status": "instrumented",
+        "stages": {
+            "planned_timeline": {
+                "declared_duration_seconds": round(duration, 6),
+                "sum_shot_output_seconds": round(sum(_as_float(shot.get("output_duration"), 0.0) for shot in shots), 6),
+                "last_output_end_seconds": round(expected_start, 6),
+                "shot_count": len(shots),
+            },
+            "source_trim": {
+                "shots": source_trim_stages,
+                "sum_source_interval_seconds": round(sum(item["source_interval_seconds"] for item in source_trim_stages), 6),
+                "sum_speed_adjusted_required_seconds": round(sum(item["speed_adjusted_required_seconds"] for item in source_trim_stages), 6),
+            },
+            "frame_grid": {
+                "fps": fps,
+                "total_frame_count": total_frame_count,
+                "base_frame_counts": base_frame_counts,
+                "base_duration_seconds": round(sum(base_frame_counts) / fps, 6),
+                "transition_frame_counts": transition_frame_counts,
+                "render_frame_counts": render_frame_counts,
+                "render_duration_seconds": round(sum(render_durations), 6),
+            },
+            "filtergraph": {
+                "expected_frame_count": total_frame_count,
+                "expected_duration_seconds": round(total_frame_count / fps, 6),
+                "transition_types": transition_types,
+                "transition_durations_seconds": [round(value, 6) for value in transition_durations],
+                "status": "constructed",
+            },
+            "ffmpeg_encode": {"status": "pending"},
+            "encoded_output": {"status": "pending"},
+        },
+    }
+    plan["duration_instrumentation"] = duration_instrumentation
 
     part_suffix = output.suffix if output.suffix else ".mp4"
     part = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.part{part_suffix}")
@@ -2087,12 +2586,7 @@ def render_timeline(
             shot_contrast = _as_float(grade.get("contrast"), contrast)
             balance = grade["colorbalance"]
             if _as_float(grade.get("strength"), 0.0) > 0.01:
-                grade_filters.append(
-                    "colorbalance="
-                    f"rs={balance['rs']:.4f}:gs={balance['gs']:.4f}:bs={balance['bs']:.4f}:"
-                    f"rm={balance['rm']:.4f}:gm={balance['gm']:.4f}:bm={balance['bm']:.4f}:"
-                    f"rh={balance['rh']:.4f}:gh={balance['gh']:.4f}:bh={balance['bh']:.4f}:pl=1"
-                )
+                grade_filters.append(_colorbalance_filter(balance))
         suffix = ",".join(
             [
                     f"fps={fps}",
@@ -2182,13 +2676,33 @@ def render_timeline(
     try:
         process = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if process.returncode != 0:
+            duration_instrumentation["stages"]["ffmpeg_encode"] = {
+                "status": "failed",
+                "returncode": process.returncode,
+                "stderr_tail": process.stderr.splitlines()[-12:],
+            }
             tail = "\n".join(process.stderr.splitlines()[-30:])
             raise MontageError(f"FFmpeg render failed:\n{tail}")
         if not part.is_file() or part.stat().st_size < 1024:
+            duration_instrumentation["stages"]["ffmpeg_encode"] = {
+                "status": "failed",
+                "returncode": process.returncode,
+                "reason": "missing_or_empty_part",
+            }
             raise MontageError("FFmpeg returned success but the atomic part file is missing or empty.")
+        duration_instrumentation["stages"]["ffmpeg_encode"] = {
+            "status": "completed",
+            "returncode": process.returncode,
+            "part_size_bytes": part.stat().st_size,
+        }
         if output.exists() and not overwrite:
             raise MontageError(f"Output appeared during rendering and was not overwritten: {output}")
         os.replace(part, output)
+        duration_instrumentation["stages"]["encoded_output"] = {
+            "status": "pending_validation",
+            "path": str(output),
+            "size_bytes": output.stat().st_size,
+        }
     except Exception:
         part.unlink(missing_ok=True)
         raise

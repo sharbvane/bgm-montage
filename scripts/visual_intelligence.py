@@ -24,6 +24,7 @@ import numpy as np
 ENGINE_VERSION = "1.3.0"
 PROFILE_SCHEMA_VERSION = "1.3"
 ASSET_ANALYSIS_SCHEMA_VERSION = 2
+FEATURE_METADATA_SCHEMA_VERSION = "metadata-contract.1"
 
 
 _STOPWORDS = {
@@ -181,6 +182,135 @@ def english_terms(value: Any) -> list[str]:
         if chinese in text:
             terms.extend(mapped)
     return _unique(term for term in terms if term not in _STOPWORDS)
+
+
+def build_feature_detail(
+    value: Any,
+    *,
+    available: bool,
+    source: str,
+    confidence: float,
+    evidence: Sequence[Any] | None = None,
+) -> dict[str, Any]:
+    """Return one additive metadata contract value.
+
+    Legacy flat fields remain the public compatibility surface.  This detail
+    record is the internal truth source for downstream scoring and QA, so an
+    unavailable feature cannot be mistaken for a low-but-valid score.
+    """
+
+    if isinstance(value, (list, tuple, set)):
+        normalized: Any = _unique(value, 32)
+    elif value in (None, "", "unknown", "unresolved", "none", "n/a"):
+        normalized = None
+    else:
+        normalized = str(value).strip().lower()
+    has_value = bool(normalized) if not isinstance(normalized, list) else bool(normalized)
+    return {
+        "value": normalized,
+        "available": bool(available and has_value),
+        "source": str(source or "unknown"),
+        "confidence": round(_clamp(confidence), 4),
+        "schema_version": FEATURE_METADATA_SCHEMA_VERSION,
+        "evidence": _unique(evidence or [], 12),
+    }
+
+
+def _normalize_feature_detail(raw: Any, key: str) -> dict[str, Any] | None:
+    if not isinstance(raw, Mapping):
+        return None
+    value = raw.get("value")
+    if value is None and key in {"world", "time_weather", "camera_language"}:
+        value = raw.get("values")
+    if value is None and key == "shot_scale":
+        value = raw.get("shot_scale")
+    detail = build_feature_detail(
+        value,
+        available=bool(raw.get("available")),
+        source=str(raw.get("source") or raw.get("provenance") or "legacy_unknown"),
+        confidence=_clamp(raw.get("confidence"), 0.0, 1.0),
+        evidence=raw.get("evidence") if isinstance(raw.get("evidence"), list) else [],
+    )
+    detail["schema_version"] = str(raw.get("schema_version") or FEATURE_METADATA_SCHEMA_VERSION)
+    return detail
+
+
+def metadata_feature_details(
+    asset: Mapping[str, Any],
+    features: Mapping[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Resolve explicit metadata details, then make legacy availability explicit."""
+
+    quality = asset.get("quality") if isinstance(asset.get("quality"), Mapping) else {}
+    visual = quality.get("visual_features") if isinstance(quality.get("visual_features"), Mapping) else {}
+    explicit = asset.get("metadata_features") if isinstance(asset.get("metadata_features"), Mapping) else {}
+    if not explicit and isinstance(quality.get("metadata_features"), Mapping):
+        explicit = quality["metadata_features"]
+    features = features or {}
+    filename = asset.get("filename_semantics") if isinstance(asset.get("filename_semantics"), Mapping) else {}
+    filename_terms = set(str(item).lower() for item in filename.get("terms", []) if item)
+
+    details: dict[str, dict[str, Any]] = {}
+    for key in ("shot_scale", "world", "time_weather", "camera_language", "motion"):
+        raw = explicit.get(key) or explicit.get(f"{key}_detail") or visual.get(f"{key}_detail")
+        detail = _normalize_feature_detail(raw, key)
+        if detail is not None:
+            details[key] = detail
+            continue
+
+        if key == "shot_scale":
+            lightweight = asset.get("lightweight_visual") if isinstance(asset.get("lightweight_visual"), Mapping) else {}
+            light_value = lightweight.get("shot_scale")
+            legacy_value = asset.get("shot_scale") or visual.get("shot_scale")
+            if light_value:
+                details[key] = build_feature_detail(
+                    light_value, available=True, source="legacy_lightweight_visual", confidence=0.55,
+                    evidence=["lightweight_visual"],
+                )
+            else:
+                details[key] = build_feature_detail(
+                    legacy_value, available=False, source="legacy_field", confidence=0.0,
+                    evidence=["legacy_flat_field"],
+                )
+        elif key == "world":
+            values = list(features.get("world_families") or [])
+            details[key] = build_feature_detail(
+                values,
+                available=bool(values),
+                source="filename" if values and filename_terms else "legacy_tags_or_visual" if values else "unavailable",
+                confidence=0.55 if values and filename_terms else 0.35 if values else 0.0,
+                evidence=["filename_semantics"] if values and filename_terms else ["tags_or_visual_features"] if values else [],
+            )
+        elif key == "time_weather":
+            values = _unique([*(features.get("time_of_day") or []), *(features.get("weather") or [])], 16)
+            details[key] = build_feature_detail(
+                values,
+                available=bool(values),
+                source="filename" if values and filename_terms else "legacy_tags_or_visual" if values else "unavailable",
+                confidence=0.55 if values and filename_terms else 0.35 if values else 0.0,
+                evidence=["filename_semantics"] if values and filename_terms else ["tags_or_visual_features"] if values else [],
+            )
+        elif key == "camera_language":
+            capture = list(features.get("capture") or [])
+            motion_type = str(features.get("motion_type") or "unknown")
+            value = capture or (motion_type if motion_type not in {"", "unknown"} else None)
+            details[key] = build_feature_detail(
+                value,
+                available=bool(value),
+                source="filename_or_motion" if value and filename_terms else "motion_signals" if value else "unavailable",
+                confidence=0.55 if value else 0.0,
+                evidence=["filename_semantics", "motion_signals"] if value and filename_terms else ["motion_signals"] if value else [],
+            )
+        else:
+            motion_type = str(features.get("motion_type") or "unknown")
+            details[key] = build_feature_detail(
+                motion_type,
+                available=motion_type not in {"", "unknown"},
+                source="motion_signals" if motion_type not in {"", "unknown"} else "unavailable",
+                confidence=0.55 if motion_type not in {"", "unknown"} else 0.0,
+                evidence=["motion_signals"] if motion_type not in {"", "unknown"} else [],
+            )
+    return details
 
 
 def _proper_location_phrases(text: str) -> list[str]:
@@ -710,7 +840,12 @@ def asset_visual_features(asset: Mapping[str, Any]) -> dict[str, Any]:
     quality = asset.get("quality") if isinstance(asset.get("quality"), Mapping) else {}
     cached = quality.get("visual_features") if isinstance(quality.get("visual_features"), Mapping) else {}
     if cached and all(key in cached for key in ("world_families", "motion_type", "mean_hsv", "aesthetic_score")):
-        return dict(cached)
+        features = dict(cached)
+        details = metadata_feature_details(asset, features)
+        if details.get("shot_scale", {}).get("value"):
+            features["shot_scale"] = details["shot_scale"]["value"]
+        features["feature_details"] = details
+        return features
     visual = quality.get("visual_analysis") if isinstance(quality.get("visual_analysis"), Mapping) else {}
     tags = " ".join(
         str(value)
@@ -737,7 +872,7 @@ def asset_visual_features(asset: Mapping[str, Any]) -> dict[str, Any]:
     ).lower()
     hsv = asset.get("mean_hsv") if isinstance(asset.get("mean_hsv"), Mapping) else quality.get("mean_hsv", {})
     texture = [name for name, vocab in _TEXTURE_TERMS.items() if any(term in joined for term in vocab)]
-    return {
+    features = {
         "world_families": _world_families(joined),
         "world_groups": _unique(_WORLD_GROUP.get(item, item) for item in _world_families(joined)),
         "time_of_day": _unique(time_terms),
@@ -755,16 +890,25 @@ def asset_visual_features(asset: Mapping[str, Any]) -> dict[str, Any]:
         "visual_impact_score": _clamp(visual.get("visual_impact_score", 0.45)),
         "ordinary_travelogue_risk": _clamp(visual.get("ordinary_travelogue_risk", 0.45)),
     }
+    details = metadata_feature_details(asset, features)
+    if details.get("shot_scale", {}).get("value"):
+        features["shot_scale"] = details["shot_scale"]["value"]
+    features["feature_details"] = details
+    return features
 
 
 def asset_profile_fit(asset: Mapping[str, Any], profile: Mapping[str, Any]) -> dict[str, float]:
     features = asset_visual_features(asset)
+    details = features.get("feature_details") if isinstance(features.get("feature_details"), Mapping) else {}
     preferred = set((profile.get("world_model") or {}).get("preferred_families") or [])
     preferred_groups = set((profile.get("world_model") or {}).get("preferred_groups") or [])
     worlds = set(features["world_families"])
     groups = set(features["world_groups"])
+    world_available = bool((details.get("world") or {}).get("available"))
     if not preferred:
         world = 0.62
+    elif not world_available:
+        world = 0.42
     elif preferred & worlds:
         world = 1.0
     elif preferred_groups & groups:
@@ -777,12 +921,14 @@ def asset_profile_fit(asset: Mapping[str, Any], profile: Mapping[str, Any]) -> d
     desired_time = set(desired_terms.get("lighting") or [])
     desired_weather = set(desired_terms.get("weather") or [])
     time_weather = 0.62
+    time_weather_available = bool((details.get("time_weather") or {}).get("available"))
     if desired_time or desired_weather:
         overlap = bool(desired_time & set(features["time_of_day"])) or bool(desired_weather & set(features["weather"]))
         time_weather = 1.0 if overlap else 0.28 if features["time_of_day"] or features["weather"] else 0.46
     desired_capture = set(desired_terms.get("capture") or [])
     desired_motion = set(desired_terms.get("motion") or [])
     camera = 0.62
+    camera_available = bool((details.get("camera_language") or {}).get("available"))
     if desired_capture or desired_motion:
         camera = 1.0 if desired_capture & set(features["capture"]) else 0.48
         if any(term.replace(" ", "_") in features["motion_type"] for term in desired_motion):
@@ -794,6 +940,9 @@ def asset_profile_fit(asset: Mapping[str, Any], profile: Mapping[str, Any]) -> d
         "total": round(total, 5), "world": round(world, 5), "color": round(color, 5),
         "time_weather": round(time_weather, 5), "camera_language": round(camera, 5),
         "aesthetic": round(aesthetic, 5), "cinematic": round(features["cinematic_score"], 5),
+        "world_available": float(world_available),
+        "time_weather_available": float(time_weather_available),
+        "camera_language_available": float(camera_available),
     }
 
 
@@ -808,9 +957,22 @@ def _pair_color_match(left: Mapping[str, Any], right: Mapping[str, Any]) -> floa
     return _clamp(1.0 - hue_weight * hue_distance - 0.38 * abs(ls - rs) - 0.48 * abs(lv - rv))
 
 
-def transition_match(previous: Mapping[str, Any] | None, current: Mapping[str, Any], profile: Mapping[str, Any]) -> dict[str, float]:
+def transition_match(previous: Mapping[str, Any] | None, current: Mapping[str, Any], profile: Mapping[str, Any]) -> dict[str, Any]:
     if previous is None:
-        return {"total": 0.55, "motion": 0.55, "scale": 0.55, "color": 0.55, "world": 0.55, "texture": 0.55, "composition": 0.55}
+        return {
+            "total": 0.55,
+            "effective_total": 0.55,
+            "effective_weight_sum": 1.0,
+            "full_weight_sum": 1.0,
+            "missing_dimensions": [],
+            "component_availability": {"motion": True, "scale": True, "color": True, "world": True, "texture": True, "composition": True},
+            "motion": 0.55,
+            "scale": 0.55,
+            "color": 0.55,
+            "world": 0.55,
+            "texture": 0.55,
+            "composition": 0.55,
+        }
     left, right = asset_visual_features(previous), asset_visual_features(current)
     ld, rd = left["motion_direction"], right["motion_direction"]
     lt, rt = left["motion_type"], right["motion_type"]
@@ -834,9 +996,40 @@ def transition_match(previous: Mapping[str, Any] | None, current: Mapping[str, A
     textures_left, textures_right = set(left["texture_families"]), set(right["texture_families"])
     texture = 1.0 if textures_left & textures_right else 0.48 if not textures_left or not textures_right else 0.22
     composition = _clamp(1.0 - abs(left["composition_quality_score"] - right["composition_quality_score"]) * 0.75)
-    total = _clamp(0.24 * motion + 0.13 * scale + 0.21 * color + 0.20 * world + 0.13 * texture + 0.09 * composition)
+    legacy_total = _clamp(0.24 * motion + 0.13 * scale + 0.21 * color + 0.20 * world + 0.13 * texture + 0.09 * composition)
+    details = {
+        "motion": left.get("feature_details", {}).get("motion", {}) if isinstance(left.get("feature_details"), Mapping) else {},
+        "scale": left.get("feature_details", {}).get("shot_scale", {}) if isinstance(left.get("feature_details"), Mapping) else {},
+        "world": left.get("feature_details", {}).get("world", {}) if isinstance(left.get("feature_details"), Mapping) else {},
+    }
+    right_details = right.get("feature_details", {}) if isinstance(right.get("feature_details"), Mapping) else {}
+    component_availability = {
+        "motion": bool(details["motion"].get("available")) and bool((right_details.get("motion") or {}).get("available")),
+        "scale": bool(details["scale"].get("available")) and bool((right_details.get("shot_scale") or {}).get("available")),
+        "color": all(
+            key in left.get("mean_hsv", {}) and key in right.get("mean_hsv", {})
+            for key in ("hue_degrees", "saturation", "value")
+        ),
+        "world": bool(details["world"].get("available")) and bool((right_details.get("world") or {}).get("available")),
+        "texture": bool(textures_left) and bool(textures_right),
+        "composition": "composition_quality_score" in left and "composition_quality_score" in right,
+    }
+    values = {"motion": motion, "scale": scale, "color": color, "world": world, "texture": texture, "composition": composition}
+    weights = {"motion": 0.24, "scale": 0.13, "color": 0.21, "world": 0.20, "texture": 0.13, "composition": 0.09}
+    effective_weight_sum = sum(weight for key, weight in weights.items() if component_availability[key])
+    effective_total = (
+        _clamp(sum(weights[key] * values[key] for key in weights if component_availability[key]) / effective_weight_sum)
+        if effective_weight_sum
+        else 0.0
+    )
     return {
-        "total": round(total, 5), "motion": round(motion, 5), "scale": round(scale, 5),
+        "total": round(legacy_total, 5),
+        "effective_total": round(effective_total, 5),
+        "effective_weight_sum": round(effective_weight_sum, 5),
+        "full_weight_sum": 1.0,
+        "missing_dimensions": [key for key, available in component_availability.items() if not available],
+        "component_availability": component_availability,
+        "motion": round(motion, 5), "scale": round(scale, 5),
         "color": round(color, 5), "world": round(world, 5), "texture": round(texture, 5),
         "composition": round(composition, 5),
     }
@@ -848,32 +1041,84 @@ def evaluate_sequence_consistency(shots: Sequence[Mapping[str, Any]], profile: M
     features = [asset_visual_features(shot) for shot in shots]
     pairs = [transition_match(shots[index - 1], shots[index], profile) for index in range(1, len(shots))]
     profile_fits = [asset_profile_fit(shot, profile) for shot in shots]
-    pair_average = float(np.mean([item["total"] for item in pairs])) if pairs else 1.0
-    world_average = float(np.mean([item["world"] for item in profile_fits]))
-    color_average = float(np.mean([item["color"] for item in profile_fits]))
-    time_average = float(np.mean([item["time_weather"] for item in profile_fits]))
-    camera_average = float(np.mean([item["camera_language"] for item in profile_fits]))
-    overall = _clamp(0.28 * pair_average + 0.25 * world_average + 0.20 * color_average + 0.14 * time_average + 0.13 * camera_average)
+    detail_keys = ("shot_scale", "world", "time_weather", "camera_language", "motion")
+    coverage: dict[str, dict[str, Any]] = {}
+    for key in detail_keys:
+        available = sum(
+            bool((feature.get("feature_details", {}).get(key) or {}).get("available"))
+            for feature in features
+            if isinstance(feature.get("feature_details"), Mapping)
+        )
+        coverage[key] = {
+            "available_shots": available,
+            "total_shots": len(features),
+            "coverage": round(available / max(1, len(features)), 4),
+        }
+    coverage["world"]["available_shots"] = sum(bool(item.get("world_available")) for item in profile_fits)
+    coverage["time_weather"]["available_shots"] = sum(bool(item.get("time_weather_available")) for item in profile_fits)
+    coverage["camera_language"]["available_shots"] = sum(bool(item.get("camera_language_available")) for item in profile_fits)
+    for key in ("world", "time_weather", "camera_language"):
+        coverage[key]["coverage"] = round(coverage[key]["available_shots"] / max(1, len(features)), 4)
+    pair_available = [
+        index
+        for index in range(1, len(features))
+        if any(
+            bool((features[index - 1].get("feature_details", {}).get(key) or {}).get("available"))
+            or bool((features[index].get("feature_details", {}).get(key) or {}).get("available"))
+            for key in detail_keys
+            if isinstance(features[index - 1].get("feature_details"), Mapping)
+            and isinstance(features[index].get("feature_details"), Mapping)
+        )
+    ]
+    pair_values = [pairs[index - 1].get("effective_total", pairs[index - 1]["total"]) for index in pair_available]
+    pair_average = float(np.mean(pair_values)) if pair_values else 0.0
+    dimension_values = {
+        "pair": pair_average,
+        "world": float(np.mean([item["world"] for index, item in enumerate(profile_fits) if item.get("world_available")])) if any(item.get("world_available") for item in profile_fits) else 0.0,
+        "color": float(np.mean([item["color"] for item, feature in zip(profile_fits, features) if feature.get("mean_hsv")])) if any(feature.get("mean_hsv") for feature in features) else 0.0,
+        "time_weather": float(np.mean([item["time_weather"] for item in profile_fits if item.get("time_weather_available")])) if any(item.get("time_weather_available") for item in profile_fits) else 0.0,
+        "camera_language": float(np.mean([item["camera_language"] for item in profile_fits if item.get("camera_language_available")])) if any(item.get("camera_language_available") for item in profile_fits) else 0.0,
+    }
+    dimension_weights = {"pair": 0.28, "world": 0.25, "color": 0.20, "time_weather": 0.14, "camera_language": 0.13}
+    dimension_available = {
+        "pair": bool(pair_values),
+        "world": any(item.get("world_available") for item in profile_fits),
+        "color": any(feature.get("mean_hsv") for feature in features),
+        "time_weather": any(item.get("time_weather_available") for item in profile_fits),
+        "camera_language": any(item.get("camera_language_available") for item in profile_fits),
+    }
+    active_weight = sum(weight for key, weight in dimension_weights.items() if dimension_available[key])
+    overall = _clamp(
+        sum(dimension_weights[key] * dimension_values[key] for key in dimension_weights if dimension_available[key])
+        / max(active_weight, 1e-9)
+    ) if active_weight else 0.0
     threshold = float((profile.get("sequence") or {}).get("minimum_consistency", 0.48))
     confidence = float((profile.get("sequence") or {}).get("profile_confidence", 0.0))
-    evaluated = confidence >= 0.35 and any(item["world_families"] or item["mean_hsv"] for item in features)
+    evaluated = confidence >= 0.35 and active_weight > 0.0
+    evidence_sufficient = active_weight > 0.0
     failures: list[str] = []
     if evaluated and overall < threshold:
         failures.append(f"sequence consistency {overall:.4f} < {threshold:.4f}")
-    severe_pairs = [index + 1 for index, item in enumerate(pairs) if item["total"] < 0.24]
+    severe_pairs = [index for index in pair_available if pairs[index - 1].get("effective_total", pairs[index - 1]["total"]) < 0.24]
     if evaluated and len(severe_pairs) > max(1, math.ceil(len(pairs) * 0.18)):
         failures.append("too many severe visual discontinuities")
     world_counts = Counter(family for item in features for family in item["world_families"][:1])
     return {
         "evaluated": evaluated,
+        "evidence_sufficient": evidence_sufficient,
+        "status": "evaluated" if evaluated else "insufficient_evidence",
         "passed": not failures,
         "score": round(overall, 4),
         "threshold": round(threshold, 4),
         "pair_match_average": round(pair_average, 4),
-        "world_fit_average": round(world_average, 4),
-        "color_fit_average": round(color_average, 4),
-        "time_weather_fit_average": round(time_average, 4),
-        "camera_language_fit_average": round(camera_average, 4),
+        "world_fit_average": round(dimension_values["world"], 4),
+        "color_fit_average": round(dimension_values["color"], 4),
+        "time_weather_fit_average": round(dimension_values["time_weather"], 4),
+        "camera_language_fit_average": round(dimension_values["camera_language"], 4),
+        "coverage": coverage,
+        "dimension_available": dimension_available,
+        "unavailable_dimensions": [key for key, value in dimension_available.items() if not value],
+        "effective_weight_sum": round(active_weight, 4),
         "severe_pair_right_indices": severe_pairs,
         "dominant_world_families": [name for name, _ in world_counts.most_common(5)],
         "failures": failures,

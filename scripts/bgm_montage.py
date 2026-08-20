@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bgm-montage v1.4.3 unified reference-style, BGM-driven montage entry."""
+"""bgm-montage v1.4.4 unified reference-style, BGM-driven montage entry."""
 
 from __future__ import annotations
 
@@ -573,7 +573,7 @@ def _export_jianying_draft(
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    """Run the v1.4.3 pipeline, checkpointing every reusable stage."""
+    """Run the v1.4.4 pipeline, checkpointing every reusable stage."""
 
     load_dotenv(PROJECT_ROOT / ".env", override=False)
     source_provider = str(_arg(args, "source_provider", "youtube-first")).lower()
@@ -672,7 +672,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     run_report_path = run_dir / "run_report.json"
     report: dict[str, Any] = {
         "schema_version": "1.4.3",
-        "skill_version": "1.4.3",
+            "skill_version": "1.4.4",
         "run_id": run_id,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "resumed": resume,
@@ -1256,7 +1256,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", action="version", version="bgm-montage 1.4.3")
+    parser.add_argument("--version", action="version", version="bgm-montage 1.4.4")
     parser.add_argument("--bgm", required=True, help="Input BGM/audio file")
     parser.add_argument("--theme", required=True, help="Theme used to generate English visual search queries")
     parser.add_argument("--duration", required=True, type=float, help="Requested output duration in seconds")

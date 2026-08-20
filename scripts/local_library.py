@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,10 +32,17 @@ from pixabay_pipeline import (
     _video_quality,
     evaluate_selected_sufficiency,
 )
-from visual_intelligence import analysis_cache_valid
+from visual_intelligence import (
+    FEATURE_METADATA_SCHEMA_VERSION,
+    asset_visual_features,
+    analysis_cache_valid,
+    build_feature_detail,
+    english_terms,
+    metadata_feature_details,
+)
 
 
-SCHEMA_VERSION = "1.4.3-local.1"
+SCHEMA_VERSION = "1.4.3-local.2"
 LIGHTWEIGHT_SCHEMA_VERSION = "1.4.3-light.1"
 LIGHTWEIGHT_FRAME_COUNT = 6
 INDEX_LOCK_TIMEOUT_SECONDS = 3600.0
@@ -231,6 +239,149 @@ def _tags(root: Path, path: Path) -> str:
     return " ".join(str(part).replace("_", " ").replace("-", " ") for part in parts)
 
 
+def _filename_semantics(root: Path, path: Path) -> dict[str, Any]:
+    """Extract cheap path semantics without claiming visual recognition."""
+
+    relative = path.relative_to(root)
+    raw_parts = [*relative.parts[:-1], relative.stem]
+    raw_text = " ".join(str(part).replace("_", " ").replace("-", " ") for part in raw_parts)
+    terms = [
+        term
+        for term in english_terms(raw_text)
+        if not re.fullmatch(r"(?:mmexport|clip|video|mov|img)?\d+", term.replace(" ", ""))
+        and not re.fullmatch(r"[a-f0-9]{8,}", term.replace(" ", ""))
+    ]
+    input_digest = hashlib.sha256(
+        json.dumps(raw_parts, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "raw": raw_text,
+        "terms": list(dict.fromkeys(terms))[:32],
+        "available": bool(terms),
+        "source": "filename",
+        "confidence": 0.62 if terms else 0.0,
+        "input_digest": input_digest,
+        "schema_version": FEATURE_METADATA_SCHEMA_VERSION,
+    }
+
+
+def _merge_semantic_tags(*groups: Sequence[Any]) -> list[str]:
+    values: list[str] = []
+    for group in groups:
+        for value in group:
+            text = str(value).strip().lower()
+            if text and text not in values:
+                values.append(text)
+    return values[:48]
+
+
+def _metadata_features(
+    *,
+    tags: str,
+    filename_semantics: Mapping[str, Any],
+    semantic_tags: Sequence[Any],
+    shot_scale: str,
+    shot_scale_detail: Mapping[str, Any],
+    quality: Mapping[str, Any] | None = None,
+    lightweight_visual: Mapping[str, Any] | None = None,
+    motion_direction: str = "unknown",
+    mean_hsv: Mapping[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    probe: dict[str, Any] = {
+        "tags": tags,
+        "filename_semantics": dict(filename_semantics),
+        "semantic_tags": list(semantic_tags),
+        "shot_scale": shot_scale,
+        "shot_scale_detail": dict(shot_scale_detail),
+        "quality": dict(quality or {}),
+        "lightweight_visual": dict(lightweight_visual or {}),
+        "motion_direction": motion_direction,
+        "mean_hsv": dict(mean_hsv or {}),
+    }
+    features = asset_visual_features(probe)
+    details = metadata_feature_details(probe, features)
+    details["shot_scale"] = dict(shot_scale_detail)
+    return details
+
+
+def _metadata_refresh_needed(entry: Mapping[str, Any], filename: Mapping[str, Any]) -> bool:
+    if str(entry.get("metadata_schema_version") or "") != FEATURE_METADATA_SCHEMA_VERSION:
+        return True
+    existing = entry.get("filename_semantics") if isinstance(entry.get("filename_semantics"), Mapping) else {}
+    if str(existing.get("input_digest") or "") != str(filename.get("input_digest") or ""):
+        return True
+    details = entry.get("metadata_features")
+    if not isinstance(details, Mapping):
+        return True
+    return not all(isinstance(details.get(key), Mapping) for key in ("shot_scale", "world", "time_weather", "camera_language", "motion"))
+
+
+def _refresh_metadata_entry(
+    root: Path,
+    path: Path,
+    entry: Mapping[str, Any],
+    filename: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Refresh path-derived metadata without re-decoding the video."""
+
+    current = dict(entry)
+    tags = _tags(root, path)
+    filename = dict(filename or _filename_semantics(root, path))
+    lightweight = current.get("lightweight_visual") if isinstance(current.get("lightweight_visual"), Mapping) else {}
+    quality = current.get("quality") if isinstance(current.get("quality"), Mapping) else {}
+    visual_features = quality.get("visual_features") if isinstance(quality.get("visual_features"), Mapping) else {}
+    visual_scale = str(lightweight.get("shot_scale") or "").strip().lower()
+    legacy_scale = str(current.get("shot_scale") or visual_features.get("shot_scale") or "medium").strip().lower()
+    shot_scale = visual_scale or legacy_scale
+    shot_scale_detail = build_feature_detail(
+        shot_scale,
+        available=bool(visual_scale),
+        source="lightweight_visual" if visual_scale else "legacy_field",
+        confidence=0.72 if visual_scale else 0.0,
+        evidence=["lightweight_visual"] if visual_scale else ["legacy_flat_field"],
+    )
+    scene = current.get("scene_category") or quality.get("scene_category") or _scene_category(tags, None)
+    shot_type = "close_up" if shot_scale == "close_up" else "wide" if "wide" in shot_scale else _infer_shot_type(tags)
+    semantic_tags = _merge_semantic_tags(
+        _semantic_tags(tags, scene, shot_type, shot_scale, (lightweight.get("subject_class"), lightweight.get("motion_label"))),
+        filename.get("terms") or [],
+    )
+    metadata = _metadata_features(
+        tags=tags,
+        filename_semantics=filename,
+        semantic_tags=semantic_tags,
+        shot_scale=shot_scale,
+        shot_scale_detail=shot_scale_detail,
+        quality=quality,
+        lightweight_visual=lightweight,
+        motion_direction=str(current.get("motion_direction") or quality.get("motion_direction") or "unknown"),
+        mean_hsv=current.get("mean_hsv") if isinstance(current.get("mean_hsv"), Mapping) else quality.get("mean_hsv", {}),
+    )
+    updated_quality = dict(quality)
+    updated_visual = dict(visual_features)
+    if updated_visual:
+        updated_visual["shot_scale"] = shot_scale
+        updated_visual["shot_scale_detail"] = shot_scale_detail
+        updated_visual["feature_details"] = metadata
+        updated_quality["visual_features"] = updated_visual
+    current.update(
+        {
+            "tags": tags,
+            "filename_semantics": filename,
+            "metadata_features": metadata,
+            "metadata_schema_version": FEATURE_METADATA_SCHEMA_VERSION,
+            "semantic_tags": semantic_tags,
+            "scene_category": scene,
+            "shot_type": shot_type,
+            "shot_scale": shot_scale,
+            "shot_scale_detail": shot_scale_detail,
+            "quality": updated_quality,
+            "metadata_refresh": {"status": "refreshed", "reason": "path_or_schema_change"},
+        }
+    )
+    return current
+
+
 def _asset_id(identity: str) -> str:
     return "local-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
 
@@ -250,6 +401,7 @@ def _inventory_entry(
 ) -> dict[str, Any]:
     relative = path.relative_to(root).as_posix()
     tags = _tags(root, path)
+    filename_semantics = _filename_semantics(root, path)
     content_digest = str(content_fingerprint.get("digest") or "")
     asset_id = _asset_id(content_digest or relative.casefold())
     base = {
@@ -281,8 +433,38 @@ def _inventory_entry(
         return {**base, "available": False, "analysis_status": "failed", "failure_reason": str(exc)}
     light_quality = dict(lightweight.get("quality") or {})
     scene = lightweight.get("scene_category") or _scene_category(tags, None)
-    shot_scale = str(lightweight.get("shot_scale") or _infer_shot_scale(tags))
+    visual_scale = str(lightweight.get("shot_scale") or "").strip().lower()
+    shot_scale = visual_scale or _infer_shot_scale(tags)
+    shot_scale_detail = build_feature_detail(
+        shot_scale,
+        available=bool(visual_scale),
+        source="lightweight_visual" if visual_scale else "tag_fallback",
+        confidence=0.72 if visual_scale else 0.12,
+        evidence=["lightweight_visual"] if visual_scale else ["filename_or_tags"],
+    )
     shot_type = "close_up" if shot_scale == "close_up" else "wide" if "wide" in shot_scale else _infer_shot_type(tags)
+    semantic_tags = _merge_semantic_tags(
+        _semantic_tags(
+            tags,
+            scene,
+            shot_type,
+            shot_scale,
+            (lightweight.get("subject_class"), lightweight.get("motion_label")),
+        ),
+        filename_semantics.get("terms") or [],
+    )
+    metadata = _metadata_features(
+        tags=tags,
+        filename_semantics=filename_semantics,
+        semantic_tags=semantic_tags,
+        shot_scale=shot_scale,
+        shot_scale_detail=shot_scale_detail,
+        quality=light_quality,
+        lightweight_visual=lightweight,
+        motion_direction=str(lightweight.get("motion_direction") or "unknown"),
+        mean_hsv=lightweight.get("mean_hsv") if isinstance(lightweight.get("mean_hsv"), Mapping) else {},
+    )
+    light_quality["metadata_features"] = metadata
     return {
         **base,
         "available": True,
@@ -306,16 +488,14 @@ def _inventory_entry(
         "quality": light_quality,
         "fingerprint": {"perceptual_hashes": list(lightweight.get("perceptual_hashes") or [])},
         "lightweight_visual": lightweight,
-        "semantic_tags": _semantic_tags(
-            tags,
-            scene,
-            shot_type,
-            shot_scale,
-            (lightweight.get("subject_class"), lightweight.get("motion_label")),
-        ),
+        "filename_semantics": filename_semantics,
+        "metadata_features": metadata,
+        "metadata_schema_version": FEATURE_METADATA_SCHEMA_VERSION,
+        "semantic_tags": semantic_tags,
         "scene_category": scene,
         "shot_type": shot_type,
         "shot_scale": shot_scale,
+        "shot_scale_detail": shot_scale_detail,
         "motion_score": float(lightweight.get("motion_score") or 0.0),
         "motion_direction": lightweight.get("motion_direction") or "unknown",
         "mean_hsv": dict(lightweight.get("mean_hsv") or {}),
@@ -326,6 +506,7 @@ def _inventory_entry(
 def _analyze_entry(root: Path, path: Path, previous: Mapping[str, Any] | None) -> dict[str, Any]:
     relative = path.relative_to(root).as_posix()
     tags = _tags(root, path)
+    filename_semantics = _filename_semantics(root, path)
     signature = _signature(path)
     content_fingerprint = dict((previous or {}).get("content_fingerprint") or _content_fingerprint(path))
     content_digest = str(content_fingerprint.get("digest") or "")
@@ -360,6 +541,44 @@ def _analyze_entry(root: Path, path: Path, previous: Mapping[str, Any] | None) -
     height = int(media.get("height") or 0)
     duration = float(media.get("duration_seconds") or 0.0)
     canonical = f"local-content:{content_digest or fingerprint.get('sha256') or asset_id}"
+    lightweight = base.get("lightweight_visual") if isinstance(base.get("lightweight_visual"), Mapping) else {}
+    visual_scale = str(lightweight.get("shot_scale") or "").strip().lower()
+    legacy_scale = str(
+        (quality.get("visual_features") or {}).get("shot_scale")
+        if isinstance(quality.get("visual_features"), Mapping)
+        else ""
+    ).strip().lower()
+    shot_scale = visual_scale or legacy_scale or _infer_shot_scale(tags)
+    shot_scale_detail = build_feature_detail(
+        shot_scale,
+        available=bool(visual_scale),
+        source="lightweight_visual" if visual_scale else "tag_fallback",
+        confidence=0.72 if visual_scale else 0.12,
+        evidence=["lightweight_visual"] if visual_scale else ["legacy_visual_or_tags"],
+    )
+    scene = quality.get("scene_category") or _scene_category(tags, None)
+    shot_type = "close_up" if shot_scale == "close_up" else "wide" if "wide" in shot_scale else _infer_shot_type(tags)
+    semantic_tags = _merge_semantic_tags(
+        _semantic_tags(tags, scene, shot_type, shot_scale),
+        filename_semantics.get("terms") or [],
+    )
+    visual_features = dict(quality.get("visual_features") or {}) if isinstance(quality.get("visual_features"), Mapping) else {}
+    visual_features["shot_scale"] = shot_scale
+    visual_features["shot_scale_detail"] = shot_scale_detail
+    metadata = _metadata_features(
+        tags=tags,
+        filename_semantics=filename_semantics,
+        semantic_tags=semantic_tags,
+        shot_scale=shot_scale,
+        shot_scale_detail=shot_scale_detail,
+        quality={**quality, "visual_features": visual_features},
+        lightweight_visual=lightweight,
+        motion_direction=str(quality.get("motion_direction") or "unknown"),
+        mean_hsv=quality.get("mean_hsv") if isinstance(quality.get("mean_hsv"), Mapping) else {},
+    )
+    visual_features["feature_details"] = metadata
+    quality["visual_features"] = visual_features
+    quality["metadata_features"] = metadata
     return {
         **base,
         "available": bool(quality.get("passed")),
@@ -376,15 +595,14 @@ def _analyze_entry(root: Path, path: Path, previous: Mapping[str, Any] | None) -
         "quality": quality,
         "media": media,
         "fingerprint": fingerprint,
-        "semantic_tags": _semantic_tags(
-            tags,
-            quality.get("scene_category"),
-            _infer_shot_type(tags),
-            _infer_shot_scale(tags),
-        ),
-        "scene_category": quality.get("scene_category"),
-        "shot_type": _infer_shot_type(tags),
-        "shot_scale": _infer_shot_scale(tags),
+        "filename_semantics": filename_semantics,
+        "metadata_features": metadata,
+        "metadata_schema_version": FEATURE_METADATA_SCHEMA_VERSION,
+        "semantic_tags": semantic_tags,
+        "scene_category": scene,
+        "shot_type": shot_type,
+        "shot_scale": shot_scale,
+        "shot_scale_detail": shot_scale_detail,
         "motion_score": float(quality.get("motion_score") or 0.5),
         "motion_direction": quality.get("motion_direction") or "unknown",
         "usable_segments": list(quality.get("usable_segments") or []),
@@ -394,12 +612,20 @@ def _analyze_entry(root: Path, path: Path, previous: Mapping[str, Any] | None) -
 def sync_local_library(
     library_root: str | os.PathLike[str],
     cache_root: str | os.PathLike[str],
+    *,
+    metadata_refresh_limit: int = 0,
 ) -> dict[str, Any]:
-    """Transactionally sync metadata and one persistent lightweight profile per file."""
+    """Transactionally sync the index without decoding the whole library.
+
+    Existing entries receive bounded path-metadata migration only when the
+    caller explicitly supplies a positive budget. New/changed files still get
+    their normal inventory profile.
+    """
 
     root = Path(library_root).expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Local library directory not found: {root}")
+    metadata_refresh_limit = max(0, int(metadata_refresh_limit))
     index_path = _index_path(root, Path(cache_root).expanduser().resolve())
     # ponytail: one catalog lock serializes cold sync; shard only after measured contention.
     with _exclusive_catalog_lock(index_path, timeout_seconds=INDEX_LOCK_TIMEOUT_SECONDS):
@@ -423,14 +649,25 @@ def sync_local_library(
         moved_paths: list[str] = []
         moved_source_keys: set[str] = set()
         light_analyzed_paths: list[str] = []
+        metadata_refreshed_paths: list[str] = []
+        metadata_deferred_paths: list[str] = []
+        metadata_refresh_budget_used = 0
         for path in files:
             relative = path.relative_to(root).as_posix()
             old = previous_by_relative.get(relative.casefold())
             signature = _signature(path)
+            filename_semantics = _filename_semantics(root, path)
             unchanged = bool(old and old.get("signature") == signature and _lightweight_valid(old))
             if unchanged:
                 entry = dict(old)
                 entry.update({"local_path": str(path.resolve()), "path": str(path.resolve())})
+                if _metadata_refresh_needed(entry, filename_semantics):
+                    if metadata_refresh_budget_used < metadata_refresh_limit:
+                        entry = _refresh_metadata_entry(root, path, entry, filename_semantics)
+                        metadata_refreshed_paths.append(relative)
+                        metadata_refresh_budget_used += 1
+                    else:
+                        metadata_deferred_paths.append(relative)
                 if entry.get("analysis_status") == "indexed" and not _deep_analysis_valid(entry):
                     entry["analysis_status"] = "inventory"
                 entries.append(entry)
@@ -460,6 +697,9 @@ def sync_local_library(
                         "tags": _tags(root, path),
                     }
                 )
+                if _metadata_refresh_needed(entry, filename_semantics):
+                    entry = _refresh_metadata_entry(root, path, entry, filename_semantics)
+                    metadata_refreshed_paths.append(relative)
                 moved += int(is_move)
                 if is_move:
                     moved_paths.append(relative)
@@ -493,6 +733,11 @@ def sync_local_library(
             "light_analyzed": len(light_analyzed_paths),
             "light_cache_hits": profiled - len(light_analyzed_paths),
             "light_cache_hit_rate": round((profiled - len(light_analyzed_paths)) / max(1, profiled), 6),
+            "metadata_refreshed": len(metadata_refreshed_paths),
+            "metadata_refreshed_paths": metadata_refreshed_paths,
+            "metadata_refresh_limit": metadata_refresh_limit,
+            "metadata_refresh_deferred": len(metadata_deferred_paths),
+            "metadata_refresh_deferred_paths": metadata_deferred_paths,
             "deep_analyzed": 0,
             "failed": failed,
             "added_paths": added_paths,
@@ -537,9 +782,18 @@ def _candidate(entry: Mapping[str, Any]) -> dict[str, Any]:
         "local_reuse_entry": entry,
         "canonical_source_id": entry.get("canonical_source_id"),
         "semantic_tags": list(entry.get("semantic_tags") or []),
+        "filename_semantics": dict(entry.get("filename_semantics") or {})
+        if isinstance(entry.get("filename_semantics"), Mapping)
+        else {},
+        "metadata_features": dict(entry.get("metadata_features") or {})
+        if isinstance(entry.get("metadata_features"), Mapping)
+        else {},
         "scene_category": entry.get("scene_category"),
         "shot_type": entry.get("shot_type"),
         "shot_scale": entry.get("shot_scale"),
+        "shot_scale_detail": dict(entry.get("shot_scale_detail") or {})
+        if isinstance(entry.get("shot_scale_detail"), Mapping)
+        else {},
         "motion_score_estimate": float(entry.get("motion_score") or 0.5),
         "face_content_risk": float(quality.get("face_content_risk") or 0.0),
         "historical_usage_count": int(entry.get("historical_usage_count") or 0),
@@ -580,6 +834,57 @@ def _indexed_entry(index: Mapping[str, Any], target: Mapping[str, Any]) -> dict[
         if digest and _content_digest(entry) == digest:
             return dict(entry)
     return None
+
+
+def refresh_local_library_metadata(
+    library_root: str | os.PathLike[str],
+    index_path: str | os.PathLike[str],
+    relative_paths: Sequence[str],
+    *,
+    limit: int = 64,
+) -> dict[str, Any]:
+    """Refresh cheap metadata for a bounded, already-ranked candidate set."""
+
+    root = Path(library_root).expanduser().resolve()
+    index_file = Path(index_path).expanduser().resolve()
+    requested = list(dict.fromkeys(str(path) for path in relative_paths))[: max(0, int(limit))]
+    if not requested:
+        return {**_load_index(index_file), "metadata_refreshed_paths": []}
+    with _exclusive_catalog_lock(index_file, timeout_seconds=INDEX_LOCK_TIMEOUT_SECONDS):
+        latest = _load_index(index_file)
+        by_relative = {
+            str(entry.get("relative_path") or "").casefold(): dict(entry)
+            for entry in latest.get("entries", [])
+            if isinstance(entry, Mapping) and entry.get("relative_path")
+        }
+        refreshed: list[str] = []
+        for relative in requested:
+            key = relative.casefold()
+            entry = by_relative.get(key)
+            path = root / Path(relative)
+            if not entry or not path.is_file():
+                continue
+            filename_semantics = _filename_semantics(root, path)
+            if _metadata_refresh_needed(entry, filename_semantics):
+                by_relative[key] = _refresh_metadata_entry(root, path, entry, filename_semantics)
+                refreshed.append(relative)
+        if refreshed:
+            latest["entries"] = [
+                by_relative.get(str(entry.get("relative_path") or "").casefold(), entry)
+                for entry in latest.get("entries", [])
+            ]
+            sync = dict(latest.get("sync") or {})
+            prior_paths = list(sync.get("metadata_refreshed_paths") or [])
+            sync.update(
+                {
+                    "metadata_refreshed": int(sync.get("metadata_refreshed") or 0) + len(refreshed),
+                    "metadata_refreshed_paths": list(dict.fromkeys([*prior_paths, *refreshed])),
+                    "metadata_migration_mode": "bounded_ranked_candidates",
+                }
+            )
+            latest.update({"schema_version": SCHEMA_VERSION, "updated_at": _utc_now(), "sync": sync})
+            _atomic_write_json(index_file, latest)
+        return {**latest, "metadata_refreshed_paths": refreshed, "index_path": str(index_file)}
 
 
 def _commit_deep_result(index_path: Path, analyzed: Mapping[str, Any]) -> dict[str, Any]:
@@ -642,7 +947,12 @@ def run_local_library_pipeline(
 ) -> dict[str, Any]:
     """Sync, coarse-rank the index, then expose only a bounded fine candidate set."""
 
-    sync = sync_local_library(library_root, cache_root)
+    # Production selection never performs an unbounded cache migration during
+    # the catalog sync. Only the already-ranked fine candidate set may be
+    # refreshed below.
+    sync = sync_local_library(library_root, cache_root, metadata_refresh_limit=0)
+    root = Path(library_root).expanduser().resolve()
+    index_path = Path(str(sync["index_path"]))
     min_long, min_short = sorted((int(min_resolution[0]), int(min_resolution[1])), reverse=True)
     entries = []
     for entry in sync.get("entries", []):
@@ -670,6 +980,41 @@ def run_local_library_pipeline(
         )
     slots = timeline_plan.get("slots", []) if isinstance(timeline_plan, Mapping) else list(timeline_plan or [])
     fine_limit = min(len(ranked), min(64, max(16, desired_count * 3, len(slots) * 2)))
+    metadata_candidates = []
+    for candidate in ranked[:fine_limit]:
+        entry = candidate.get("local_reuse_entry") if isinstance(candidate, Mapping) else None
+        relative = str(entry.get("relative_path") or "") if isinstance(entry, Mapping) else ""
+        path = root / Path(relative) if relative else None
+        if isinstance(entry, Mapping) and path and path.is_file() and _metadata_refresh_needed(
+            entry, _filename_semantics(root, path)
+        ):
+            metadata_candidates.append(relative)
+    if metadata_candidates:
+        refreshed_index = refresh_local_library_metadata(
+            root,
+            index_path,
+            metadata_candidates,
+            limit=fine_limit,
+        )
+        refreshed_by_relative = {
+            str(entry.get("relative_path") or "").casefold(): dict(entry)
+            for entry in refreshed_index.get("entries", [])
+            if isinstance(entry, Mapping) and entry.get("relative_path")
+        }
+        for index, candidate in enumerate(ranked):
+            entry = candidate.get("local_reuse_entry") if isinstance(candidate, Mapping) else None
+            relative = str(entry.get("relative_path") or "") if isinstance(entry, Mapping) else ""
+            updated = refreshed_by_relative.get(relative.casefold())
+            if updated:
+                ranked[index] = _candidate(updated)
+        sync["sync"].update(
+            {
+                "metadata_migration_mode": "bounded_ranked_candidates",
+                "metadata_candidate_count": len(metadata_candidates),
+                "metadata_refreshed_paths": list(refreshed_index.get("metadata_refreshed_paths") or []),
+            }
+        )
+        sync["entries"] = refreshed_index.get("entries", [])
     selection_signature = hashlib.sha256(
         json.dumps(
             {
@@ -701,8 +1046,6 @@ def run_local_library_pipeline(
 
     deep_analyzed = deep_reused = 0
     refreshed: list[dict[str, Any]] = []
-    root = Path(library_root).expanduser().resolve()
-    index_path = Path(str(sync["index_path"]))
     for candidate in fine_candidates:
         entry = candidate["local_reuse_entry"]
         analyzed, reused_after_lock = _deep_entry_transaction(root, index_path, entry)

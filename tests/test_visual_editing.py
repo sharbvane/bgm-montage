@@ -19,6 +19,7 @@ from visual_intelligence import (
     plan_visual_search_queries,
     transition_match,
 )
+from montage import _colorbalance_filter
 
 
 def _visual_quality(score: float, motion: str = "push_in") -> dict:
@@ -167,6 +168,24 @@ def test_visual_analysis_cache_invalidates_by_schema_engine_and_hash() -> None:
     assert analysis_cache_valid(current, "abc")
     assert not analysis_cache_valid(current, "def")
     assert not analysis_cache_valid({"analysis_cache": {"schema_version": 1, "engine_version": "1.2"}})
+
+
+def test_colorbalance_contract_disables_preserve_lightness_for_saturated_subjects() -> None:
+    filter_text = _colorbalance_filter(
+        {
+            "rs": -0.0123,
+            "gs": 0.0,
+            "bs": 0.0123,
+            "rm": -0.0088,
+            "gm": 0.0,
+            "bm": 0.0088,
+            "rh": -0.0052,
+            "gh": 0.0,
+            "bh": 0.0052,
+        }
+    )
+    assert filter_text.endswith(":pl=0")
+    assert ":pl=1" not in filter_text
 
 
 def test_edit_schema_migrates_v12_and_keeps_one_timeline_truth(tmp_path: Path) -> None:

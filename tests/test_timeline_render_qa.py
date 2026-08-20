@@ -23,7 +23,8 @@ from montage import (  # noqa: E402
     render_timeline,
     timeline_diversity_issues,
 )
-from validate_output import _climax_metrics, validate_output  # noqa: E402
+from validate_output import _climax_metrics, _visual_diversity_metrics, validate_output  # noqa: E402
+from visual_intelligence import build_visual_style_profile, evaluate_sequence_consistency  # noqa: E402
 
 
 FFMPEG = shutil.which("ffmpeg")
@@ -52,6 +53,165 @@ def test_climax_qa_uses_event_windows_when_early_drop_role_misses_late_peak() ->
     assert metrics["comparison_method"] == "drop_and_climax_event_windows"
     assert metrics["section_role_event_window_coverage"] < 0.50
     assert metrics["passed"] is True
+
+
+def test_climax_comparison_passes_when_climax_is_stronger() -> None:
+    shots = [
+        {"output_start": 0.0, "output_end": 2.0, "output_duration": 2.0, "section_role": "intro", "source_motion": 0.1},
+        {"output_start": 2.0, "output_end": 2.5, "output_duration": 0.5, "section_role": "climax", "source_motion": 0.8, "is_emphasis": True},
+        {"output_start": 2.5, "output_end": 3.0, "output_duration": 0.5, "section_role": "climax", "source_motion": 0.9, "is_emphasis": True},
+    ]
+    metrics = _climax_metrics(shots, {"events": {"climaxes": [2.5], "drops": [2.5]}}, 3.0)
+    assert metrics is not None
+    assert metrics["evidence_sufficient"] is True
+    assert metrics["density_passed"] is True
+    assert metrics["intensity_passed"] is True
+    assert metrics["passed"] is True
+
+
+def test_climax_comparison_fails_when_climax_is_weaker() -> None:
+    shots = [
+        {"output_start": 0.0, "output_end": 0.5, "output_duration": 0.5, "section_role": "intro", "source_motion": 0.9, "is_emphasis": True},
+        {"output_start": 0.5, "output_end": 2.5, "output_duration": 2.0, "section_role": "climax", "source_motion": 0.1},
+    ]
+    metrics = _climax_metrics(shots, {"events": {"climaxes": [1.5], "drops": [1.5]}}, 2.5)
+    assert metrics is not None
+    assert metrics["evidence_sufficient"] is True
+    assert metrics["density_passed"] is False
+    assert metrics["intensity_passed"] is False
+    assert metrics["passed"] is False
+
+
+def test_climax_comparison_is_insufficient_without_calm_reference() -> None:
+    shots = [
+        {"output_start": 0.0, "output_end": 1.0, "output_duration": 1.0, "section_role": "climax", "source_motion": 0.8},
+        {"output_start": 1.0, "output_end": 2.0, "output_duration": 1.0, "section_role": "climax", "source_motion": 0.9},
+    ]
+    metrics = _climax_metrics(shots, {"events": {"climaxes": [1.0], "drops": [1.0]}}, 2.0)
+    assert metrics is not None
+    assert metrics["status"] == "insufficient_evidence"
+    assert metrics["evidence_sufficient"] is False
+    assert metrics["calm_shot_count"] == 0
+    assert metrics["calm_cut_density"] is None
+    assert metrics["calm_visual_intensity"] is None
+    assert metrics["density_passed"] is None
+    assert metrics["intensity_passed"] is None
+    assert metrics["passed"] is False
+    assert "insufficient_comparison_evidence" in metrics["failure_reasons"]
+
+
+def test_climax_comparison_is_insufficient_with_calm_only() -> None:
+    shots = [
+        {"output_start": 0.0, "output_end": 2.0, "output_duration": 2.0, "section_role": "intro", "source_motion": 0.2},
+        {"output_start": 2.0, "output_end": 4.0, "output_duration": 2.0, "section_role": "outro", "source_motion": 0.2},
+    ]
+    metrics = _climax_metrics(shots, {"events": {}}, 4.0)
+    assert metrics is not None
+    assert metrics["comparison_method"] == "no_climax_event_window"
+    assert metrics["status"] == "insufficient_evidence"
+    assert metrics["evidence_sufficient"] is False
+    assert metrics["climax_shot_count"] == 0
+    assert metrics["climax_cut_density"] is None
+    assert metrics["climax_visual_intensity"] is None
+    assert metrics["passed"] is False
+
+
+def test_visual_diversity_reports_same_scale_rate_and_hard_policy() -> None:
+    def shot(scale: str, direction: str = "right") -> dict[str, object]:
+        return {
+            "source_shot_scale": scale,
+            "motion_direction": direction,
+            "scene_category": scale,
+            "subject_label": scale,
+            "composition": scale,
+            "color_tendency": scale,
+            "is_static_like": False,
+            "is_aerial": False,
+            "visual_features": {
+                "feature_details": {
+                    "shot_scale": {"value": scale, "available": True},
+                    "world": {"value": ["natural"], "available": True},
+                    "time_weather": {"value": ["day"], "available": True},
+                    "camera_language": {"value": "drift", "available": True},
+                    "motion": {"value": "dynamic", "available": True},
+                }
+            },
+        }
+
+    metrics = _visual_diversity_metrics([shot("wide") for _ in range(4)], {})
+    assert metrics["pair_count"] == 3
+    assert metrics["same_shot_scale"]["count"] == 3
+    assert metrics["same_shot_scale"]["rate"] == pytest.approx(1.0)
+    assert metrics["policy_decision"]["same_shot_scale"] == "hard_fail"
+    assert metrics["passed"] is False
+
+
+def test_climax_density_reports_microshot_exclusions_and_evidence_coverage() -> None:
+    shots = [
+        {"index": 0, "output_start": 0.0, "output_end": 2.0, "output_duration": 2.0, "section_role": "intro", "source_motion": 0.2},
+        {"index": 1, "output_start": 2.0, "output_end": 3.0, "output_duration": 1.0, "section_role": "drop", "source_motion": 0.7},
+        {"index": 2, "output_start": 3.0, "output_end": 3.3, "output_duration": 0.3, "section_role": "drop", "source_motion": 0.9},
+        {"index": 3, "output_start": 3.3, "output_end": 5.5, "output_duration": 2.2, "section_role": "drop", "source_motion": 0.95, "is_emphasis": True},
+    ]
+    metrics = _climax_metrics(shots, {"events": {"drops": [4.0]}}, 5.5)
+    assert metrics is not None
+    assert metrics["evidence_sufficient"] is True
+    assert metrics["comparison_window_coverage"] == pytest.approx(1.0)
+    assert metrics["counted_climax_shot_count"] < metrics["climax_shot_count"]
+    assert metrics["excluded_microshots"][0]["reason"] == "bridge_microshot_excluded_from_density"
+
+
+def test_climax_qa_marks_low_window_coverage_as_insufficient_evidence() -> None:
+    shots = [
+        {"index": 0, "output_start": 0.0, "output_end": 1.0, "output_duration": 1.0, "section_role": "intro", "source_motion": 0.2},
+        {"index": 1, "output_start": 1.0, "output_end": 2.0, "output_duration": 1.0, "section_role": "outro", "source_motion": 0.2},
+    ]
+    metrics = _climax_metrics(shots, {"events": {"climaxes": [4.5]}}, 5.0)
+    assert metrics is not None
+    assert metrics["evidence_sufficient"] is False
+    assert metrics["status"] == "insufficient_evidence"
+    assert "insufficient_climax_window_coverage" in metrics["failure_reasons"]
+
+
+def test_visual_diversity_excludes_unknown_motion_from_comparison() -> None:
+    def shot(direction: str) -> dict[str, object]:
+        return {
+            "source_shot_scale": "wide",
+            "motion_direction": direction,
+            "is_static_like": False,
+            "is_aerial": False,
+        }
+
+    metrics = _visual_diversity_metrics([shot("right"), shot("unknown"), shot("right")], {})
+    assert metrics["same_motion_direction"]["comparable_pairs"] == 0
+    assert metrics["same_motion_direction"]["count"] == 0
+
+
+def test_sequence_consistency_marks_unavailable_world_and_weather_without_fallback_average() -> None:
+    profile = build_visual_style_profile(
+        "mountain wilderness",
+        {"lighting": "fog overcast", "camera": "drone push in"},
+        {"emotion": "moody epic"},
+        "remote mountain cliffs and mist",
+    )
+    quality = {
+        "overall_score": 0.8,
+        "mean_hsv": {"hue_degrees": 210.0, "saturation": 0.28, "value": 0.46},
+        "visual_analysis": {"aesthetic_score": 0.8, "cinematic_score": 0.8, "motion_type": "push_in"},
+        "motion_type": "push_in",
+    }
+    shots = [
+        {"quality": quality, "motion_direction": "right"},
+        {"quality": quality, "motion_direction": "right"},
+    ]
+    metrics = evaluate_sequence_consistency(shots, profile)
+    assert metrics["coverage"]["world"]["coverage"] == 0.0
+    assert metrics["coverage"]["time_weather"]["coverage"] == 0.0
+    assert metrics["dimension_available"]["world"] is False
+    assert metrics["world_fit_average"] == 0.0
+    pair = metrics["pair_scores"][0]
+    assert pair["component_availability"]["world"] is False
+    assert pair["effective_weight_sum"] < pair["full_weight_sum"]
 
 
 def _asset(path: Path, index: int, *, fingerprint: str | None = None) -> dict:
@@ -302,6 +462,9 @@ def test_v12_real_dissolve_atomic_render_and_event_qa(tmp_path: Path) -> None:
         "terminal": report.get("detectors", {}).get("terminal_scene_seconds"),
     }
     assert report["checks"]["full_decode"] is True
+    assert report["checks"]["duration_stage_instrumentation"] is True
+    assert report["duration_stages"]["complete"] is True
+    assert report["duration_stages"]["root_cause_status"] in {"not_reproduced", "stage_mismatch_observed"}
     assert report["checks"]["music_cut_alignment"] is True
     assert report["checks"]["source_intervals_nonoverlap"] is True
     assert report["checks"]["event_frames"] is True

@@ -1,4 +1,4 @@
-# bgm-montage v1.4.3 使用说明
+# bgm-montage v1.4.4 使用说明
 
 ## Local Library Mode
 
@@ -16,7 +16,7 @@
 
 ## YouTube-first acquisition
 
-The unified entry defaults to `--source-provider youtube-first`. Explicit `youtube`, `pixabay`, and network-free `local-library` modes remain available. v1.4.3 retains the v1.4 scene/grammar work and v1.4.1 Agent review, adding persistent whole-library lightweight visual recognition and concurrent local-index updates. `yt-dlp` is only needed by YouTube modes.
+The unified entry defaults to `--source-provider youtube-first`. Explicit `youtube`, `pixabay`, and network-free `local-library` modes remain available. v1.4.4 retains the v1.4 scene/grammar work and v1.4.1 Agent review, the v1.4.3 persistent whole-library lightweight visual recognition, and the bounded `insufficient_evidence` climax comparison contract. `yt-dlp` is only needed by YouTube modes.
 
 ```powershell
 & $Python (Join-Path $SkillRoot "scripts\bgm_montage.py") `
@@ -59,7 +59,7 @@ Skill 的标准项目结构是：
 Windows PowerShell 安装：
 
 ```powershell
-$ProjectRoot = "E:\资料\造球计划"
+$ProjectRoot = "D:\projects\your-project"
 $SkillRoot = Join-Path $ProjectRoot ".agents\skills\bgm-montage"
 $Venv = Join-Path $SkillRoot ".venv"
 $Python = Join-Path $Venv "Scripts\python.exe"
@@ -73,10 +73,10 @@ ffmpeg -version
 ffprobe -version
 ```
 
-若 Skill 安装在 `C:\Users\<用户名>\.codex\skills\bgm-montage`，使用该目录中的 `.venv`，并在运行前显式设置项目根目录：
+若 Skill 安装在 Codex 的 skills 目录中，使用该目录中的 `.venv`，并在运行前显式设置项目根目录：
 
 ```powershell
-$env:BGM_MONTAGE_PROJECT_ROOT = "E:\资料\造球计划"
+$env:BGM_MONTAGE_PROJECT_ROOT = $ProjectRoot
 ```
 
 项目内标准布局的源码与全局 Codex 安装可以共存；缓存、参考视频、素材和输出都归当前项目，不放进 Skill 发布包。
@@ -84,10 +84,10 @@ $env:BGM_MONTAGE_PROJECT_ROOT = "E:\资料\造球计划"
 从发布 ZIP 安装到全局 Codex Skill 时，先解压到临时目录，再同步 ZIP 内部的标准路径；不要把 ZIP 直接解压到全局 `skills` 根目录，否则会形成错误的 `.agents/skills` 嵌套。以下流程保留已有 `.venv`，并先备份旧源码：
 
 ```powershell
-$Package = "E:\资料\skills\造球计划\bgm-montage-v1.4.3.zip"
+$Package = "D:\packages\bgm-montage-v1.4.4.zip"
 $GlobalSkill = Join-Path $env:USERPROFILE ".codex\skills\bgm-montage"
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$Stage = Join-Path ([IO.Path]::GetTempPath()) "bgm-montage-v1.4.3-$Stamp"
+$Stage = Join-Path ([IO.Path]::GetTempPath()) "bgm-montage-v1.4.4-$Stamp"
 $Backup = Join-Path $env:USERPROFILE ".codex\skills\.backups\bgm-montage-$Stamp"
 
 New-Item -ItemType Directory -Path $Stage, $Backup -Force | Out-Null
@@ -136,7 +136,7 @@ PIXABAY_API_KEY=your_pixabay_api_key_here
 统一入口是完整生产路径，也是唯一会顺序执行参考学习、BGM 分析、下载前时间线、Pixabay 搜索、素材充足度检查、选片、渲染、QA 和使用历史提交的入口。
 
 ```powershell
-$ProjectRoot = "E:\资料\造球计划"
+$ProjectRoot = "D:\projects\your-project"
 $SkillRoot = Join-Path $ProjectRoot ".agents\skills\bgm-montage"
 $Python = Join-Path $SkillRoot ".venv\Scripts\python.exe"
 $env:BGM_MONTAGE_PROJECT_ROOT = $ProjectRoot
@@ -466,16 +466,16 @@ py -3.11 -m venv $JianYingVenv
 
 ```powershell
 & $Python (Join-Path $SkillRoot "scripts\package_skill.py") `
-  --version 1.4.3 --profile runtime `
-  --output "E:\资料\skills\造球计划\bgm-montage-v1.4.3-runtime.zip"
+  --version 1.4.4 --profile runtime `
+  --output "D:\packages\bgm-montage-v1.4.4-runtime.zip"
 ```
 
 构建开发交付包：
 
 ```powershell
 & $Python (Join-Path $SkillRoot "scripts\package_skill.py") `
-  --version 1.4.3 --profile development `
-  --output "E:\资料\skills\造球计划\bgm-montage-v1.4.3-development.zip"
+  --version 1.4.4 --profile development `
+  --output "D:\packages\bgm-montage-v1.4.4-development.zip"
 ```
 
 Runtime 包只包含 `SKILL.md`、Agent 元数据、运行说明、依赖锁和运行脚本，不含测试、测试报告、Changelog 或打包器。Development 包是其超集，额外包含当前测试、当前测试报告、Changelog 和打包器。两个包都使用标准 `/` 分隔符和 `.agents/skills/bgm-montage/` 根前缀；真实 `.env`、API Key、`.venv`、模型、缓存、下载素材、测试输出和成片均不进入。目标 ZIP 已存在时默认拒绝覆盖，只有显式 `--force` 才替换。
@@ -483,11 +483,11 @@ Runtime 包只包含 `SKILL.md`、Agent 元数据、运行说明、依赖锁和�
 Windows 解压：
 
 ```powershell
-Expand-Archive -LiteralPath "D:\downloads\bgm-montage-v1.4.3-runtime.zip" `
+Expand-Archive -LiteralPath "D:\downloads\bgm-montage-v1.4.4-runtime.zip" `
   -DestinationPath "D:\my-montage-project"
 ```
 
-Linux/Docker 可使用 `unzip bgm-montage-v1.4.3-runtime.zip -d /workspace/project` 或 `python -m zipfile -e ...`。这只表示 ZIP 路径兼容；本版本不宣称已完成 Linux/Docker 的依赖、模型、FFmpeg 或剪映现场运行验证。
+Linux/Docker 可使用 `unzip bgm-montage-v1.4.4-runtime.zip -d /workspace/project` 或 `python -m zipfile -e ...`。这只表示 ZIP 路径兼容；本版本不宣称已完成 Linux/Docker 的依赖、模型、FFmpeg 或剪映现场运行验证。
 
 ## 12. 能力状态
 

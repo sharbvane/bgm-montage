@@ -26,6 +26,7 @@ renders/
 materials/
 downloads/
 validation_frames/
+*.zip
 *.mp4
 *.mov
 *.mkv
@@ -39,5 +40,9 @@ validation_frames/
 *.log
 *.tmp
 *.bak
+.codex/
+.idea/
+.vscode/
+*.part
 .DS_Store
 Thumbs.db

@@ -16,6 +16,7 @@ if str(SCRIPTS) not in sys.path:
 
 import local_library as library  # noqa: E402
 from pixabay_pipeline import update_usage_intervals  # noqa: E402
+from visual_intelligence import FEATURE_METADATA_SCHEMA_VERSION  # noqa: E402
 
 
 def _fake_quality(path: Path, *_args: object, **_kwargs: object) -> tuple[dict, dict]:
@@ -316,3 +317,88 @@ def test_concurrent_sync_and_deep_writes_merge_without_duplicate_work(
     index = json.loads(Path(results[0]["library_index"]).read_text(encoding="utf-8"))
     assert len(index["entries"]) == 30
     assert sum(entry["analysis_status"] == "indexed" for entry in index["entries"]) == 16
+
+
+def test_deep_analysis_preserves_lightweight_shot_scale_with_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    path = root / "wide-coast.mp4"
+    path.write_bytes(b"wide-video")
+    monkeypatch.setattr(library, "_video_quality", _fake_quality)
+    monkeypatch.setattr(library, "_ffprobe", _fake_probe)
+    previous = {
+        "content_fingerprint": library._content_fingerprint(path),
+        "lightweight_visual": _fake_light(path, "wide coast"),
+    }
+
+    analyzed = library._analyze_entry(root, path, previous)
+
+    assert analyzed["shot_scale"] == "wide"
+    assert analyzed["shot_scale_detail"]["available"] is True
+    assert analyzed["shot_scale_detail"]["source"] == "lightweight_visual"
+    assert analyzed["shot_scale_detail"]["schema_version"] == FEATURE_METADATA_SCHEMA_VERSION
+    assert analyzed["quality"]["visual_features"]["shot_scale"] == "wide"
+
+
+def test_filename_semantics_refresh_after_rename_without_visual_rescan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, cache = tmp_path / "library", tmp_path / "cache"
+    root.mkdir()
+    path = root / "雾中雪山.mp4"
+    path.write_bytes(b"same-video")
+    light_calls: list[str] = []
+
+    def light(path: Path, tags: str) -> dict:
+        light_calls.append(path.name)
+        return _fake_light(path, tags)
+
+    monkeypatch.setattr(library, "_ffprobe", _fake_probe)
+    monkeypatch.setattr(library, "_lightweight_visual", light)
+    first = library.sync_local_library(root, cache)
+    assert {"fog", "mountain"}.issubset(first["entries"][0]["filename_semantics"]["terms"])
+
+    path.rename(root / "航拍海岸.mp4")
+    second = library.sync_local_library(root, cache, metadata_refresh_limit=1)
+    entry = second["entries"][0]
+    assert second["sync"]["metadata_refreshed"] == 1
+    assert light_calls == ["雾中雪山.mp4"]
+    assert {"aerial", "coast"}.issubset(entry["filename_semantics"]["terms"])
+    assert "fog" not in entry["filename_semantics"]["terms"]
+    assert entry["shot_scale_detail"]["source"] == "lightweight_visual"
+
+
+def test_legacy_metadata_migrates_lazily_without_lightweight_rescan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, cache = tmp_path / "library", tmp_path / "cache"
+    root.mkdir()
+    path = root / "航拍海岸.mp4"
+    path.write_bytes(b"legacy-video")
+    light_calls: list[str] = []
+
+    def light(path: Path, tags: str) -> dict:
+        light_calls.append(path.name)
+        return _fake_light(path, tags)
+
+    monkeypatch.setattr(library, "_ffprobe", _fake_probe)
+    monkeypatch.setattr(library, "_lightweight_visual", light)
+    first = library.sync_local_library(root, cache)
+    index_path = Path(first["index_path"])
+    legacy = json.loads(index_path.read_text(encoding="utf-8"))
+    legacy_entry = legacy["entries"][0]
+    legacy_entry.pop("metadata_features", None)
+    legacy_entry.pop("filename_semantics", None)
+    legacy_entry.pop("metadata_schema_version", None)
+    index_path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+    light_calls.clear()
+
+    migrated = library.sync_local_library(root, cache, metadata_refresh_limit=1)
+    entry = migrated["entries"][0]
+    assert migrated["sync"]["metadata_refreshed"] == 1
+    assert migrated["sync"]["light_analyzed"] == 0
+    assert light_calls == []
+    assert entry["metadata_schema_version"] == FEATURE_METADATA_SCHEMA_VERSION
+    assert entry["metadata_features"]["shot_scale"]["available"] is True

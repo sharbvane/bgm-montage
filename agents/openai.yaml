@@ -1,7 +1,7 @@
 interface:
   display_name: "BGM Montage"
   short_description: "Plan, source, render, and QA quality-first BGM montages"
-  default_prompt: "Use $bgm-montage v1.4.3 to incrementally sync and visually index a requested local library or acquire online footage, plan and render to the BGM, run programmatic QA, then actually view every requested evidence frame and resume bounded rework until both QA layers pass."
+  default_prompt: "Use $bgm-montage v1.4.4 to incrementally sync and visually index a requested local library or acquire online footage, plan and render to the BGM, run programmatic QA, then actually view every requested evidence frame and resume bounded rework until both QA layers pass."
 
 policy:
   allow_implicit_invocation: true

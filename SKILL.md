@@ -3,9 +3,9 @@ name: bgm-montage
 description: Learn a dynamic visual profile and audio-linked editing grammar from read-only references and BGM, incrementally index and reuse large local video libraries or intelligently acquire Pixabay/YouTube footage, render a low-repetition montage, enforce automatic media QA, and require a frame-viewing visual Agent review with bounded rework. Use when Codex must create a BGM montage from a local library or online material using a theme, duration, aspect ratio, and output directory.
 ---
 
-# BGM Montage v1.4.3
+# BGM Montage v1.4.4
 
-The unified entry defaults to `--source-provider youtube-first`. Use `--source-provider local-library --local-library-dir PATH` for a network-free local workflow. v1.4.3 keeps the BGM, scene, grammar, timeline, renderer, and QA cores intact; it adds a persistent six-frame visual profile for every new or changed local asset, content-based history identity, and transactional bounded two-stage selection.
+The unified entry defaults to `--source-provider youtube-first`. Use `--source-provider local-library --local-library-dir PATH` for a network-free local workflow. v1.4.4 keeps the BGM, scene, grammar, timeline, renderer, and QA cores intact; it retains the v1.4.3 cache/report schemas and adds the minimal climax evidence contract: missing calm/reference evidence is reported as `insufficient_evidence` and is not treated as a zero-intensity comparison or a whole-video failure.
 
 ## Material usage mode
 
