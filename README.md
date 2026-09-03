@@ -1,8 +1,13 @@
 # bgm-montage
 
-`bgm-montage` is a Python skill for building traceable, music-driven video montages from a BGM track, read-only reference videos, and local or provider-sourced footage. The current published release is `v1.4.4`.
+`bgm-montage` is a Python skill for building traceable, music-driven video montages from a BGM track, read-only reference videos, and local or provider-sourced footage. The current published release is `v1.4.6`.
 
-## v1.4.4 highlights
+## v1.4.6 highlights
+
+- Frame-safe Agent Visual Review coverage for every planned shot; samples within one frame of a cut no longer count for the preceding shot.
+- Visual-impact-aware climax QA, reserve capacity, provenance-bound resume/review handling, and retained `colorbalance` preserve-lightness correction.
+- Generalization validation across slow-lyrical, mid-tempo, and high-energy 20-second local-library montages.
+- v1.4.3 JSON/cache schemas remain compatible.
 
 - Local-library metadata truth and provenance, with missing-feature scoring normalization and bounded lazy cache migration.
 - Shared asset-capacity preflight for reuse, source intervals, repeat gaps, screen share, face budget, and usable duration.
@@ -23,7 +28,7 @@
 - Uses FFmpeg rendering and automatic media QA, plus required Agent Visual Review evidence where enabled.
 - Optionally exports edit decisions to JianYing Pro with independent source clips and a separate BGM track.
 
-The `v1.4.4` boundary is deliberate: Duration remains `not reproduced / instrumented / known historical risk`; Color is `pl=0 fixed / evidence boundary retained`; further Reference Grammar `beat_cut` rhythm optimization is deferred and is not part of this release.
+The `v1.4.6` boundary is deliberate: Duration remains `not reproduced / instrumented / known historical risk`; Color is `pl=0 fixed / evidence boundary retained`; further Reference Grammar `beat_cut` rhythm optimization is deferred and is not part of this release.
 
 ## Install
 
@@ -32,7 +37,7 @@ Check out the release tag. Python 3.11 is recommended; `ffmpeg` and `ffprobe` mu
 ```powershell
 git clone https://github.com/sharbvane/bgm-montage.git
 Set-Location bgm-montage
-git checkout v1.4.4
+git checkout v1.4.6
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
 Copy-Item .env.example .env
@@ -54,7 +59,7 @@ Provide a BGM, task/theme, output directory, and, when available, a read-only re
 
 ## History and release artifacts
 
-Published source snapshots include `v1`, `v1.1`, `v1.2`, `v1.3`, `v1.3.2`, `v1.3.3`, `v1.4`, `v1.4.1`, `v1.4.3`, and `v1.4.4`. The v1.4.4 release asset is attached to the GitHub Release; media, caches, logs, credentials, virtual environments, and test-output are excluded from the repository.
+Published source snapshots include `v1`, `v1.1`, `v1.2`, `v1.3`, `v1.3.2`, `v1.3.3`, `v1.4`, `v1.4.1`, `v1.4.3`, `v1.4.4`, and `v1.4.6`. The v1.4.6 runtime and development package assets are attached to the GitHub Release; media, caches, logs, credentials, virtual environments, and test-output are excluded from the repository.
 
 ## License
 

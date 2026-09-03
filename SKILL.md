@@ -3,9 +3,9 @@ name: bgm-montage
 description: Learn a dynamic visual profile and audio-linked editing grammar from read-only references and BGM, incrementally index and reuse large local video libraries or intelligently acquire Pixabay/YouTube footage, render a low-repetition montage, enforce automatic media QA, and require a frame-viewing visual Agent review with bounded rework. Use when Codex must create a BGM montage from a local library or online material using a theme, duration, aspect ratio, and output directory.
 ---
 
-# BGM Montage v1.4.4
+# BGM Montage v1.4.6
 
-The unified entry defaults to `--source-provider youtube-first`. Use `--source-provider local-library --local-library-dir PATH` for a network-free local workflow. v1.4.4 keeps the BGM, scene, grammar, timeline, renderer, and QA cores intact; it retains the v1.4.3 cache/report schemas and adds the minimal climax evidence contract: missing calm/reference evidence is reported as `insufficient_evidence` and is not treated as a zero-intensity comparison or a whole-video failure.
+The unified entry defaults to `--source-provider youtube-first`. Use `--source-provider local-library --local-library-dir PATH` for a network-free local workflow. v1.4.6 keeps the BGM, scene, grammar, timeline, renderer, and QA cores intact; it adds frame-safe whole-shot Agent review coverage, visual-impact-aware climax QA, bounded reserve capacity, and transactional resume/review handling while preserving the v1.4.3 JSON/cache schemas.
 
 ## Material usage mode
 
@@ -45,7 +45,7 @@ Switch to `publish` only when the user explicitly says the specific video will b
 
 每次正式运行先轻扫目录。索引位于 `--cache-dir/local-library/libraries/<library-id>/library_index.json`，不写入素材库；每个新增、修改或 v1.4.2 旧条目只做一次 ffprobe、内容采样指纹与 6 帧轻量视觉画像，未变化条目直接复用，删除文件同步移出。选片先按全库轻量画像、BGM 和历史粗排，再只对最多 64 个有界高相关候选执行现有 48 帧视觉分析。索引和 usage 回写使用现有跨进程锁及原子替换；同内容移动/改名保留历史，同路径内容替换不继承历史。`asset_manifest.json` 记录轻量命中率、粗筛数、精筛数、深度分析/复用数和选中数。
 
-每次运行写入 `<output-dir>/<project-slug>/<run-id>/`。未传 `--run-id` 时自动生成 UTC 时间戳加随机后缀；已有目录不会被静默覆盖。失败运行可用完全相同的输入、原 `--run-id` 和 `--resume-run` 继续。
+每次运行写入 `<output-dir>/<project-slug>/<run-id>/`。未传 `--run-id` 时自动生成 UTC 时间戳加随机后缀；已有目录不会被静默覆盖。失败运行可用完全相同的输入、原 `--run-id` 和 `--resume-run` 继续。attempt MP4 只有在 `render_provenance.json` 同时匹配 renderer、编辑计划、BGM、风格、比例、帧率和视频哈希时才会复用；缺失、损坏或不匹配会原子重渲染。
 
 ## 执行约束
 
@@ -66,6 +66,7 @@ Switch to `publish` only when the user explicitly says the specific video will b
 - `visual_style_profile.json`：本次任务动态形成的世界观、色彩、天气光线、摄影与质量画像。
 - `asset_manifest.json`：检索轮次、审美筛选、缓存、去重、下载、复用、来源和实际使用区间。
 - `edit_decisions.json`：v1.3 统一时间线真值；保留原始路径、源/目标区间、速度、裁剪/变换、BGM 独立轨和 v1.2 兼容字段。
+- `attempts/attempt_XX/render_provenance.json`：该 attempt 的渲染输入摘要及 MP4 大小/全文件 SHA-256；断点续跑的唯一视频复用凭据。
 - `render_report.json`：最终媒体探测、完整解码、音乐结构和全片视觉一致性 QA。
 - `visual_review.json` / `visual_review.md`：开头、结尾、音乐事件和计划切点的可审查帧证据。
 - `agent_visual_review_request.json` / `agent_visual_review.json`：视觉 Agent 待审目标及结构化 `pass` / `warning` / `fail` 判断、时间戳、置信度、原因和建议动作。
@@ -82,7 +83,7 @@ Switch to `publish` only when the user explicitly says the specific video will b
 3. 按请求中的 `response_template` 写入指定 `agent_visual_review.json`；每个证据帧都要有状态、原因、时间戳和置信度；
 4. 使用完全相同的参数、原 `--run-id` 和 `--resume-run` 继续。
 
-`fail` 会进入既有 attempt 循环；`replace_shot` 指向的镜头源会在下一次尝试中排除，其他失败至少使用新 seed 重排并重渲染。`warning` 保留在最终 QA 报告中但不阻断交付。只有明确不需要 Agent 审片的兼容运行才使用 `--agent-visual-review off`。
+`fail` 会进入既有 attempt 循环；`replace_shot` 指向的镜头源会在下一次尝试中排除，其他失败至少使用新 seed 重排并重渲染。任何 provenance 失配导致的成功重渲都会把旧审片请求/结果原子归档为 `*.stale.*.json`，并等待新审片，绝不沿用旧判断。`warning` 保留在最终 QA 报告中但不阻断交付。只有明确不需要 Agent 审片的兼容运行才使用 `--agent-visual-review off`。
 
 ## 已实现边界
 

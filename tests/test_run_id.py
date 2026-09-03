@@ -87,6 +87,29 @@ def test_default_run_id_is_unique_and_history_is_not_overwritten(tmp_path: Path,
     assert first_dir.is_dir() and second_dir.is_dir()
 
 
+def test_default_asset_count_reserves_two_candidates_per_rework(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "references").mkdir()
+    (tmp_path / "music.wav").write_bytes(b"audio")
+    _stub_pipeline(monkeypatch, tmp_path)
+    pipeline = entry.run_youtube_first_pipeline
+    requested: list[int] = []
+
+    def capture(*args: object, **kwargs: object) -> dict[str, object]:
+        requested.append(int(args[5]))
+        return pipeline(*args, **kwargs)
+
+    monkeypatch.setattr(entry, "run_youtube_first_pipeline", capture)
+    args = _args(tmp_path, run_id="rework-reserve")
+    args.assets = None
+    args.max_rework_attempts = 2
+
+    report = entry.run(args)
+
+    assert requested[0] >= report["stages"]["timeline_planning"]["slots"] + 4
+
+
 def test_explicit_existing_run_id_fails_before_overwrite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tmp_path / "references").mkdir()
     (tmp_path / "music.wav").write_bytes(b"audio")
@@ -127,6 +150,31 @@ def test_failed_run_resumes_from_existing_stage_artifacts(
     assert report["stages"]["references"]["status"] == "resumed"
     assert report["stages"]["bgm"]["status"] == "resumed"
     assert Path(report["artifacts"]["video"]).is_file()
+
+
+@pytest.mark.parametrize("stored_renderer", [None, "stale-renderer"])
+def test_resume_refuses_existing_video_without_matching_renderer_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stored_renderer: str | None
+) -> None:
+    (tmp_path / "references").mkdir()
+    (tmp_path / "music.wav").write_bytes(b"audio")
+    _stub_pipeline(monkeypatch, tmp_path)
+    monkeypatch.setattr(entry, "_renderer_sha256", lambda: "current-renderer")
+    args = _args(tmp_path, run_id="renderer-provenance")
+    report = entry.run(args)
+    run_dir = Path(report["artifacts"]["run_report"]).parent
+    state_path = run_dir / "run_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["renderer_sha256"] == "current-renderer"
+    if stored_renderer is None:
+        state.pop("renderer_sha256")
+    else:
+        state["renderer_sha256"] = stored_renderer
+    entry._write_json(state_path, state)
+
+    args.resume_run = True
+    with pytest.raises(ValueError, match="Resume renderer differs"):
+        entry.run(args)
 
 
 def test_legacy_cli_names_and_primary_invocation_remain_compatible() -> None:
@@ -224,6 +272,260 @@ def _write_agent_review(request_path: Path, status: str) -> Path:
     return result_path
 
 
+def _validate_with_visual_review(media: Path, *args: object, **kwargs: object) -> dict:
+    media = Path(media)
+    frames = Path(kwargs["frames_dir"])
+    frames.mkdir(parents=True, exist_ok=True)
+    frame = frames / "event.jpg"
+    frame.write_bytes(b"jpeg")
+    attempt_dir = frames.parent
+    review_path = attempt_dir / "visual_review.json"
+    digest = hashlib.sha256(media.read_bytes()).hexdigest()
+    review_path.write_text(json.dumps({
+        "schema_version": "1.4.3",
+        "artifact_type": "visual_review",
+        "media_sha256": digest,
+        "entries": [{
+            "index": 1,
+            "time_seconds": 1.0,
+            "frame_path": str(frame.resolve()),
+            "event_types": ["climaxes"],
+            "details": [{"type": "music_event", "event": "climaxes", "shot_index": 0}],
+        }],
+        "planned_cut_pairs": [],
+    }), encoding="utf-8")
+    (attempt_dir / "visual_review.md").write_text(
+        "![frame](<validation_frames/event.jpg>)\n", encoding="utf-8"
+    )
+    return {
+        "passed": True,
+        "checks": {"programmatic_fixture": True},
+        "sha256": digest,
+        "path": str(media),
+        "visual_review": {
+            "json": str(review_path),
+            "markdown": str(attempt_dir / "visual_review.md"),
+        },
+    }
+
+
+def _install_provenance_pipeline(
+    monkeypatch: pytest.MonkeyPatch, root: Path
+) -> tuple[dict[str, object], list[str]]:
+    _stub_pipeline(monkeypatch, root)
+    state: dict[str, object] = {"renderer": "renderer-a", "plan_variant": "a", "fail": False}
+    render_calls: list[str] = []
+
+    monkeypatch.setattr(entry, "_renderer_sha256", lambda: state["renderer"])
+    monkeypatch.setattr(
+        entry,
+        "build_timeline",
+        lambda *args, **kwargs: {
+            "duration_seconds": 8.0,
+            "shots": [],
+            "plan_variant": state["plan_variant"],
+        },
+    )
+
+    def render(_plan: dict, _bgm: Path, output: Path, *_args: object, **_kwargs: object) -> Path:
+        if state["fail"]:
+            raise entry.MontageError("intentional render failure")
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"identical-render-bytes")
+        render_calls.append(output.parent.name)
+        return output
+
+    monkeypatch.setattr(entry, "render_timeline", render)
+    monkeypatch.setattr(entry, "validate_output", _validate_with_visual_review)
+    return state, render_calls
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_render_calls"),
+    [
+        ("none", 1),
+        ("renderer", 2),
+        ("plan", 2),
+        ("missing_sidecar", 2),
+        ("corrupt_sidecar", 2),
+        ("tampered_video", 2),
+    ],
+)
+def test_attempt_render_provenance_controls_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_render_calls: int,
+) -> None:
+    (tmp_path / "references").mkdir()
+    (tmp_path / "music.wav").write_bytes(b"audio")
+    state, render_calls = _install_provenance_pipeline(monkeypatch, tmp_path)
+    args = _args(tmp_path, run_id=f"provenance-{mutation}")
+    args.agent_visual_review = "required"
+
+    first = entry.run(args)
+    attempt_dir = Path(first["artifacts"]["run_report"]).parent / "attempts" / "attempt_01"
+    provenance_path = attempt_dir / "render_provenance.json"
+    video_path = attempt_dir / "run-id-test_attempt_01.mp4"
+    first_provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    assert first["status"] == "awaiting_agent_visual_review"
+
+    if mutation == "renderer":
+        state["renderer"] = "renderer-b"
+    elif mutation == "plan":
+        state["plan_variant"] = "b"
+    elif mutation == "missing_sidecar":
+        provenance_path.unlink()
+    elif mutation == "corrupt_sidecar":
+        provenance_path.write_text("{broken", encoding="utf-8")
+    elif mutation == "tampered_video":
+        video_path.write_bytes(b"tampered")
+
+    args.resume_run = True
+    resumed = entry.run(args)
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+
+    assert resumed["status"] == "awaiting_agent_visual_review"
+    assert len(render_calls) == expected_render_calls
+    assert provenance["artifact_type"] == "render_provenance"
+    assert provenance["status"] == "complete"
+    assert provenance["attempt"] == 1
+    assert set(provenance["inputs"]) == {
+        "renderer_sha256",
+        "edit_plan_sha256",
+        "bgm_sha256",
+        "style_profile_sha256",
+        "ratio",
+        "fps",
+    }
+    assert provenance["render_input_sha256"] == entry._invocation_digest(provenance["inputs"])
+    assert provenance["output"] == {
+        "size": video_path.stat().st_size,
+        "sha256": hashlib.sha256(video_path.read_bytes()).hexdigest(),
+    }
+    assert resumed["stages"]["render_attempts"][0]["render_provenance"] == str(provenance_path)
+    if mutation == "none":
+        assert provenance == first_provenance
+
+
+def test_rerender_archives_stale_agent_review_even_when_video_bytes_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "references").mkdir()
+    (tmp_path / "music.wav").write_bytes(b"audio")
+    state, render_calls = _install_provenance_pipeline(monkeypatch, tmp_path)
+    args = _args(tmp_path, run_id="stale-review")
+    args.agent_visual_review = "required"
+
+    first = entry.run(args)
+    attempt_dir = Path(first["artifacts"]["run_report"]).parent / "attempts" / "attempt_01"
+    request_path = attempt_dir / "agent_visual_review_request.json"
+    result_path = _write_agent_review(request_path, "pass")
+    old_request = request_path.read_bytes()
+    old_result = result_path.read_bytes()
+    old_media_sha = json.loads(request_path.read_text(encoding="utf-8"))["media_sha256"]
+    old_input_sha = json.loads(
+        (attempt_dir / "render_provenance.json").read_text(encoding="utf-8")
+    )["render_input_sha256"]
+
+    state["plan_variant"] = "b"
+    args.resume_run = True
+    pending = entry.run(args)
+
+    stale_requests = list(attempt_dir.glob("agent_visual_review_request.stale.*.json"))
+    stale_results = list(attempt_dir.glob("agent_visual_review.stale.*.json"))
+    new_request = json.loads(request_path.read_text(encoding="utf-8"))
+    new_input_sha = json.loads(
+        (attempt_dir / "render_provenance.json").read_text(encoding="utf-8")
+    )["render_input_sha256"]
+    assert pending["status"] == "awaiting_agent_visual_review"
+    assert render_calls == ["attempt_01", "attempt_01"]
+    assert not result_path.exists()
+    assert len(stale_requests) == len(stale_results) == 1
+    assert stale_requests[0].read_bytes() == old_request
+    assert stale_results[0].read_bytes() == old_result
+    assert new_request["media_sha256"] == old_media_sha
+    assert new_input_sha != old_input_sha
+
+    _write_agent_review(request_path, "pass")
+    completed = entry.run(args)
+    assert completed["passed"] is True
+    assert render_calls == ["attempt_01", "attempt_01"]
+
+
+def test_reused_render_validates_review_against_its_original_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "references").mkdir()
+    (tmp_path / "music.wav").write_bytes(b"audio")
+    _state, render_calls = _install_provenance_pipeline(monkeypatch, tmp_path)
+    validations = 0
+
+    def validate_with_expanded_scope(media: Path, *args: object, **kwargs: object) -> dict:
+        nonlocal validations
+        validations += 1
+        validation = _validate_with_visual_review(media, *args, **kwargs)
+        if validations == 2:
+            review_path = Path(validation["visual_review"]["json"])
+            review = json.loads(review_path.read_text(encoding="utf-8"))
+            second_frame = review_path.parent / "validation_frames" / "new-event.jpg"
+            second_frame.write_bytes(b"jpeg")
+            review["entries"].append({
+                "index": 2,
+                "time_seconds": 2.0,
+                "frame_path": str(second_frame.resolve()),
+                "event_types": ["planned_shot"],
+                "details": [{"type": "planned_shot", "shot_index": 1}],
+            })
+            entry._write_json(review_path, review)
+        return validation
+
+    monkeypatch.setattr(entry, "validate_output", validate_with_expanded_scope)
+    args = _args(tmp_path, run_id="review-contract-migration")
+    args.agent_visual_review = "required"
+
+    first = entry.run(args)
+    attempt_dir = Path(first["artifacts"]["run_report"]).parent / "attempts" / "attempt_01"
+    request_path = attempt_dir / "agent_visual_review_request.json"
+    original_request = request_path.read_bytes()
+    _write_agent_review(request_path, "pass")
+
+    args.resume_run = True
+    completed = entry.run(args)
+
+    assert completed["passed"] is True
+    assert render_calls == ["attempt_01"]
+    assert request_path.read_bytes() == original_request
+    assert len(json.loads((attempt_dir / "visual_review.json").read_text(encoding="utf-8"))["entries"]) == 2
+
+
+def test_failed_rerender_preserves_old_video_without_trusted_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "references").mkdir()
+    (tmp_path / "music.wav").write_bytes(b"audio")
+    state, _render_calls = _install_provenance_pipeline(monkeypatch, tmp_path)
+    args = _args(tmp_path, run_id="failed-rerender")
+    args.agent_visual_review = "required"
+    args.max_rework_attempts = 0
+
+    first = entry.run(args)
+    attempt_dir = Path(first["artifacts"]["run_report"]).parent / "attempts" / "attempt_01"
+    video_path = attempt_dir / "run-id-test_attempt_01.mp4"
+    provenance_path = attempt_dir / "render_provenance.json"
+    old_video = video_path.read_bytes()
+
+    state["plan_variant"] = "b"
+    state["fail"] = True
+    args.resume_run = True
+    with pytest.raises(RuntimeError, match="All render/QA attempts failed"):
+        entry.run(args)
+
+    assert video_path.read_bytes() == old_video
+    assert not provenance_path.exists()
+
+
 def test_agent_visual_review_failure_triggers_existing_rework_loop_then_passes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -239,39 +541,8 @@ def test_agent_visual_review_failure_triggers_existing_rework_loop_then_passes(
         render_calls.append(output.parent.name)
         return output
 
-    def validate(media: Path, *args: object, **kwargs: object) -> dict:
-        media = Path(media)
-        frames = Path(kwargs["frames_dir"])
-        frames.mkdir(parents=True, exist_ok=True)
-        frame = frames / "event.jpg"
-        frame.write_bytes(b"jpeg")
-        attempt_dir = frames.parent
-        review_path = attempt_dir / "visual_review.json"
-        digest = hashlib.sha256(media.read_bytes()).hexdigest()
-        review_path.write_text(json.dumps({
-            "schema_version": "1.4.3",
-            "artifact_type": "visual_review",
-            "media_sha256": digest,
-            "entries": [{
-                "index": 1,
-                "time_seconds": 1.0,
-                "frame_path": str(frame.resolve()),
-                "event_types": ["climaxes"],
-                "details": [{"type": "music_event", "event": "climaxes", "shot_index": 0}],
-            }],
-            "planned_cut_pairs": [],
-        }), encoding="utf-8")
-        (attempt_dir / "visual_review.md").write_text("![frame](<validation_frames/event.jpg>)\n", encoding="utf-8")
-        return {
-            "passed": True,
-            "checks": {"programmatic_fixture": True},
-            "sha256": digest,
-            "path": str(media),
-            "visual_review": {"json": str(review_path), "markdown": str(attempt_dir / "visual_review.md")},
-        }
-
     monkeypatch.setattr(entry, "render_timeline", render)
-    monkeypatch.setattr(entry, "validate_output", validate)
+    monkeypatch.setattr(entry, "validate_output", _validate_with_visual_review)
     args = _args(tmp_path, run_id="agent-loop")
     args.agent_visual_review = "required"
 

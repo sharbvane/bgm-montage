@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bgm-montage v1.4.4 unified reference-style, BGM-driven montage entry."""
+"""bgm-montage v1.4.6 unified reference-style, BGM-driven montage entry."""
 
 from __future__ import annotations
 
@@ -83,6 +83,48 @@ def _file_fingerprint(path: Path) -> dict[str, Any]:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha256": digest.hexdigest()}
+
+
+def _renderer_sha256() -> str:
+    """Identify the renderer implementation that produced resumable video."""
+
+    return str(_file_fingerprint(SCRIPT_DIR / "montage.py")["sha256"])
+
+
+def _render_provenance_matches(
+    video_path: Path,
+    provenance_path: Path,
+    expected_inputs: dict[str, Any],
+) -> bool:
+    """Only trust a resumable render whose inputs and bytes still match."""
+
+    if not video_path.is_file() or not provenance_path.is_file():
+        return False
+    try:
+        provenance = _read_json(provenance_path)
+        output = provenance.get("output") if isinstance(provenance.get("output"), dict) else {}
+        fingerprint = _file_fingerprint(video_path)
+        return (
+            provenance.get("schema_version") == "1.4.3"
+            and provenance.get("artifact_type") == "render_provenance"
+            and provenance.get("status") == "complete"
+            and provenance.get("inputs") == expected_inputs
+            and provenance.get("render_input_sha256") == _invocation_digest(expected_inputs)
+            and output.get("size") == fingerprint["size"]
+            and output.get("sha256") == fingerprint["sha256"]
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _archive_agent_visual_review(attempt_dir: Path) -> None:
+    """Keep, but invalidate, any human/agent review superseded by a re-render."""
+
+    token = secrets.token_hex(4)
+    for name in ("agent_visual_review_request.json", "agent_visual_review.json"):
+        source = attempt_dir / name
+        if source.is_file():
+            os.replace(source, source.with_name(f"{source.stem}.stale.{token}{source.suffix}"))
 
 
 def _json_copy(source: Path, destination: Path) -> Path:
@@ -279,6 +321,7 @@ def _build_agent_visual_review_request(
         "required_entry_indices": [int(item["index"]) for item in entries],
         "required_scope": [
             "opening_and_ending",
+            "every_planned_shot",
             "drop_and_climax_response",
             "phrase_and_section_boundaries",
             "planned_cut_before_after_pairs",
@@ -286,7 +329,7 @@ def _build_agent_visual_review_request(
         ],
         "instructions": [
             "Use an image-viewing tool to open every review target; filenames and metadata alone are not evidence.",
-            "Judge the image at each music event and both sides of every planned cut.",
+            "Judge every planned shot at least once, plus each sampled music event and sampled planned-cut pair.",
             "Write the structured result to result_json, then resume the same run with --resume-run.",
             "Use fail only for a clear problem that should trigger automatic re-editing; warning is non-blocking.",
         ],
@@ -573,7 +616,7 @@ def _export_jianying_draft(
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    """Run the v1.4.4 pipeline, checkpointing every reusable stage."""
+    """Run the v1.4.6 pipeline, checkpointing every reusable stage."""
 
     load_dotenv(PROJECT_ROOT / ".env", override=False)
     source_provider = str(_arg(args, "source_provider", "youtube-first")).lower()
@@ -638,6 +681,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args=args,
     )
     invocation_digest = _invocation_digest(invocation)
+    renderer_sha256 = _renderer_sha256()
     state_path = run_dir / "run_state.json"
     if run_dir.exists() and not resume:
         raise FileExistsError(
@@ -654,6 +698,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             prior = _read_json(previous_report)
             prior_video = Path(str(prior.get("artifacts", {}).get("video", "")))
             if prior.get("passed") is True and prior_video.is_file():
+                if existing_state.get("renderer_sha256") != renderer_sha256:
+                    raise ValueError(
+                        "Resume renderer differs from the one that produced the existing video; "
+                        "use a new --run-id to re-render"
+                    )
                 return prior
     else:
         run_dir.mkdir(parents=True, exist_ok=False)
@@ -665,6 +714,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "run_id": run_id,
             "invocation_digest": invocation_digest,
             "invocation": invocation,
+            "renderer_sha256": renderer_sha256,
             "resumed": resume,
         },
     )
@@ -672,10 +722,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     run_report_path = run_dir / "run_report.json"
     report: dict[str, Any] = {
         "schema_version": "1.4.3",
-            "skill_version": "1.4.4",
+        "skill_version": "1.4.6",
         "run_id": run_id,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "resumed": resume,
+        "renderer_sha256": renderer_sha256,
         "theme": args.theme,
         "requested_duration_seconds": args.duration,
         "ratio": args.ratio,
@@ -828,11 +879,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         report["artifacts"]["timeline"] = str(timeline_path)
         checkpoint()
 
+        max_rework_attempts = max(0, int(_arg(args, "max_rework_attempts", 2)))
+        # ponytail: reserve two replacements per rework; expand only if review data shows more.
+        default_assets = max(
+            slot_count + (2 * max_rework_attempts),
+            max(4, min(30, math.ceil(target_duration / 1.7) + 3)),
+        )
         desired_assets = int(
             _arg(
                 args,
                 "assets",
-                max(slot_count, max(4, min(30, math.ceil(target_duration / 1.7) + 3))),
+                default_assets,
             )
         )
         asset_manifest_path = run_dir / "asset_manifest.json"
@@ -980,7 +1037,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "min_repeat_gap_seconds": float(_arg(args, "min_repeat_gap_seconds", 6.0)),
             "visual_style_profile_digest": visual_style_profile.get("profile_digest"),
         }
-        max_rework_attempts = max(0, int(_arg(args, "max_rework_attempts", 2)))
         final_output = run_dir / f"{slug}_montage.mp4"
         edit_decisions_path = run_dir / "edit_decisions.json"
         edit_plan_path = run_dir / "edit_plan.json"
@@ -1001,6 +1057,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             attempt_plan_path = attempt_dir / "edit_decisions.json"
             attempt_video = attempt_dir / f"{slug}_attempt_{attempt_number:02d}.mp4"
             attempt_report_path = attempt_dir / "render_report.json"
+            attempt_provenance_path = attempt_dir / "render_provenance.json"
             seed = f"{args.theme}|{bgm_path.name}|{run_id}|attempt={attempt_number}"
             try:
                 plan = build_timeline(
@@ -1026,9 +1083,45 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     height=output_spec.height,
                     fps=30.0,
                 )
-                write_edit_decisions(attempt_plan_path, plan)
-                if not (resume and attempt_video.is_file()):
-                    render_timeline(plan, bgm_path, attempt_video, args.ratio, style_profile)
+                plan = write_edit_decisions(attempt_plan_path, plan)
+                render_inputs = {
+                    "renderer_sha256": renderer_sha256,
+                    "edit_plan_sha256": _invocation_digest(plan),
+                    "bgm_sha256": invocation["bgm"]["fingerprint"]["sha256"],
+                    "style_profile_sha256": _invocation_digest(style_profile),
+                    "ratio": args.ratio,
+                    "fps": 30.0,
+                }
+                reuse_render = resume and _render_provenance_matches(
+                    attempt_video, attempt_provenance_path, render_inputs
+                )
+                if not reuse_render:
+                    attempt_provenance_path.unlink(missing_ok=True)
+                    render_timeline(
+                        plan,
+                        bgm_path,
+                        attempt_video,
+                        args.ratio,
+                        style_profile,
+                        overwrite=attempt_video.is_file(),
+                    )
+                    _archive_agent_visual_review(attempt_dir)
+                    fingerprint = _file_fingerprint(attempt_video)
+                    _write_json(
+                        attempt_provenance_path,
+                        {
+                            "schema_version": "1.4.3",
+                            "artifact_type": "render_provenance",
+                            "status": "complete",
+                            "attempt": attempt_number,
+                            "render_input_sha256": _invocation_digest(render_inputs),
+                            "inputs": render_inputs,
+                            "output": {
+                                "size": fingerprint["size"],
+                                "sha256": fingerprint["sha256"],
+                            },
+                        },
+                    )
                 validation = validate_output(
                     attempt_video,
                     expected_duration=target_duration,
@@ -1041,9 +1134,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 agent_review: dict[str, Any] | None = None
                 if validation.get("passed") and agent_review_mode == "required":
-                    request = _build_agent_visual_review_request(validation, attempt_dir, attempt_number)
                     request_path = attempt_dir / "agent_visual_review_request.json"
                     result_path = attempt_dir / "agent_visual_review.json"
+                    request = (
+                        _read_json(request_path)
+                        if reuse_render and request_path.is_file() and result_path.is_file()
+                        else _build_agent_visual_review_request(validation, attempt_dir, attempt_number)
+                    )
                     if not result_path.is_file():
                         attempts.append(
                             {
@@ -1052,6 +1149,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                                 "seed": seed,
                                 "plan": str(attempt_plan_path),
                                 "video": str(attempt_video),
+                                "render_provenance": str(attempt_provenance_path),
                                 "report": str(attempt_report_path),
                                 "agent_visual_review_request": str(request_path),
                             }
@@ -1092,6 +1190,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "seed": seed,
                     "plan": str(attempt_plan_path),
                     "video": str(attempt_video),
+                    "render_provenance": str(attempt_provenance_path),
                     "report": str(attempt_report_path),
                     "failed_checks": [
                         key for key, passed in validation.get("checks", {}).items() if not passed
@@ -1256,7 +1355,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", action="version", version="bgm-montage 1.4.4")
+    parser.add_argument("--version", action="version", version="bgm-montage 1.4.6")
     parser.add_argument("--bgm", required=True, help="Input BGM/audio file")
     parser.add_argument("--theme", required=True, help="Theme used to generate English visual search queries")
     parser.add_argument("--duration", required=True, type=float, help="Requested output duration in seconds")

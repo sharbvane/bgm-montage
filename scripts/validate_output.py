@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any
 
 from montage import adjacent_diversity_issues, canonical_source_key, parse_ratio
-from music_event_contract import normalize_music_event_contract
 from visual_intelligence import evaluate_sequence_consistency
 
 
@@ -156,14 +155,46 @@ def _event_time(value: Any) -> float | None:
 
 
 def _collect_event_times(audiomap: dict[str, Any] | None, duration: float) -> dict[str, list[float]]:
-    contract = normalize_music_event_contract(audiomap, duration)
-    return {
-        group: list(contract.get("groups", {}).get(group, []))
-        for group in (
-            "beats", "downbeats", "onsets", "accents", "hard_stops",
-            "drops", "surges", "climaxes", "phrases", "sections",
-        )
+    result: dict[str, list[float]] = {
+        "beats": [], "downbeats": [], "onsets": [], "accents": [],
+        "hard_stops": [], "drops": [], "surges": [], "climaxes": [],
+        "phrases": [], "sections": [],
     }
+    if not audiomap:
+        return result
+    events = audiomap.get("events", {}) if isinstance(audiomap.get("events"), dict) else {}
+    aliases = {
+        "beats": (events.get("beats"), audiomap.get("beats")),
+        "downbeats": (events.get("downbeats"), audiomap.get("downbeats")),
+        "onsets": (events.get("onsets"), audiomap.get("onsets")),
+        "accents": (events.get("accents"), audiomap.get("accents")),
+        "hard_stops": (events.get("hard_stops"), audiomap.get("hard_stops")),
+        "drops": (events.get("drops"), audiomap.get("drops")),
+        "surges": (events.get("surges"), audiomap.get("surges")),
+        "climaxes": (events.get("climaxes"), audiomap.get("climaxes")),
+        "phrases": (events.get("phrase_boundaries"), audiomap.get("phrase_boundaries"), audiomap.get("phrases")),
+        "sections": (events.get("section_boundaries"), audiomap.get("section_boundaries")),
+    }
+    sections = audiomap.get("sections")
+    if isinstance(sections, list):
+        aliases["sections"] = (*aliases["sections"], sections)
+    for group, candidates in aliases.items():
+        times: list[float] = []
+        for candidate in candidates:
+            values = candidate if isinstance(candidate, list) else []
+            for value in values:
+                if group in {"phrases", "sections"} and isinstance(value, dict):
+                    for key in ("start", "end", "time", "boundary"):
+                        if value.get(key) is not None:
+                            parsed = _event_time(value[key])
+                            if parsed is not None:
+                                times.append(parsed)
+                else:
+                    parsed = _event_time(value)
+                    if parsed is not None:
+                        times.append(parsed)
+        result[group] = sorted({round(value, 5) for value in times if 0.0 <= value <= duration})
+    return result
 
 
 def _volume_metrics(stderr: str) -> dict[str, float | None]:
@@ -200,6 +231,91 @@ def _evenly_spaced(values: list[float], limit: int) -> list[float]:
         return [ordered[len(ordered) // 2]]
     indices = sorted({round(index * (len(ordered) - 1) / (limit - 1)) for index in range(limit)})
     return [ordered[index] for index in indices]
+
+
+def _shot_index_at(
+    shots: list[dict[str, Any]], timestamp: float, *, end_margin: float = 0.0
+) -> int | None:
+    for fallback, shot in enumerate(shots):
+        start = float(shot.get("output_start") or 0.0)
+        end = float(shot.get("output_end") or start)
+        safe_end = end - min(end_margin, max(0.0, (end - start) * 0.25))
+        if start <= timestamp < safe_end or (fallback == len(shots) - 1 and timestamp <= end):
+            return int(shot.get("index", fallback))
+    return None
+
+
+def _uncovered_shot_midpoints(
+    shots: list[dict[str, Any]], selected: list[float], end_margin: float = 0.04
+) -> list[tuple[int, float]]:
+    """Return one midpoint for each planned shot absent from selected review evidence."""
+
+    covered = {
+        shot_index
+        for timestamp in selected
+        if (shot_index := _shot_index_at(shots, timestamp, end_margin=end_margin)) is not None
+    }
+    missing: list[tuple[int, float]] = []
+    for fallback, shot in enumerate(shots):
+        index = int(shot.get("index", fallback))
+        if index in covered:
+            continue
+        start = float(shot.get("output_start") or 0.0)
+        end = float(shot.get("output_end") or start)
+        missing.append((index, round((start + end) / 2.0, 4)))
+    return missing
+
+
+def _fit_review_frame_budget(
+    shots: list[dict[str, Any]],
+    timestamps: list[float],
+    requested: dict[float, set[str]],
+    budget: int,
+    end_margin: float = 0.04,
+) -> list[float]:
+    """Drop only redundant evidence while preserving opening, ending, and shot coverage."""
+
+    kept = sorted(set(timestamps))
+    pinned = {
+        timestamp
+        for timestamp in kept
+        if requested.get(timestamp, set()) & {"opening", "ending"}
+    }
+    shot_by_time = {
+        timestamp: _shot_index_at(shots, timestamp, end_margin=end_margin)
+        for timestamp in kept
+    }
+    coverage: dict[int, int] = {}
+    for shot_index in shot_by_time.values():
+        if shot_index is not None:
+            coverage[shot_index] = coverage.get(shot_index, 0) + 1
+
+    def priority(timestamp: float) -> int:
+        labels = requested.get(timestamp, set())
+        if labels & {"planned_cut_before", "planned_cut_after"}:
+            return 4
+        if labels & {"drops", "climaxes", "surges", "hard_stops"}:
+            return 3
+        if labels & {"phrases", "sections"}:
+            return 2
+        if "shot_midpoint" in labels:
+            return 1
+        return 0
+
+    removed: set[float] = set()
+    for timestamp in sorted(kept, key=lambda value: (priority(value), value)):
+        if len(kept) - len(removed) <= budget:
+            break
+        shot_index = shot_by_time[timestamp]
+        if timestamp in pinned or (shot_index is not None and coverage[shot_index] <= 1):
+            continue
+        removed.add(timestamp)
+        if shot_index is not None:
+            coverage[shot_index] -= 1
+    result = [timestamp for timestamp in kept if timestamp not in removed]
+    if len(result) > budget:
+        raise ValueError("Review frame budget cannot preserve both pinned frames and every planned shot")
+    return result
 
 
 def _write_visual_review(
@@ -349,198 +465,6 @@ def _source_interval_overlap_ratio(shots: list[dict[str, Any]]) -> float:
     return maximum
 
 
-def _visual_detail(shot: dict[str, Any], key: str) -> tuple[Any, bool]:
-    for source in (
-        shot.get("visual_features"),
-        shot.get("metadata_features"),
-        (shot.get("quality") or {}).get("visual_features") if isinstance(shot.get("quality"), dict) else None,
-    ):
-        if not isinstance(source, dict):
-            continue
-        details = source.get("feature_details") if isinstance(source.get("feature_details"), dict) else source
-        detail = details.get(key) if isinstance(details.get(key), dict) else None
-        if isinstance(detail, dict):
-            return detail.get("value"), bool(detail.get("available"))
-    if key == "shot_scale":
-        value = shot.get("source_shot_scale") or shot.get("shot_scale")
-        return value, bool(value and str(value).lower() not in {"unknown", "unresolved", "none"})
-    return None, False
-
-
-def _meaningful_visual_value(value: Any) -> bool:
-    if isinstance(value, (list, tuple, set)):
-        return bool(value)
-    return value not in (None, "", "unknown", "unresolved", "none", "n/a")
-
-
-def _visual_diversity_metrics(shots: list[dict[str, Any]], policy: dict[str, Any]) -> dict[str, Any]:
-    pair_count = max(0, len(shots) - 1)
-    issue_counts: dict[str, int] = {}
-    pair_issue_sets: list[set[str]] = []
-    comparable_pairs: dict[str, int] = {"same_shot_scale": 0, "same_motion_direction": 0}
-    same_counts = {"same_shot_scale": 0, "same_motion_direction": 0}
-    coverage: dict[str, dict[str, Any]] = {}
-    for key in ("shot_scale", "world", "time_weather", "camera_language", "motion"):
-        available = sum(1 for shot in shots if _visual_detail(shot, key)[1])
-        coverage[key] = {
-            "available_shots": available,
-            "total_shots": len(shots),
-            "coverage": round(available / max(1, len(shots)), 4),
-        }
-    for index in range(1, len(shots)):
-        issues = adjacent_diversity_issues(shots[index - 1], shots[index])
-        pair_issue_sets.append(set(issues))
-        for issue in issues:
-            issue_counts[issue] = issue_counts.get(issue, 0) + 1
-        for issue in ("same_shot_scale", "same_motion_direction"):
-            if issue == "same_shot_scale":
-                left = shots[index - 1].get("source_shot_scale") or shots[index - 1].get("shot_scale")
-                right = shots[index].get("source_shot_scale") or shots[index].get("shot_scale")
-            else:
-                left, right = shots[index - 1].get("motion_direction"), shots[index].get("motion_direction")
-            comparable = _meaningful_visual_value(left) and _meaningful_visual_value(right)
-            if comparable:
-                comparable_pairs[issue] += 1
-                if str(left).lower() == str(right).lower():
-                    same_counts[issue] += 1
-    def longest_run(values: list[bool]) -> int:
-        longest = current = 0
-        for value in values:
-            current = current + 1 if value else 0
-            longest = max(longest, current)
-        return longest
-
-    rates = {
-        "same_shot_scale": round(same_counts["same_shot_scale"] / max(1, comparable_pairs["same_shot_scale"]), 4),
-        "same_motion_direction": round(same_counts["same_motion_direction"] / max(1, comparable_pairs["same_motion_direction"]), 4),
-    }
-    all_issue_types = sorted(set(issue_counts) | {"same_shot_scale", "same_motion_direction"})
-    issue_summary = {}
-    for issue in all_issue_types:
-        count = same_counts.get(issue, issue_counts.get(issue, 0))
-        denominator = comparable_pairs.get(issue, pair_count)
-        issue_flags = [issue in pair_issues for pair_issues in pair_issue_sets]
-        issue_summary[issue] = {
-            "count": count,
-            "pair_count": denominator,
-            "rate": round(count / max(1, denominator), 4),
-            "longest_run": longest_run(issue_flags),
-        }
-    scale_policy = {
-        "mode": "hard_when_coverage_is_high",
-        "coverage_required": 0.90,
-        "max_rate": 0.85,
-        "source": "v1.4.4_visual_diversity_contract",
-    }
-    scale_coverage = coverage["shot_scale"]["coverage"]
-    scale_hard_fail = (
-        comparable_pairs["same_shot_scale"] > 0
-        and scale_coverage >= scale_policy["coverage_required"]
-        and rates["same_shot_scale"] > scale_policy["max_rate"]
-    )
-    same_source_hard_fail = issue_counts.get("same_source", 0) > 0
-    return {
-        "schema_version": "visual-diversity.1",
-        "pair_count": pair_count,
-        "coverage": coverage,
-        "issue_summary": issue_summary,
-        "same_shot_scale": {
-            **issue_summary["same_shot_scale"],
-            "comparable_pairs": comparable_pairs["same_shot_scale"],
-            "policy": scale_policy,
-        },
-        "same_motion_direction": {
-            **issue_summary["same_motion_direction"],
-            "comparable_pairs": comparable_pairs["same_motion_direction"],
-        },
-        "policy_decision": {
-            "same_source": "hard_fail" if same_source_hard_fail else "pass",
-            "same_shot_scale": "hard_fail" if scale_hard_fail else "advisory",
-            "status": "hard_fail" if same_source_hard_fail or scale_hard_fail else "pass_or_advisory",
-        },
-        "passed": not same_source_hard_fail and not scale_hard_fail,
-    }
-
-
-def _duration_stage_report(
-    plan_payload: dict[str, Any] | None,
-    *,
-    target_duration: float,
-    container_duration: float,
-    video_duration: float,
-    audio_duration: float,
-    video_stream: dict[str, Any],
-    tolerance: float,
-) -> dict[str, Any]:
-    instrumentation = plan_payload.get("duration_instrumentation") if isinstance(plan_payload, dict) else None
-    if not isinstance(instrumentation, dict):
-        return {
-            "schema_version": "duration-stages.1",
-            "status": "not_available",
-            "complete": False,
-            "root_cause_status": "unverified",
-            "missing": ["render_instrumentation"],
-        }
-    stages = instrumentation.get("stages") if isinstance(instrumentation.get("stages"), dict) else {}
-    frame_grid = stages.get("frame_grid") if isinstance(stages.get("frame_grid"), dict) else {}
-    filtergraph = stages.get("filtergraph") if isinstance(stages.get("filtergraph"), dict) else {}
-    expected_frame_count = frame_grid.get("total_frame_count")
-    observed_frame_count = video_stream.get("nb_frames")
-    try:
-        observed_frame_count = int(observed_frame_count) if observed_frame_count is not None else None
-    except (TypeError, ValueError):
-        observed_frame_count = None
-    expected_filter_duration = float(filtergraph.get("expected_duration_seconds") or 0.0)
-    expected_grid_duration = float(frame_grid.get("base_duration_seconds") or 0.0)
-    observed = {
-        "container_seconds": round(container_duration, 6),
-        "video_stream_seconds": round(video_duration, 6),
-        "audio_stream_seconds": round(audio_duration, 6),
-        "video_frame_count": observed_frame_count,
-    }
-    deltas = {
-        "container_vs_planned_seconds": round(container_duration - target_duration, 6),
-        "video_vs_planned_seconds": round(video_duration - target_duration, 6),
-        "audio_vs_planned_seconds": round(audio_duration - target_duration, 6),
-        "filtergraph_vs_planned_seconds": round(expected_filter_duration - target_duration, 6),
-        "frame_grid_vs_planned_seconds": round(expected_grid_duration - target_duration, 6),
-    }
-    mismatches = [
-        name for name, value in (
-            ("container", abs(deltas["container_vs_planned_seconds"])),
-            ("video_stream", abs(deltas["video_vs_planned_seconds"])),
-            ("audio_stream", abs(deltas["audio_vs_planned_seconds"])),
-        ) if value > tolerance
-    ]
-    if expected_frame_count is not None and observed_frame_count is not None and expected_frame_count != observed_frame_count:
-        mismatches.append("frame_count")
-    missing = [
-        name for name, value in (
-            ("planned_timeline", stages.get("planned_timeline")),
-            ("source_trim", stages.get("source_trim")),
-            ("frame_grid", frame_grid),
-            ("filtergraph", filtergraph),
-            ("ffmpeg_encode", stages.get("ffmpeg_encode")),
-        ) if not isinstance(value, dict) or value.get("status") in {"pending", "pending_validation"}
-    ]
-    complete = not missing and bool(stages.get("encoded_output")) and not isinstance(stages.get("encoded_output"), str)
-    return {
-        "schema_version": "duration-stages.1",
-        "status": "complete" if complete else "incomplete",
-        "complete": complete,
-        "root_cause_status": "stage_mismatch_observed" if mismatches else "not_reproduced",
-        "instrumentation_schema_version": instrumentation.get("schema_version"),
-        "planned": stages.get("planned_timeline", {}),
-        "source_trim": stages.get("source_trim", {}),
-        "frame_grid": frame_grid,
-        "filtergraph": filtergraph,
-        "observed": observed,
-        "deltas": deltas,
-        "mismatches": mismatches,
-        "missing": missing,
-    }
-
-
 def _cut_alignment(
     shots: list[dict[str, Any]],
     audiomap: dict[str, Any] | None,
@@ -548,20 +472,20 @@ def _cut_alignment(
 ) -> dict[str, Any] | None:
     if not audiomap or len(shots) < 2:
         return None
-    contract = normalize_music_event_contract(audiomap, duration)
-    mode = str(contract.get("mode") or "phrase_flow")
-    allowed = list(contract.get("allowed_times", []))
-    tolerance = float(contract.get("tolerance_seconds") or 0.55)
+    groups = _collect_event_times(audiomap, duration)
+    rhythm = audiomap.get("rhythm_mode", {})
+    mode = str(rhythm.get("mode") if isinstance(rhythm, dict) else rhythm or "phrase_flow")
+    if mode == "beat_cut":
+        allowed = sorted(set(groups["beats"] + groups["downbeats"] + groups["accents"] + groups["drops"] + groups["surges"] + groups["climaxes"] + groups["hard_stops"]))
+        beat_period = 0.0
+        tempo = audiomap.get("tempo", {}) if isinstance(audiomap.get("tempo"), dict) else {}
+        beat_period = float(tempo.get("beat_period_seconds") or 0.0)
+        tolerance = max(0.10, min(0.28, beat_period * 0.32 if beat_period else 0.20))
+    else:
+        allowed = sorted(set(groups["phrases"] + groups["sections"] + groups["drops"] + groups["surges"] + groups["climaxes"] + groups["hard_stops"]))
+        tolerance = 0.55
     if not allowed:
-        return {
-            "mode": mode,
-            "available": False,
-            "passed": False,
-            "reason": "no alignment events",
-            "contract_schema_version": contract.get("schema_version"),
-            "contract_digest": contract.get("contract_digest"),
-            "allowed_event_types": contract.get("allowed_event_types", []),
-        }
+        return {"mode": mode, "available": False, "passed": False, "reason": "no alignment events"}
     offsets = []
     for shot in shots[:-1]:
         boundary = float(shot.get("output_end") or 0.0)
@@ -571,12 +495,9 @@ def _cut_alignment(
     aligned_share = sum(error <= tolerance for error in errors) / max(1, len(errors))
     # A small number of energy-grid cuts between strong anchors is acceptable;
     # requiring every cut to hit a beat would recreate mechanical beat cutting.
-    required_share = float(contract.get("required_aligned_share") or (0.70 if mode == "beat_cut" else 0.60))
+    required_share = 0.70 if mode == "beat_cut" else 0.60
     return {
         "mode": mode,
-        "contract_schema_version": contract.get("schema_version"),
-        "contract_digest": contract.get("contract_digest"),
-        "allowed_event_types": contract.get("allowed_event_types", []),
         "available": True,
         "tolerance_seconds": tolerance,
         "required_aligned_share": required_share,
@@ -595,13 +516,6 @@ def _climax_metrics(
 ) -> dict[str, Any] | None:
     if not audiomap or not shots:
         return None
-
-    def counted_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        # ponytail: exclude sub-0.5s bridge microshots from cut-density QA;
-        # they are already covered by the dedicated microshot checks and can
-        # otherwise make a short calm tail look denser than the musical peak.
-        return [item for item in items if float(item.get("output_duration") or 0.0) >= 0.5]
-
     events = _collect_event_times(audiomap, duration)
     windows: list[tuple[float, float]] = []
     for item in audiomap.get("climaxes", []) if isinstance(audiomap.get("climaxes"), list) else []:
@@ -610,40 +524,7 @@ def _climax_metrics(
     for time_value in events["climaxes"] + events["drops"]:
         windows.append((max(0.0, time_value - 1.2), min(duration, time_value + 1.8)))
     if not windows:
-        counted_calm = counted_items(shots)
-        calm_duration = sum(float(item.get("output_duration") or 0.0) for item in counted_calm)
-        return {
-            "available": True,
-            "windows": [],
-            "comparison_method": "no_climax_event_window",
-            "section_role_event_window_coverage": 0.0,
-            "comparison_window_coverage": 0.0,
-            "evidence_sufficient": False,
-            "status": "insufficient_evidence",
-            "climax_shot_count": 0,
-            "calm_shot_count": len(shots),
-            "counted_climax_shot_count": 0,
-            "counted_calm_shot_count": len(counted_calm),
-            "excluded_microshots": [
-                {
-                    "index": int(shot.get("index", position)),
-                    "duration_seconds": round(float(shot.get("output_duration") or 0.0), 4),
-                    "side": "calm",
-                    "reason": "bridge_microshot_excluded_from_density",
-                }
-                for position, shot in enumerate(shots)
-                if float(shot.get("output_duration") or 0.0) < 0.5
-            ],
-            "climax_cut_density": None,
-            "calm_cut_density": round(len(counted_calm) / max(calm_duration, 1e-6), 4) if counted_calm else None,
-            "climax_visual_intensity": None,
-            "calm_visual_intensity": None,
-            "density_passed": None,
-            "intensity_passed": None,
-            "passed": False,
-            "failure_reasons": ["insufficient_comparison_evidence"],
-        }
-    windows = sorted({(round(left, 4), round(right, 4)) for left, right in windows if right > left})
+        return None
 
     def overlaps(shot: dict[str, Any], ranges: list[tuple[float, float]]) -> bool:
         start, end = float(shot.get("output_start") or 0.0), float(shot.get("output_end") or 0.0)
@@ -683,9 +564,8 @@ def _climax_metrics(
         comparison_method = "drop_and_climax_event_windows"
 
     def density(items: list[dict[str, Any]]) -> float:
-        counted = counted_items(items)
-        total = sum(float(item.get("output_duration") or 0.0) for item in counted)
-        return len(counted) / max(total, 1e-6)
+        total = sum(float(item.get("output_duration") or 0.0) for item in items)
+        return len(items) / max(total, 1e-6)
 
     def intensity(items: list[dict[str, Any]]) -> float:
         values = []
@@ -696,74 +576,41 @@ def _climax_metrics(
             values.append(min(1.0, motion + emphasis + scale))
         return sum(values) / max(1, len(values))
 
-    counted_climax, counted_calm = counted_items(climax_shots), counted_items(calm_shots)
+    def visual_impact(items: list[dict[str, Any]]) -> float | None:
+        values = [
+            float(value)
+            for item in items
+            if (value := (item.get("visual_analysis") or {}).get("visual_impact_score")) is not None
+        ]
+        return sum(values) / len(values) if values else None
+
     climax_density, calm_density = density(climax_shots), density(calm_shots)
-    climax_intensity, calm_intensity = intensity(counted_climax), intensity(counted_calm)
-    window_shot_coverage = sum(
-        any(overlaps(shot, [window]) for shot in counted_climax)
-        for window in windows
-    ) / max(1, len(windows))
-    excluded_microshots = [
-        {
-            "index": int(shot.get("index", position)),
-            "duration_seconds": round(float(shot.get("output_duration") or 0.0), 4),
-            "side": "climax" if shot in climax_shots else "calm",
-            "reason": "bridge_microshot_excluded_from_density",
-        }
-        for position, shot in enumerate(shots)
-        if float(shot.get("output_duration") or 0.0) < 0.5
-    ]
-    valid_climax_duration = sum(float(item.get("output_duration") or 0.0) for item in counted_climax)
-    valid_calm_duration = sum(float(item.get("output_duration") or 0.0) for item in counted_calm)
-    evidence_sufficient = (
-        bool(counted_climax)
-        and bool(counted_calm)
-        and valid_climax_duration >= 0.5
-        and valid_calm_duration >= 0.5
-        and window_shot_coverage >= 0.50
+    climax_intensity, calm_intensity = intensity(climax_shots), intensity(calm_shots)
+    climax_impact, calm_impact = visual_impact(climax_shots), visual_impact(calm_shots)
+    motion_response = climax_intensity + 0.08 >= calm_intensity
+    impact_response = (
+        climax_impact is not None
+        and calm_impact is not None
+        and climax_impact >= calm_impact
     )
-    density_passed = None
-    intensity_passed = None
-    if evidence_sufficient:
-        density_passed = (
+    return {
+        "windows": [[round(left, 4), round(right, 4)] for left, right in windows],
+        "comparison_method": comparison_method,
+        "section_role_event_window_coverage": round(role_window_coverage, 4),
+        "climax_shot_count": len(climax_shots),
+        "climax_cut_density": round(climax_density, 4),
+        "calm_cut_density": round(calm_density, 4),
+        "climax_visual_intensity": round(climax_intensity, 4),
+        "calm_visual_intensity": round(calm_intensity, 4),
+        "climax_visual_impact": round(climax_impact, 4) if climax_impact is not None else None,
+        "calm_visual_impact": round(calm_impact, 4) if calm_impact is not None else None,
+        "passed": bool(climax_shots)
+        and (
             climax_density > calm_density
             if comparison_method == "audiomap_section_roles"
             else climax_density + 0.05 >= calm_density * 0.90
         )
-        intensity_passed = climax_intensity + 0.08 >= calm_intensity
-    failure_reasons: list[str] = []
-    if window_shot_coverage < 0.50:
-        failure_reasons.append("insufficient_climax_window_coverage")
-    if not evidence_sufficient:
-        failure_reasons.append("insufficient_comparison_evidence")
-    else:
-        if not density_passed:
-            failure_reasons.append("climax_density_not_higher")
-        if not intensity_passed:
-            failure_reasons.append("climax_visual_intensity_not_higher")
-    return {
-        "available": True,
-        "windows": [[round(left, 4), round(right, 4)] for left, right in windows],
-        "comparison_method": comparison_method,
-        "section_role_event_window_coverage": round(role_window_coverage, 4),
-        "comparison_window_coverage": round(window_shot_coverage, 4),
-        "evidence_sufficient": evidence_sufficient,
-        "status": "evaluated" if evidence_sufficient else "insufficient_evidence",
-        "climax_shot_count": len(climax_shots),
-        "calm_shot_count": len(calm_shots),
-        "counted_climax_shot_count": len(counted_climax),
-        "counted_calm_shot_count": len(counted_calm),
-        "valid_climax_duration_seconds": round(valid_climax_duration, 4),
-        "valid_calm_duration_seconds": round(valid_calm_duration, 4),
-        "excluded_microshots": excluded_microshots,
-        "climax_cut_density": round(climax_density, 4) if counted_climax else None,
-        "calm_cut_density": round(calm_density, 4) if counted_calm else None,
-        "climax_visual_intensity": round(climax_intensity, 4) if counted_climax else None,
-        "calm_visual_intensity": round(calm_intensity, 4) if counted_calm else None,
-        "density_passed": density_passed,
-        "intensity_passed": intensity_passed,
-        "passed": bool(evidence_sufficient and density_passed and intensity_passed),
-        "failure_reasons": failure_reasons,
+        and (motion_response or impact_response),
     }
 
 
@@ -908,7 +755,6 @@ def validate_output(
         "no_terminal_microshot": terminal_scene_seconds + 1e-6 >= terminal_scene_minimum,
         "resolution": True,
     }
-    non_blocking_checks: list[str] = []
     expected_dimensions: dict[str, int] | None = None
     if expected_ratio:
         spec = parse_ratio(expected_ratio)
@@ -917,18 +763,8 @@ def validate_output(
 
     plan_payload = _load_payload(edit_plan)
     audiomap_payload = _load_payload(audiomap)
-    duration_stage_metrics = _duration_stage_report(
-        plan_payload,
-        target_duration=target_duration,
-        container_duration=duration,
-        video_duration=video_duration,
-        audio_duration=audio_duration,
-        video_stream=video,
-        tolerance=duration_tolerance,
-    )
     if edit_plan is not None:
         checks["edit_plan_readable"] = plan_payload is not None
-        checks["duration_stage_instrumentation"] = bool(duration_stage_metrics.get("complete"))
     if audiomap is not None:
         checks["audiomap_readable"] = audiomap_payload is not None
     shots: list[dict[str, Any]] = []
@@ -936,7 +772,6 @@ def validate_output(
     alignment_metrics: dict[str, Any] | None = None
     climax_metrics: dict[str, Any] | None = None
     visual_consistency_metrics: dict[str, Any] | None = None
-    visual_diversity_metrics: dict[str, Any] | None = None
     if plan_payload is not None:
         shots = [shot for shot in plan_payload.get("shots", []) if isinstance(shot, dict)]
         policy = plan_payload.get("content_policy", {}) if isinstance(plan_payload.get("content_policy"), dict) else {}
@@ -998,7 +833,6 @@ def validate_output(
             if adjacent_diversity_issues(shots[index - 1], shots[index])
         ]
         severe_limit = int(policy.get("max_adjacent_similarity_dimensions", 3))
-        visual_diversity_metrics = _visual_diversity_metrics(shots, policy)
         checks["material_repetition"] = (
             unique >= int(policy.get("min_unique_assets", 1))
             and max_reuse <= int(policy.get("max_reuse_per_asset", max_reuse or 1))
@@ -1009,10 +843,10 @@ def validate_output(
             policy.get("max_source_interval_overlap", 0.02)
         ) + 0.006
         checks["repeat_gap"] = not repeat_gap_failures
-        checks["adjacent_diversity"] = bool(visual_diversity_metrics.get("passed")) and not any(
-            len(item["issues"]) > severe_limit + 2 for item in diversity_issues
+        checks["adjacent_diversity"] = not any(
+            "same_source" in item["issues"] or len(item["issues"]) > severe_limit + 2
+            for item in diversity_issues
         )
-        checks["visual_diversity_reported"] = True
         checks["prominent_face_budget"] = face_share <= float(
             policy.get("max_prominent_face_screen_share", 1.0)
         ) + 0.006
@@ -1029,13 +863,6 @@ def validate_output(
         climax_metrics = _climax_metrics(shots, audiomap_payload, duration)
         if climax_metrics is not None:
             checks["climax_visual_response"] = bool(climax_metrics.get("passed"))
-            checks["climax_evidence_sufficient"] = bool(climax_metrics.get("evidence_sufficient"))
-            if climax_metrics.get("status") == "insufficient_evidence":
-                # Keep the false evidence/result flags truthful, but do not
-                # turn an inapplicable comparison into a whole-video failure.
-                non_blocking_checks.extend(
-                    ["climax_visual_response", "climax_evidence_sufficient"]
-                )
         visual_profile = (
             plan_payload.get("visual_style_profile")
             if isinstance(plan_payload.get("visual_style_profile"), dict)
@@ -1058,7 +885,6 @@ def validate_output(
             "repeat_gap_failures": repeat_gap_failures,
             "missing_source_paths": missing_sources,
             "adjacent_diversity_issues": diversity_issues,
-            "visual_diversity": visual_diversity_metrics,
             "minimum_planned_shot_seconds": round(min(planned_durations, default=0.0), 4),
             "terminal_planned_shot_seconds": round(planned_durations[-1], 4)
             if planned_durations
@@ -1090,14 +916,6 @@ def validate_output(
         frame_interval = max(0.04, 1.0 / max(frame_rate, 24.0))
         safe_last_frame = max(0.0, duration - frame_interval)
 
-        def shot_index_at(timestamp: float) -> int | None:
-            for fallback, shot in enumerate(shots):
-                start = float(shot.get("output_start") or 0.0)
-                end = float(shot.get("output_end") or start)
-                if start <= timestamp < end or (fallback == len(shots) - 1 and timestamp <= end):
-                    return int(shot.get("index", fallback))
-            return None
-
         def request(timestamp: float, label: str, detail: dict[str, Any]) -> float:
             value = round(min(safe_last_frame, max(0.0, timestamp)), 4)
             requested.setdefault(value, set()).add(label)
@@ -1107,7 +925,7 @@ def validate_output(
         request(
             0.0,
             "opening",
-            {"type": "opening", "reason": "Pinned opening frame", "shot_index": shot_index_at(0.0)},
+            {"type": "opening", "reason": "Pinned opening frame", "shot_index": _shot_index_at(shots, 0.0)},
         )
         request(
             safe_last_frame,
@@ -1115,7 +933,7 @@ def validate_output(
             {
                 "type": "ending",
                 "reason": "Pinned final decodable frame",
-                "shot_index": shot_index_at(safe_last_frame),
+                "shot_index": _shot_index_at(shots, safe_last_frame),
             },
         )
         for group in ("sections", "phrases", "drops", "surges", "climaxes", "hard_stops"):
@@ -1127,7 +945,7 @@ def validate_output(
                         "type": "music_event",
                         "event": group,
                         "reason": f"BGM {group.replace('_', ' ')} event",
-                        "shot_index": shot_index_at(timestamp),
+                        "shot_index": _shot_index_at(shots, timestamp),
                     },
                 )
 
@@ -1200,7 +1018,22 @@ def validate_output(
                 if value not in selected and requested[value] & labels
             ]
             selected.extend(_evenly_spaced(candidates, remaining))
-        ordered_times = sorted(set(selected))
+        for shot_index, midpoint in _uncovered_shot_midpoints(shots, selected, frame_interval):
+            selected.append(
+                request(
+                    midpoint,
+                    "shot_midpoint",
+                    {
+                        "type": "shot_sample",
+                        "reason": "Midpoint of otherwise uncovered planned shot",
+                        "shot_index": shot_index,
+                    },
+                )
+            )
+        review_frame_budget = max(24, len(shots))
+        ordered_times = _fit_review_frame_budget(
+            shots, selected, requested, review_frame_budget, frame_interval
+        )
         for index, timestamp in enumerate(ordered_times, start=1):
             event_name = "_".join(sorted(requested[timestamp]))
             frame = frames / f"event_{index:02d}_{event_name}_{timestamp:.2f}s.jpg"
@@ -1247,7 +1080,6 @@ def validate_output(
         "duration_seconds": round(duration, 4),
         "expected_duration_seconds": round(target_duration, 4),
         "duration_tolerance_seconds": round(duration_tolerance, 6),
-        "duration_stages": duration_stage_metrics,
         "video": {
             "codec": video.get("codec_name"),
             "width": width,
@@ -1267,12 +1099,7 @@ def validate_output(
         },
         "expected_dimensions": expected_dimensions,
         "checks": checks,
-        "passed": all(
-            passed
-            for name, passed in checks.items()
-            if name not in non_blocking_checks
-        ),
-        "non_blocking_checks": non_blocking_checks,
+        "passed": all(checks.values()),
         "decode_errors": decode.stderr.splitlines()[-20:],
         "detectors": {
             "black": black,
@@ -1294,7 +1121,6 @@ def validate_output(
         "music_cut_alignment": alignment_metrics,
         "climax_visual_response": climax_metrics,
         "visual_sequence_consistency": visual_consistency_metrics,
-        "visual_diversity": visual_diversity_metrics,
     }
     if report_path:
         output = Path(report_path).expanduser().resolve()

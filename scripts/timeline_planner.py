@@ -27,11 +27,10 @@ from montage import (
     _normalize_transition,
     _transition_choice,
 )
-from music_event_contract import normalize_music_event_contract
 
 
 SCHEMA_VERSION = "1.2"
-PLANNER_VERSION = "1.4.0"
+PLANNER_VERSION = "1.4.1"
 
 _EVENT_GROUP = {
     "strong_accent": "accents",
@@ -47,9 +46,6 @@ _EVENT_GROUP = {
     "pause": "pauses",
     "pause_edge": "pauses",
     "hard_stop": "pauses",
-    "drop": "drops",
-    "surge": "surges",
-    "climax": "climaxes",
 }
 
 _PREFERRED_EVENT = {
@@ -157,10 +153,72 @@ def _time_item(value: Any, event_type: str) -> dict[str, Any] | None:
 
 
 def _events(audiomap: Mapping[str, Any], duration: float) -> list[dict[str, Any]]:
-    return [
-        {key: value for key, value in event.items() if key != "group"}
-        for event in normalize_music_event_contract(audiomap, duration).get("events", [])
-    ]
+    canonical = audiomap.get("events") if isinstance(audiomap.get("events"), Mapping) else {}
+    names = (
+        "beats",
+        "downbeats",
+        "onsets",
+        "accents",
+        "hard_stops",
+        "drops",
+        "surges",
+        "climaxes",
+        "phrase_boundaries",
+        "section_boundaries",
+    )
+    aliases = {
+        "beats": "beat",
+        "downbeats": "downbeat",
+        "onsets": "onset",
+        "accents": "accent",
+        "hard_stops": "hard_stop",
+        "drops": "drop",
+        "surges": "surge",
+        "climaxes": "climax",
+        "phrase_boundaries": "phrase_boundary",
+        "section_boundaries": "section_boundary",
+    }
+    output: list[dict[str, Any]] = []
+    for name in names:
+        values = canonical.get(name)
+        if not isinstance(values, list):
+            values = audiomap.get(name)
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            item = _time_item(value, aliases[name])
+            if item is not None and 0.0 < item["time"] < duration:
+                output.append(item)
+
+    # v1.1 phrase and section records carry boundaries as start/end pairs.
+    for collection_name, event_type in (("phrases", "phrase_boundary"), ("sections", "section_boundary")):
+        values = audiomap.get(collection_name)
+        if not isinstance(values, list):
+            continue
+        for record in values:
+            if not isinstance(record, Mapping):
+                continue
+            for key in ("start", "end"):
+                time_value = _number(record.get(key), -1.0)
+                if 0.0 < time_value < duration:
+                    output.append({"type": event_type, "time": time_value, "strength": 0.72, "confidence": 0.65})
+
+    deduplicated: list[dict[str, Any]] = []
+    for event in sorted(output, key=lambda item: (item["time"], item["type"])):
+        duplicate = next(
+            (
+                existing
+                for existing in deduplicated
+                if existing["type"] == event["type"]
+                and abs(existing["time"] - event["time"]) <= 0.004
+            ),
+            None,
+        )
+        if duplicate is None:
+            deduplicated.append(event)
+        elif event["strength"] > duplicate["strength"]:
+            duplicate.update(event)
+    return deduplicated
 
 
 def _sections(audiomap: Mapping[str, Any], duration: float) -> list[dict[str, Any]]:
@@ -258,6 +316,16 @@ def _style_shot_target(style_profile: Mapping[str, Any] | None) -> float | None:
     return visit(style_profile)
 
 
+def _role_duration_multiplier(mode: str, role: str) -> float:
+    if mode != "beat_cut":
+        return 1.0
+    if role in {"drop", "climax"}:
+        return 0.78
+    if role in {"intro", "break", "outro"}:
+        return 1.18
+    return 1.0
+
+
 def _shot_target(section: Mapping[str, Any], style_target: float | None) -> tuple[float, float, float, float]:
     guidance = section.get("edit_guidance") if isinstance(section.get("edit_guidance"), Mapping) else {}
     recommendation = guidance.get("recommended_shot_duration_seconds")
@@ -286,17 +354,9 @@ def _shot_target(section: Mapping[str, Any], style_target: float | None) -> tupl
     # arc: climax/drop sections become denser, while intro/break/outro breathe.
     # Apply this to all three bounds so an explicit analyzer range cannot erase
     # the structural contrast.
-    if mode != "beat_cut":
-        # phrase_flow must preserve phrase/section anchors instead of forcing a
-        # denser pseudo-beat grid; its per-section analyzer guidance remains
-        # authoritative.
-        role_multiplier = 1.0
-    elif role in {"drop", "climax"}:
-        role_multiplier = 0.78
-    elif role in {"intro", "break", "outro"}:
-        role_multiplier = 1.18
-    else:
-        role_multiplier = 1.0
+    # phrase_flow keeps a neutral multiplier so phrase/section anchors remain
+    # authoritative instead of becoming a denser pseudo-beat grid.
+    role_multiplier = _role_duration_multiplier(mode, role)
     low *= role_multiplier
     target *= role_multiplier
     high *= role_multiplier
@@ -320,7 +380,6 @@ def _boundary(
     events: Sequence[Mapping[str, Any]],
     event_weights: Mapping[str, float] | None = None,
     event_offsets: Mapping[str, float] | None = None,
-    allowed_event_types: Sequence[str] | None = None,
 ) -> tuple[float, dict[str, Any]]:
     target = min(section_end, current + target_length)
     low = current + minimum
@@ -333,7 +392,6 @@ def _boundary(
         else ("drop", "climax", "hard_stop", "surge", "section_boundary", "phrase_boundary", "accent", "onset")
     )
     rank = {name: index for index, name in enumerate(priorities)}
-    allowed_types = set(allowed_event_types or priorities)
     candidates: list[tuple[float, float, Mapping[str, Any]]] = []
     span = max(0.20, high - low)
     elastic_high = min(section_end, current + maximum * 1.25)
@@ -345,7 +403,7 @@ def _boundary(
         learned_offset = _number((event_offsets or {}).get(group), 0.0) if group else 0.0
         learned_time = time_value + learned_offset
         allowed_high = elastic_high if event_type in elastic_types else high
-        if event_type not in rank or event_type not in allowed_types or not low - 1e-6 <= learned_time <= allowed_high + 1e-6:
+        if event_type not in rank or not low - 1e-6 <= learned_time <= allowed_high + 1e-6:
             continue
         distance = abs(learned_time - target) / span
         if learned_time > high:
@@ -410,12 +468,12 @@ def plan_timeline_slots(
     if not isinstance(audiomap, Mapping):
         raise TimelinePlanningError("audiomap must be a mapping")
     total = _duration(audiomap, duration)
-    event_contract = normalize_music_event_contract(audiomap, total)
-    events = [
-        {key: value for key, value in event.items() if key != "group"}
-        for event in event_contract.get("events", [])
-    ]
+    events = _events(audiomap, total)
     sections = _sections(audiomap, total)
+    section_roles = {str(section.get("role") or "build").strip().lower() for section in sections}
+    has_pacing_contrast = bool(section_roles & {"drop", "climax"}) and bool(
+        section_roles & {"intro", "break", "outro"}
+    )
     style_target = _style_shot_target(style_profile)
     grammar = dict(editing_grammar or {})
     grammar_digest = (
@@ -475,7 +533,9 @@ def plan_timeline_slots(
         )
         if value
     ]
-    global_mode = str(event_contract.get("mode") or "phrase_flow")
+    global_mode = str((audiomap.get("rhythm_mode") or {}).get("mode") or "phrase_flow")
+    if global_mode not in {"beat_cut", "phrase_flow"}:
+        global_mode = "phrase_flow"
     config = dict(config or {})
     minimum_override = _number(config.get("minimum_shot_seconds"), 0.0)
     maximum_override = _number(config.get("maximum_shot_seconds"), 0.0)
@@ -503,7 +563,16 @@ def plan_timeline_slots(
         section_energy = _clamp(energy_root.get("mean", section.get("energy", 0.5)))
         learned_target = target
         if raw_durations:
-            learned_target = _grammar_duration(grammar, section_energy, target, beat_seconds)
+            role_multiplier = (
+                _role_duration_multiplier(
+                    mode, str(section.get("role") or "build").strip().lower()
+                )
+                if has_pacing_contrast
+                else 1.0
+            )
+            learned_target = _grammar_duration(
+                grammar, section_energy, target / role_multiplier, beat_seconds
+            ) * role_multiplier
             blended_target = target * (1.0 - reliability_score) + learned_target * reliability_score
             duration_scale = blended_target / max(target, 1e-9)
             low *= duration_scale
@@ -542,7 +611,6 @@ def plan_timeline_slots(
                 events,
                 event_weights,
                 event_offsets,
-                event_contract.get("allowed_event_types"),
             )
             boundary = min(end, max(current + 0.24, boundary))
             if end - boundary < terminal_minimum:
@@ -740,7 +808,6 @@ def plan_timeline_slots(
         "style_target": style_target,
         "config": config,
         "slots": slots,
-        "music_event_contract_digest": event_contract.get("contract_digest"),
     }
     if grammar_digest:
         digest_payload["editing_grammar_digest"] = grammar_digest
@@ -756,7 +823,6 @@ def plan_timeline_slots(
         "plan_digest": plan_digest,
         "duration_seconds": round(total, 4),
         "rhythm_mode": global_mode,
-        "music_event_contract": event_contract,
         "sections": sections,
         "key_moments": [
             dict(item)

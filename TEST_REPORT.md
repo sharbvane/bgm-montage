@@ -1,20 +1,49 @@
-# bgm-montage v1.4.4 release verification
+# bgm-montage v1.4.6 测试报告
 
-This file records the release checks for the published v1.4.4 source snapshot. It intentionally contains no local media, cache, test-output, credential, or machine-specific path.
+验证日期：2026-09-03
+验证环境：Windows 11 x64、CPython 3.11.9、FFmpeg/FFprobe 8.1.2、pytest 8.4.2。
 
-## Release checks
+## 结论
 
-- CLI version must print `bgm-montage 1.4.4`.
-- Contract/unit tests, JSON integration tests, render smoke tests, dedicated failure fixtures, and Golden frozen QA replay are run from the development source before release.
-- The runtime ZIP is checked in a clean extraction without importing the project checkout or an installed `.agents/skills/bgm-montage` directory.
-- The release asset is checked by SHA-256 after downloading it from the GitHub Release.
+v1.4.6 在保留 v1.4.3 的持久化 6 帧轻量视觉画像、全库粗排/Top-K 深析、内容身份和事务写入的基础上，增加逐计划镜头的帧安全 Agent 审片覆盖；切点前不足一帧的证据不再冒充上一镜覆盖。高潮 QA 同时使用视觉冲击分数与运动响应，保留静态但视觉更强的高潮镜头。FFmpeg `colorbalance` preserve-lightness 继续关闭；每个 attempt 继续绑定 renderer、规范化编辑计划、BGM、风格、比例、帧率和输出哈希，完成态保持不可变。
 
-The final pre-release source-root run completed with `124 passed, 5 warnings` in approximately 42.75 seconds. The CLI check printed `bgm-montage 1.4.4`; the warnings are existing audio-library deprecation/fallback warnings. The clean-extract package test passed from the canonical Skill root.
+完整 pytest：`120 passed, 5 warnings`（36.16 秒）。`compileall`、`pip check` 和 CLI `bgm-montage 1.4.6` 均通过。5 条 warning 为既有 audioread/librosa 弃用或音频回退提示。新增回归覆盖真实 filter graph 不含任何 `pl=`、attempt provenance 的匹配复用、renderer/计划/sidecar/输出哈希失配后的重渲、审片结果失效、高潮视觉冲击回退，以及切点前不足一帧不计入上一镜覆盖。
 
-The exact command outputs and gate-by-gate decision are recorded in the release task evidence. This repository snapshot is the source of truth for the released code; the attached runtime ZIP is a separate distribution artifact.
+三首 20 秒本地库泛化验收均通过：慢抒情《雨爱》20 镜/20 唯一素材，视觉序列 0.7705；中速律动《我们辗转反侧》20 镜/20 唯一素材，视觉序列 0.7780；高能卡点《isa进行曲》26 镜/26 唯一素材，视觉序列 0.7961。三者解码错误、黑帧、冻结、静音均为 0，Agent Visual Review 均为 pass。
 
-## Known boundaries
+## 发布结构
 
-- Duration: `not reproduced / instrumented / known historical risk`.
-- Color: `pl=0 fixed / evidence boundary retained`.
-- Planner: further Reference Grammar `beat_cut` rhythm optimization is deferred.
+磁盘只维护一套完整的 v1.4.6 开发源码。打包器从该目录按需生成两个白名单产物：Runtime 包排除测试、测试报告、Changelog 和打包器；Development 包是 Runtime 的超集并包含这些开发材料。两种 profile、Unicode 路径、秘密扫描、依赖锁、禁止静默覆盖和 ZIP 结构由 7 条打包测试覆盖。
+
+本次发布包：Runtime `239636` bytes，SHA-256 `47009d5f39ea2c732d1d9dde15f7978f4366939f713899e08bb1c2563fdc4f80`；Development `312568` bytes，SHA-256 `05bfbaca52201593dcdfad47347a2b0b4dea843d36faa275d98100137dd0def2`。两个 ZIP 均通过 `python -m zipfile -t`。
+
+## 100 / 500 条真实媒体压力验证
+
+测试目录：`E:\资料\造球计划\test-output\v1.4.3-stress`。素材为 FFmpeg 生成并可实际解码的 320×180 H.264 MP4；压力测试只验证索引、同步与候选链。
+
+| 场景 | 真实结果 |
+|---|---|
+| 100 条首次建库 | 100/100 建立轻量视觉画像，0 深析、0 失败；28.565 秒 |
+| 100 条二次同步 | 轻量分析 0，命中 100/100；0.199 秒 |
+| 100 条首次选片 | 全库粗排 100，精筛 16，深析 16，选中 4；16.488 秒 |
+| 100 条更换 BGM | 轻量分析 0；精筛 16，复用深析 8、新深析 8，选中 4；8.787 秒 |
+| 500 条首次建库 | 500/500 建立轻量视觉画像，0 失败；133.509 秒 |
+| 500 条二次同步 | 轻量分析 0，命中 500/500；0.851 秒 |
+| 500 条首次选片 | 全库粗排 500，精筛/深析 16，选中 4；深析仅占 3.2% |
+| 一次新增 100 条 | 库从 500 增至 600；只分析新增 100，旧 500 全部命中；28.592 秒 |
+| 600 条更换 BGM | 轻量分析 0；精筛 16，新深析 8、复用 8，选中 4；26.980 秒 |
+
+用户指定的只读库 `E:\资料\造球计划\视频素材\冰岛` 共 41 条、2,915,714,375 bytes。首次同步 41/41 获得轻量画像，实际计算 40 条、同内容复用 1 条，0 失败，用时 129.144 秒；第二次轻量分析 0、命中 41/41，用时 0.118 秒。索引只写入测试缓存，没有修改素材库。
+
+## 身份、删除与并发验证
+
+- 同路径被不同视频覆盖后只重建该条目，内容 canonical 改变，旧 usage 不继承；移动或改名保持 canonical 与历史。
+- 删除素材后索引同步删除对应条目。
+- 4 个任务同时同步 600 条素材，最终 JSON 可解析，保留 600 条和 600 个唯一内容身份。
+- 两个任务同时冷启动 30 条库时，轻量画像总计执行 30 次、深析总计 16 次；等待任务复用已有深析结果。
+
+## 已知限制
+
+- 内容身份使用文件大小加首部/中部/尾部的有界采样 SHA-256，不作为抗恶意碰撞的全文件哈希；进入深析的 Top-K 仍保留全文件 SHA-256。
+- 冷启动同步使用库级锁保证事务安全；实测 500 条约 133.5 秒。深析按内容分锁并行。
+- 轻量场景类别是现有启发式 CV/标签结果，不等同于通用视觉语言模型；最终候选仍由深析与 Agent QA 把关。

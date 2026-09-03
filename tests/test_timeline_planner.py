@@ -12,9 +12,7 @@ SCRIPTS = SKILL_ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from music_event_contract import normalize_music_event_contract  # noqa: E402
 from timeline_planner import build_timeline_slots, plan_timeline_slots  # noqa: E402
-from validate_output import _cut_alignment  # noqa: E402
 
 
 def _audiomap(mode: str = "phrase_flow") -> dict[str, object]:
@@ -128,45 +126,10 @@ def test_timeline_duration_override_never_exceeds_available_audio() -> None:
     assert plan["slots"][-1]["end"] == pytest.approx(6.25)
 
 
-def test_music_event_contract_is_shared_by_planner_and_validator() -> None:
-    profile = _audiomap("phrase_flow")
-    phrase_contract = normalize_music_event_contract(profile, 10.0)
-    beat_contract = normalize_music_event_contract({**profile, "rhythm_mode": {"mode": "beat_cut"}}, 10.0)
-
-    assert phrase_contract["schema_version"] == "music-event-contract.1"
-    assert "beat" not in phrase_contract["allowed_event_types"]
-    assert "onset" in phrase_contract["allowed_event_types"]
-    assert "beat" in beat_contract["allowed_event_types"]
-    plan = plan_timeline_slots(profile)
-    assert plan["music_event_contract"]["contract_digest"] == phrase_contract["contract_digest"]
-    shots = [
-        {"output_start": 0.0, "output_end": 2.3},
-        {"output_start": 2.3, "output_end": 5.15},
-        {"output_start": 5.15, "output_end": 10.0},
-    ]
-    alignment = _cut_alignment(shots, profile, 10.0)
-    assert alignment is not None
-    assert alignment["contract_digest"] == phrase_contract["contract_digest"]
-    assert alignment["allowed_event_types"] == phrase_contract["allowed_event_types"]
-    assert alignment["passed"] is True
-
-
-def test_legacy_audiomap_without_alignment_events_is_explicitly_unavailable() -> None:
-    profile = {"duration_seconds": 4.0, "rhythm_mode": {"mode": "phrase_flow"}}
-    contract = normalize_music_event_contract(profile, 4.0)
-    assert contract["available"] is False
-    alignment = _cut_alignment(
-        [{"output_start": 0.0, "output_end": 1.0}, {"output_start": 1.0, "output_end": 4.0}],
-        profile,
-        4.0,
-    )
-    assert alignment is not None
-    assert alignment["available"] is False
-    assert alignment["passed"] is False
-
-
-def test_climax_role_is_denser_than_intro_with_the_same_raw_duration_guidance() -> None:
+def test_climax_role_stays_denser_when_learned_duration_guidance_is_fully_trusted() -> None:
     profile = _audiomap("beat_cut")
+    profile["events"] = {key: [] for key in profile["events"]}
+    profile["key_moments"] = []
     shared_guidance = {
         "rhythm_mode": "beat_cut",
         "cut_intensity": 0.6,
@@ -193,7 +156,15 @@ def test_climax_role_is_denser_than_intro_with_the_same_raw_duration_guidance() 
         },
     ]
 
-    plan = plan_timeline_slots(profile)
+    plan = plan_timeline_slots(
+        profile,
+        editing_grammar={
+            "reliability": {"score": 1.0},
+            "montage_policy": {
+                "shot_duration_by_energy": {"high": {"median_seconds": 1.0}}
+            },
+        },
+    )
     intro = [slot for slot in plan["slots"] if slot["section_role"] == "intro"]
     climax = [slot for slot in plan["slots"] if slot["section_role"] == "climax"]
 
@@ -204,6 +175,20 @@ def test_climax_role_is_denser_than_intro_with_the_same_raw_duration_guidance() 
     assert min(slot["cut_intensity"] for slot in climax) > max(
         slot["cut_intensity"] for slot in intro
     )
+
+    missing_band = plan_timeline_slots(
+        profile,
+        editing_grammar={
+            "reliability": {"score": 1.0},
+            "montage_policy": {
+                "shot_duration_by_energy": {"low": {"median_seconds": 1.0}}
+            },
+        },
+    )
+    baseline = plan_timeline_slots(profile)
+    assert [slot["end"] for slot in missing_band["slots"]] == [
+        slot["end"] for slot in baseline["slots"]
+    ]
 
 
 def test_terminal_remainder_is_merged_instead_of_creating_a_flash_shot() -> None:

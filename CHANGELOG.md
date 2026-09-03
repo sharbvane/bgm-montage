@@ -1,19 +1,18 @@
 # Changelog
 
-## v1.4.4 — 2026-08-20
+## v1.4.6 — 2026-09-03 — Generalization QA / Release Baseline
 
-- Added local-library metadata truth/provenance, missing-feature scoring normalization, and bounded lazy cache migration while preserving legacy report/cache fields.
-- Added shared asset-capacity preflight and the shared planner/validator music-event contract; preflight and assignment use the same resolved policy and constraint helpers.
-- Expanded visual QA coverage for whole-film consistency and adjacent-shot diversity, and added the Golden Fixture Identity Contract plus duration-stage instrumentation.
-- Fixed `colorbalance` `pl=0` handling and retained the evidence boundary; the remaining Duration status is `not reproduced / instrumented / known historical risk`.
-- Formalized `climax_visual_response` evidence sufficiency: a climax comparison requires valid counted climax and calm/reference evidence; missing comparator data is reported as `insufficient_evidence`, with unavailable density/intensity values kept as null and excluded from comparison.
-- Kept insufficient climax evidence non-blocking for the whole-video technical QA result, while preserving truthful `evidence_sufficient=false` and `passed=false` comparison details.
-- Added a permanent clean-extract runtime-package smoke regression so the published package is tested without project-source or installed-skill imports.
-- Recorded the planner boundary: `Reference Grammar beat_cut rhythm optimization deferred`.
-- Preserved v1.4.3 JSON/cache schema identifiers for compatibility; no planner, beat-cut, selection, threshold, renderer, metadata, capacity, or scoring redesign was added.
+- Added frame-safe Agent Visual Review coverage: every planned shot receives a usable evidence frame, and samples within one frame of a cut no longer count as coverage for the preceding shot.
+- Added a regression for the frame-boundary coverage contract and kept the bounded review budget while preserving opening, ending, cut-pair, event, and planned-shot evidence.
+- Extended climax QA to accept a visually stronger climax when optical-flow motion alone is not higher, recording climax/calm visual-impact evidence instead of rejecting a valid static emphasis shot.
+- Kept the FFmpeg `colorbalance` preserve-lightness fix, provenance-bound resume contract, reserve-capacity preflight, and beat-cut planner hotfix in the new baseline.
+- Validated three generalized 20-second local-library montages (slow lyrical, mid-tempo groove, and high-energy beat) with required Agent review, unique-shot selection, and full media QA.
+- Preserved the v1.4.3 JSON/cache schema identifiers for compatibility; this is a release/version baseline update, not a schema migration.
 
 ## v1.4.3 — 2026-08-16
 
+- 2026-09-02 timeline hotfix: planner 1.4.1 keeps the existing beat-cut section pacing multiplier when high-confidence reference shot-duration learning is applied, so climax/drop sections remain observably denser than intro/break/outro without changing phrase-flow or single-role reference timing. Added regression coverage for fully trusted learned durations and missing energy-band fallback.
+- 2026-09-01 renderer/resume hotfix: kept FFmpeg `colorbalance` preserve-lightness disabled after saturated-region corruption was reproduced with `pl=1`; added a filter-graph regression test. Every attempt now writes `render_provenance.json` binding renderer, normalized edit plan, BGM, style, ratio, fps, and output hash. `--resume-run` atomically re-renders missing/corrupt/mismatched attempts, preserves an old MP4 on render failure without trusting it, and archives superseded Agent Visual Review data before requesting a fresh review. Completed runs remain immutable.
 - Cleaned the release layout without changing the runtime version: stable functional test filenames replace historical version suffixes, obsolete upgrade reports are removed, and packaging now emits explicit `runtime` and `development` profiles.
 - Replaced filename-only local-library inventory with a persistent six-frame lightweight visual profile for every new, changed, or migrated asset, reusing the existing CV signals for scene/subject, shot scale, motion, HSV, sharpness, exposure, aesthetics, and perceptual hashes.
 - Kept full-library work bounded: all assets participate in BGM-aware coarse ranking from the lightweight index, while only `min(64, max(16, assets×3, slots×2))` candidates can enter the existing 48-frame deep analysis.
