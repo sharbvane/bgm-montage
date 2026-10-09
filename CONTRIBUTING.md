@@ -1,6 +1,6 @@
 # 贡献指南
 
-感谢你愿意改进 BGM Montage。请先阅读 [README.md](README.md)、[使用说明](references/usage.md) 和 [LICENSE](LICENSE)，确认你的贡献符合当前的非商业源码可用许可范围。
+感谢你愿意改进 BGM Montage。请先阅读 [README.md](README.md)、[使用说明](references/usage.md) 和 [LICENSE](LICENSE)，确认你的贡献符合当前 AGPL-3.0-or-later 许可范围，并保留 Cui 与 'sharbvane/bgm-montage' 的署名。
 
 ## 提交前
 

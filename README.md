@@ -4,7 +4,7 @@
 
 [![Release](https://img.shields.io/github/v/release/sharbvane/bgm-montage?display_name=tag&sort=semver)](https://github.com/sharbvane/bgm-montage/releases)
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/release/python-3110/)
-[![License](https://img.shields.io/badge/License-Source--Available-5B6B73)](LICENSE)
+[![License](https://img.shields.io/badge/License-AGPL--3.0--or--later-5B6B73)](LICENSE)
 [![FFmpeg](https://img.shields.io/badge/Renderer-FFmpeg-007808?logo=ffmpeg&logoColor=white)](https://ffmpeg.org/)
 
 `bgm-montage` 会从音乐的节拍、重拍、乐句、段落与能量变化中生成剪辑节奏，再结合本地素材、参考视频或素材提供方候选，完成选片、时间线规划、渲染与质量检查。它的重点不是“随机拼接”，而是让每一个镜头、来源区间、切点和检查结果都能被追溯。
@@ -159,4 +159,4 @@ $Python = ".\.venv\Scripts\python.exe"
 
 ## 许可证
 
-本项目采用 [Source-Available Non-Commercial License](LICENSE)，允许本地学习、研究、测试和非商业技术交流。它不是 MIT、Apache-2.0、GPL 或其他商业宽松开源许可证。商业使用、商业分发或集成到商业产品/服务前，请联系 `thiscui@foxmail.com` 获得书面许可。详见 [LICENSE-NOTICE.md](LICENSE-NOTICE.md)。
+当前主分支采用 [GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)](LICENSE)。版权归 Cui 所有，并保留 'sharbvane/bgm-montage' 项目署名。此前已发布的历史 tag 和 Release 不追溯改写其当时公布的许可条款；以各自版本中的授权文件为准。直接依赖与第三方来源说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

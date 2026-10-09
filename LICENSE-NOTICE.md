@@ -1,11 +1,13 @@
 # License Notice
 
-This repository is source-available for local learning, research, testing, and
-technical exchange. It is not released under MIT, Apache-2.0, GPL, or another
-commercially permissive open-source license.
+The current main branch of BGM Montage is licensed under the GNU Affero
+General Public License, version 3 or any later version (AGPL-3.0-or-later).
+Copyright (c) 2026 Cui. The project and its author attribution are retained at
+<https://github.com/sharbvane/bgm-montage>.
 
-Commercial use, commercial distribution, and integration into a commercial
-product or service require the author's prior written permission. Contact:
-thiscui@foxmail.com.
+The license change applies to the current branch and future releases made from
+it. Existing tags and releases are historical snapshots and retain the license
+terms published with those snapshots; this repository does not rewrite history.
 
-See [LICENSE](LICENSE) for the complete terms.
+The complete license text is in [LICENSE](LICENSE). Direct dependency and
+third-party provenance notes are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

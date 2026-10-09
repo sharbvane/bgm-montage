@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — 2026-10-09 — AGPLv3 integration
+
+- Licensed the current main branch under AGPL-3.0-or-later to support
+  integration with AGPL-compatible projects such as OpenMontage.
+- Preserved existing tags and Releases as historical snapshots; no release
+  history was rewritten.
+- Added direct dependency and third-party provenance notes.
+
 ## v1.4.6 — 2026-09-03 — Generalization QA / Release Baseline
 
 - Added frame-safe Agent Visual Review coverage: every planned shot receives a usable evidence frame, and samples within one frame of a cut no longer count as coverage for the preceding shot.
